@@ -19,7 +19,7 @@ use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::buffer::BufferSizer;
-use crate::copy::{CopyStats, chunked_copy_file, parallel_copy_files, windows_copyfile};
+use crate::copy::{CopyStats, chunked_copy_file, parallel_copy_files, windows_copyfile, file_needs_copy};
 use crate::tar_stream::{tar_stream_transfer, TarConfig};
 use crate::windows_enum::{enumerate_directory, enumerate_directory_filtered, categorize_files, FileEntry, FileFilter};
 
@@ -46,7 +46,7 @@ struct Args {
     progress: bool,
     
     /// Mirror mode - copy and delete extra files (same as --delete)
-    #[arg(long, alias = "mirror", alias = "mir")]
+    #[arg(long = "mir", alias = "mirror")]
     mirror: bool,
     
     /// Delete extra files in destination
@@ -54,15 +54,15 @@ struct Args {
     delete: bool,
     
     /// Copy subdirectories, but not empty ones (/S)
-    #[arg(short = 'S', long)]
+    #[arg(short = 's', long)]
     subdirs: bool,
     
     /// Copy subdirectories including empty ones (/E) - default behavior
-    #[arg(short = 'E', long)]
+    #[arg(short = 'e', long)]
     empty_dirs: bool,
     
     /// List only - don't copy files (dry run) (/L)
-    #[arg(short = 'L', long, alias = "list-only")]
+    #[arg(short = 'l', long, alias = "list-only")]
     dry_run: bool,
     
     /// Exclude files matching patterns (/XF)
@@ -74,12 +74,16 @@ struct Args {
     exclude_dirs: Vec<String>,
     
     /// Number of retries on failed copies (/R)
-    #[arg(short = 'R', long = "retry", default_value_t = 3)]
+    #[arg(short = 'r', long = "retry", default_value_t = 3)]
     retries: u32,
     
     /// Wait time between retries in seconds (/W)
-    #[arg(short = 'W', long = "wait", default_value_t = 1)]
+    #[arg(short = 'w', long = "wait", default_value_t = 1)]
     wait_time: u64,
+    
+    /// Use checksums for comparison instead of size+timestamp
+    #[arg(short = 'c', long)]
+    checksum: bool,
     
     /// Force tar streaming for small files
     #[arg(long)]
@@ -160,6 +164,26 @@ fn main() -> Result<()> {
     } else if args.verbose {
         println!("Found {} files ({:.2} GB)", total_files, total_size as f64 / 1_073_741_824.0);
     }
+    
+    // Filter out files that don't need copying (mirror mode optimization)
+    let entries = if delete_extra {
+        if show_activity {
+            print!(" comparing...");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
+        
+        entries.into_iter()
+            .filter(|entry| {
+                let dst = compute_destination(&entry.path, &args.source, &args.destination);
+                match file_needs_copy(&entry.path, &dst, args.checksum) {
+                    Ok(needs_copy) => needs_copy,
+                    Err(_) => true, // Copy if we can't determine (file might not exist)
+                }
+            })
+            .collect()
+    } else {
+        entries
+    };
     
     // Categorize files by size
     let (small, medium, large) = categorize_files(entries);

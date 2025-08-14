@@ -4,6 +4,9 @@
 use std::fs::{self, File};
 use std::io::{Read, Write, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use anyhow::{Result, Context};
 use rayon::prelude::*;
 use parking_lot::Mutex;
@@ -11,6 +14,59 @@ use std::sync::Arc;
 
 use crate::buffer::BufferSizer;
 use crate::windows_enum::FileEntry;
+
+/// Check if a file needs to be copied (for mirror mode)
+pub fn file_needs_copy(src: &Path, dst: &Path, use_checksum: bool) -> Result<bool> {
+    // If destination doesn't exist, definitely copy
+    if !dst.exists() {
+        return Ok(true);
+    }
+    
+    let src_meta = src.metadata()?;
+    let dst_meta = dst.metadata()?;
+    
+    // If sizes differ, copy
+    if src_meta.len() != dst_meta.len() {
+        return Ok(true);
+    }
+    
+    if use_checksum {
+        // Checksum comparison (slower but accurate)
+        Ok(files_have_different_content(src, dst)?)
+    } else {
+        // Fast timestamp comparison (default)
+        let src_time = src_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let dst_time = dst_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        
+        // Copy if source is newer (allow 2 second tolerance for filesystem precision)
+        Ok(src_time.duration_since(dst_time).map_or(false, |diff| diff.as_secs() > 2))
+    }
+}
+
+/// Compare file contents using fast hashing (for --checksum mode)
+fn files_have_different_content(src: &Path, dst: &Path) -> Result<bool> {
+    
+    let src_hash = hash_file_content(src)?;
+    let dst_hash = hash_file_content(dst)?;
+    Ok(src_hash != dst_hash)
+}
+
+/// Fast file content hashing
+fn hash_file_content(path: &Path) -> Result<u64> {
+    let mut hasher = DefaultHasher::new();
+    let mut buffer = [0u8; 64 * 1024]; // 64KB chunks
+    let mut file = File::open(path)?;
+    
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        buffer[..bytes_read].hash(&mut hasher);
+    }
+    
+    Ok(hasher.finish())
+}
 
 /// Statistics for copy operations
 #[derive(Debug, Default, Clone)]
