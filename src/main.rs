@@ -41,7 +41,7 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
     
-    /// Show progress bars
+    /// Show progress display (same as verbose mode)
     #[arg(short, long)]
     progress: bool,
     
@@ -73,14 +73,6 @@ struct Args {
     #[arg(long = "xd", action = clap::ArgAction::Append)]
     exclude_dirs: Vec<String>,
     
-    /// Number of retries on failed copies (/R)
-    #[arg(short = 'r', long = "retry", default_value_t = 3)]
-    retries: u32,
-    
-    /// Wait time between retries in seconds (/W)
-    #[arg(short = 'w', long = "wait", default_value_t = 1)]
-    wait_time: u64,
-    
     /// Use checksums for comparison instead of size+timestamp
     #[arg(short = 'c', long)]
     checksum: bool,
@@ -111,11 +103,11 @@ fn main() -> Result<()> {
     let is_network = is_network_path(&args.destination);
     
     // Simple activity indicator (no performance impact)
-    let show_activity = !args.verbose; // Only show simple indicator if not verbose
+    let show_activity = !(args.verbose || args.progress); // Only show simple indicator if not verbose or progress
     
     // Simple activity indicator
     if show_activity {
-        print!("RoboSync v2.1...");
+        print!("RoboSync v2.1.1...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
     
@@ -124,8 +116,8 @@ fn main() -> Result<()> {
         println!("DRY RUN MODE - No files will be copied");
     }
     
-    if args.verbose {
-        println!("RoboSync v2.1 - Linux/macOS Optimized");
+    if args.verbose || args.progress {
+        println!("RoboSync v2.1.1 - Linux/macOS Optimized");
         println!("Source: {:?}", args.source);
         println!("Destination: {:?}", args.destination);
         println!("Network transfer: {}", is_network);
@@ -144,15 +136,39 @@ fn main() -> Result<()> {
     
     // Check if source is a single file
     if args.source.is_file() {
-        return copy_single_file(&args.source, &args.destination, is_network, args.verbose);
+        return copy_single_file(&args.source, &args.destination, is_network, args.verbose || args.progress);
     }
     
     // Enumerate files with progress
-    if args.verbose {
+    if args.verbose || args.progress {
         println!("Enumerating files...");
     }
     
-    let entries = enumerate_directory(&args.source)
+    // Build filter from CLI arguments
+    let filter = FileFilter {
+        exclude_files: args.exclude_files.clone(),
+        exclude_dirs: args.exclude_dirs.clone(),
+        min_size: None,
+        max_size: None,
+        include_empty_dirs: if args.subdirs {
+            false  // -s means skip empty dirs
+        } else if args.empty_dirs {
+            true   // -e means include empty dirs
+        } else {
+            true   // default is include empty dirs (/E behavior)
+        },
+    };
+    
+    if args.verbose || args.progress {
+        if !args.exclude_dirs.is_empty() {
+            println!("Excluding directories: {:?}", args.exclude_dirs);
+        }
+        if !args.exclude_files.is_empty() {
+            println!("Excluding files: {:?}", args.exclude_files);
+        }
+    }
+    
+    let entries = enumerate_directory_filtered(&args.source, &filter)
         .context("Failed to enumerate source directory")?;
     
     let total_files = entries.len();
@@ -161,7 +177,7 @@ fn main() -> Result<()> {
     if show_activity {
         print!(" found {}, copying...", total_files);
         std::io::Write::flush(&mut std::io::stdout()).ok();
-    } else if args.verbose {
+    } else if args.verbose || args.progress {
         println!("Found {} files ({:.2} GB)", total_files, total_size as f64 / 1_073_741_824.0);
     }
     
@@ -172,7 +188,8 @@ fn main() -> Result<()> {
             std::io::Write::flush(&mut std::io::stdout()).ok();
         }
         
-        entries.into_iter()
+        use rayon::prelude::*;
+        entries.into_par_iter()
             .filter(|entry| {
                 let dst = compute_destination(&entry.path, &args.source, &args.destination);
                 match file_needs_copy(&entry.path, &dst, args.checksum) {
@@ -218,7 +235,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     
-    if args.verbose {
+    if args.verbose || args.progress {
         println!("Small files (<1MB): {}", small.len());
         println!("Medium files (1-100MB): {}", medium.len());
         println!("Large files (>100MB): {}", large.len());
@@ -235,7 +252,7 @@ fn main() -> Result<()> {
     let use_tar = !args.no_tar && (args.force_tar || should_use_tar(&small, is_network));
     
     if use_tar && !small.is_empty() {
-        if args.verbose {
+        if args.verbose || args.progress {
             println!("Using tar streaming for {} small files", small.len());
         }
         
@@ -264,7 +281,7 @@ fn main() -> Result<()> {
     
     // Process medium files in parallel
     if !medium.is_empty() {
-        if args.verbose {
+        if args.verbose || args.progress {
             println!("Processing {} medium files in parallel", medium.len());
         }
         
@@ -278,7 +295,7 @@ fn main() -> Result<()> {
     
     // Process large files with chunked copy
     if !large.is_empty() {
-        if args.verbose {
+        if args.verbose || args.progress {
             println!("Processing {} large files", large.len());
         }
         
@@ -302,13 +319,13 @@ fn main() -> Result<()> {
     
     // Handle mirror mode - delete extra files in destination
     if delete_extra {
-        if args.verbose {
+        if args.verbose || args.progress {
             println!("Scanning destination for extra files...");
         }
         
-        let deletion_stats = handle_mirror_deletion(&args.source, &args.destination, &FileFilter::default(), args.verbose, args.dry_run)?;
+        let deletion_stats = handle_mirror_deletion(&args.source, &args.destination, &filter, args.verbose || args.progress, args.dry_run)?;
         
-        if args.verbose && (deletion_stats.0 > 0 || deletion_stats.1 > 0) {
+        if (args.verbose || args.progress) && (deletion_stats.0 > 0 || deletion_stats.1 > 0) {
             println!("Deleted {} files and {} directories", deletion_stats.0, deletion_stats.1);
         }
     }
@@ -333,7 +350,7 @@ fn main() -> Result<()> {
     
     if !total_stats.errors.is_empty() {
         println!("\nErrors encountered: {}", total_stats.errors.len());
-        if args.verbose {
+        if args.verbose || args.progress {
             for error in &total_stats.errors {
                 eprintln!("  - {}", error);
             }
@@ -409,8 +426,9 @@ fn process_small_files_tar(
     dst_root: &Path,
     _show_progress: bool,
 ) -> Result<(u64, u64)> {
-    // Create a temporary directory structure for tar
-    let temp_src = std::env::temp_dir().join(format!("robosync_{}", std::process::id()));
+    // Create a temporary directory structure for tar in destination directory
+    // This avoids /tmp space issues and puts temp files where we have space
+    let temp_src = dst_root.join(format!(".robosync_temp_{}", std::process::id()));
     std::fs::create_dir_all(&temp_src)?;
     
     // Link or copy files to temp structure

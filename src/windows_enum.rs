@@ -82,10 +82,14 @@ impl FileFilter {
     
     /// Check if a directory should be included
     fn should_include_dir(&self, path: &Path) -> bool {
-        let dirname = path.file_name().unwrap_or_default().to_string_lossy();
         for pattern in &self.exclude_dirs {
-            if glob_match(pattern, &dirname) {
-                return false;
+            // Check if any path component matches the pattern (like rsync/robocopy)
+            for component in path.components() {
+                if let Some(component_str) = component.as_os_str().to_str() {
+                    if glob_match(pattern, component_str) {
+                        return false;
+                    }
+                }
             }
         }
         true
@@ -221,16 +225,20 @@ pub fn enumerate_directory_filtered(root: &Path, filter: &FileFilter) -> Result<
     
     let mut entries = Vec::new();
     
-    for entry in WalkDir::new(root).follow_links(false) {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            // Skip excluded directories entirely - this prevents walking into them
+            if e.file_type().is_dir() {
+                filter.should_include_dir(e.path())
+            } else {
+                true // Always walk files, filter them later
+            }
+        })
+    {
         let entry = entry?;
         let path = entry.path();
-        
-        // Check directory filtering
-        if entry.file_type().is_dir() {
-            if !filter.should_include_dir(path) {
-                continue;
-            }
-        }
         
         if entry.file_type().is_file() {
             let metadata = entry.metadata()?;

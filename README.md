@@ -7,8 +7,8 @@ RoboSync v2.1 is a cross-platform file synchronization tool built for speed and 
 ## 🎯 Key Features
 
 - **⚡ High Performance**: Consistently 2-6× faster than rsync across different workloads
-- **🎮 Robocopy CLI**: Familiar command syntax with `--mirror`, `-L`, `--xf`, etc.
-- **📊 Cargo-style Progress**: File operations scroll above, status line stays at bottom
+- **🎮 Robocopy CLI**: Familiar command syntax with `--mir`, `-l`, `--xf`, etc.
+- **📊 Simple Progress**: Lightweight activity indicator without performance impact
 - **🧠 Smart Strategy**: Tar streaming for small files, parallel copy for medium, chunked for large
 - **🌍 Cross-Platform**: Native support for Linux, macOS, and Windows
 - **🔒 Reliable**: Proper empty directory handling, mirror mode, file filtering
@@ -31,10 +31,10 @@ cargo build --release
 robosync /source /destination
 
 # Mirror mode (most common) - copy and delete extra files
-robosync /source /dest --mirror
+robosync /source /dest --mir
 
 # Dry run to see what would happen
-robosync /source /dest --mirror -L
+robosync /source /dest --mir -l
 
 # Exclude files and directories
 robosync /source /dest --xf "*.tmp" --xd "node_modules" --xd ".git"
@@ -61,9 +61,10 @@ robosync /source /dest -S
 
 | Option | Description | Robocopy Equivalent |
 |--------|-------------|-------------------|
-| `--mirror` | Mirror directory (copy + delete extra) | `/MIR` |
+| `--mir` | Mirror directory (copy + delete extra) | `/MIR` |
 | `--delete` | Delete extra files in destination | `/PURGE` |
-| `-L` | Dry run - list only, don't copy | `/L` |
+| `-l` | Dry run - list only, don't copy | `/L` |
+| `-c` | Use checksums instead of size+timestamp | - |
 | `-v` | Verbose output | `/V` |
 | `-p` | Show progress display | - |
 
@@ -71,8 +72,8 @@ robosync /source /dest -S
 
 | Option | Description | Robocopy Equivalent |
 |--------|-------------|-------------------|
-| `-E` | Copy subdirectories including empty ones (default) | `/E` |
-| `-S` | Copy subdirectories but not empty ones | `/S` |
+| `-e` | Copy subdirectories including empty ones (default) | `/E` |
+| `-s` | Copy subdirectories but not empty ones | `/S` |
 
 ### File Selection
 
@@ -88,21 +89,18 @@ robosync /source /dest -S
 | `-t <n>` | Number of threads (0 = auto) |
 | `--force-tar` | Force tar streaming for small files |
 | `--no-tar` | Disable tar streaming |
-| `-R <n>` | Retry count on failures (default: 3) |
-| `-W <n>` | Wait seconds between retries (default: 1) |
+| `-r <n>` | Retry count on failures (default: 3) |
+| `-w <n>` | Wait seconds between retries (default: 1) |
 
 ## 🎨 Progress Display
 
-RoboSync v2.1 features a cargo-style progress display:
+RoboSync v2.1 features a simple, lightweight progress indicator:
 
 ```
-  Copying /path/to/file1.txt
-  Copying /path/to/file2.txt
-  Creating /path/to/empty_dir
-⠋ Processing (45/100) in 2.1s - medium files
+RoboSync v2.1... found 316646, copying... comparing... done!
 ```
 
-File operations scroll above while the status line stays fixed at the bottom, providing clear visibility into what's happening without cluttering the terminal.
+Provides immediate feedback that the tool is working without any performance impact. Use `-v` for detailed verbose output.
 
 ## 🏗️ Architecture
 
@@ -151,7 +149,7 @@ robosync /var/www/ /mnt/backup/www/ \
 
 ### Preview changes (dry run)
 ```bash
-robosync /source /dest --mirror -L -v
+robosync /source /dest --mir -l -v
 ```
 
 ## 🔧 Building
