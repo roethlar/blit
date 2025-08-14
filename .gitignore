@@ -1,0 +1,36 @@
+# Build artifacts
+/target/
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+
+# Test data and benchmarks
+benchmark_*.csv
+benchmark_*.ps1
+test_*.ps1
+*.ps1
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# AI assistant files
+.claude/
+.grok/
+
+# Error reports
+robosync_errors_*
+errors_*
+
+# Binary archives
+*.zip
+*.tar.gz
+*.crate
+
+# Platform-specific
+.DS_Store
+Thumbs.db

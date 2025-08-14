@@ -1,0 +1,47 @@
+[package]
+name = "robosync"
+version = "2.1.0"
+edition = "2021"
+authors = ["RoboSync Contributors"]
+description = "High-performance file synchronization with robocopy-style CLI"
+license = "MIT"
+
+[dependencies]
+# Core dependencies only - no bloat
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+indicatif = "0.17"  # Progress bars
+crossterm = "0.27"  # Terminal control
+rayon = "1.10"      # Parallel iterators
+tar = "0.4"         # For tar streaming
+walkdir = "2.5"     # Directory traversal
+parking_lot = "0.12" # Better mutexes
+
+# Windows-specific dependencies
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = [
+    "fileapi",
+    "handleapi", 
+    "ioapiset",
+    "minwinbase",
+    "processthreadsapi",
+    "synchapi",
+    "sysinfoapi",
+    "winbase",
+    "winerror",
+    "winnt",
+    "errhandlingapi",
+    "std"
+]}
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+]}
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
