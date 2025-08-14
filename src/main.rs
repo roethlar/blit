@@ -16,12 +16,11 @@ use std::sync::Arc;
 use std::time::Instant;
 use anyhow::{Result, Context};
 use clap::Parser;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::buffer::BufferSizer;
 use crate::copy::{CopyStats, chunked_copy_file, parallel_copy_files, windows_copyfile, file_needs_copy};
 use crate::tar_stream::{tar_stream_transfer, TarConfig};
-use crate::windows_enum::{enumerate_directory, enumerate_directory_filtered, categorize_files, FileEntry, FileFilter};
+use crate::windows_enum::{enumerate_directory_filtered, categorize_files, FileEntry, FileFilter};
 
 /// Command-line arguments
 #[derive(Parser, Debug)]
@@ -37,11 +36,11 @@ struct Args {
     #[arg(short = 't', long, default_value_t = 0)]
     threads: usize,
     
-    /// Verbose output
+    /// Show processing stages and operations (discovery, categorization, etc.)
     #[arg(short, long)]
     verbose: bool,
     
-    /// Show progress display (same as verbose mode)
+    /// Show individual file operations as they happen
     #[arg(short, long)]
     progress: bool,
     
@@ -107,7 +106,7 @@ fn main() -> Result<()> {
     
     // Simple activity indicator
     if show_activity {
-        print!("RoboSync v2.1.1...");
+        print!("RoboSync v2.1.11...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
     
@@ -116,8 +115,8 @@ fn main() -> Result<()> {
         println!("DRY RUN MODE - No files will be copied");
     }
     
-    if args.verbose || args.progress {
-        println!("RoboSync v2.1.1 - Linux/macOS Optimized");
+    if args.verbose {
+        println!("RoboSync v2.1.11 - Linux/macOS Optimized");
         println!("Source: {:?}", args.source);
         println!("Destination: {:?}", args.destination);
         println!("Network transfer: {}", is_network);
@@ -136,11 +135,11 @@ fn main() -> Result<()> {
     
     // Check if source is a single file
     if args.source.is_file() {
-        return copy_single_file(&args.source, &args.destination, is_network, args.verbose || args.progress);
+        return copy_single_file(&args.source, &args.destination, is_network, args.progress);
     }
     
     // Enumerate files with progress
-    if args.verbose || args.progress {
+    if args.verbose {
         println!("Enumerating files...");
     }
     
@@ -159,7 +158,7 @@ fn main() -> Result<()> {
         },
     };
     
-    if args.verbose || args.progress {
+    if args.verbose {
         if !args.exclude_dirs.is_empty() {
             println!("Excluding directories: {:?}", args.exclude_dirs);
         }
@@ -177,7 +176,7 @@ fn main() -> Result<()> {
     if show_activity {
         print!(" found {}, copying...", total_files);
         std::io::Write::flush(&mut std::io::stdout()).ok();
-    } else if args.verbose || args.progress {
+    } else if args.verbose {
         println!("Found {} files ({:.2} GB)", total_files, total_size as f64 / 1_073_741_824.0);
     }
     
@@ -235,85 +234,136 @@ fn main() -> Result<()> {
         return Ok(());
     }
     
-    if args.verbose || args.progress {
+    if args.verbose {
         println!("Small files (<1MB): {}", small.len());
         println!("Medium files (1-100MB): {}", medium.len());
         println!("Large files (>100MB): {}", large.len());
     }
     
     // Track overall progress
-    let mut files_processed = 0u64;
-    let mut bytes_processed = 0u64;
-    
     let mut total_stats = CopyStats::default();
     let buffer_sizer = Arc::new(BufferSizer::new());
-    
-    // Process small files with tar streaming (if beneficial)
-    let use_tar = !args.no_tar && (args.force_tar || should_use_tar(&small, is_network));
-    
-    if use_tar && !small.is_empty() {
-        if args.verbose || args.progress {
-            println!("Using tar streaming for {} small files", small.len());
-        }
-        
-        let tar_result = process_small_files_tar(
-            &small,
-            &args.source,
-            &args.destination,
-            false,
-        )?;
-        
-        files_processed += tar_result.0;
-        bytes_processed += tar_result.1;
-        total_stats.files_copied += tar_result.0;
-        total_stats.bytes_copied += tar_result.1;
-        
-    } else if !small.is_empty() {
-        // Process small files individually
-        
-        let small_pairs = prepare_copy_pairs(&small, &args.source, &args.destination);
-        let small_stats = parallel_copy_files(small_pairs, buffer_sizer.clone(), is_network);
-        
-        files_processed += small_stats.files_copied;
-        bytes_processed += small_stats.bytes_copied;
-        merge_stats(&mut total_stats, small_stats);
-    }
-    
-    // Process medium files in parallel
-    if !medium.is_empty() {
-        if args.verbose || args.progress {
-            println!("Processing {} medium files in parallel", medium.len());
-        }
-        
-        let medium_pairs = prepare_copy_pairs(&medium, &args.source, &args.destination);
-        let medium_stats = parallel_copy_files(medium_pairs, buffer_sizer.clone(), is_network);
-        
-        files_processed += medium_stats.files_copied;
-        bytes_processed += medium_stats.bytes_copied;
-        merge_stats(&mut total_stats, medium_stats);
-    }
-    
-    // Process large files with chunked copy
-    if !large.is_empty() {
-        if args.verbose || args.progress {
-            println!("Processing {} large files", large.len());
-        }
-        
-        for (i, entry) in large.iter().enumerate() {
-            let dst = compute_destination(&entry.path, &args.source, &args.destination);
-            
-            
-            match chunked_copy_file(&entry.path, &dst, &buffer_sizer, is_network, None) {
-                Ok(bytes) => {
-                    files_processed += 1;
-                    bytes_processed += bytes;
-                    total_stats.add_file(bytes);
+
+    // Process all file categories concurrently using separate threads
+    use std::sync::mpsc;
+    use std::thread;
+
+    let (tx, rx) = mpsc::channel::<(&str, CopyStats)>();
+    let mut handles = Vec::new();
+
+    // Thread 1: Process small files with tar streaming (if beneficial)
+    if !small.is_empty() {
+        let use_tar = !args.no_tar && (args.force_tar || should_use_tar(&small, is_network));
+        let small_files = small;
+        let source = args.source.clone();
+        let destination = args.destination.clone();
+        let buffer_sizer_clone = buffer_sizer.clone();
+        let tx_clone = tx.clone();
+        let verbose = args.verbose;
+        let show_files = args.progress;
+
+        let handle = thread::spawn(move || {
+            let mut stats = CopyStats::default();
+
+            if use_tar {
+                if verbose {
+                    println!("Using tar streaming for {} small files", small_files.len());
                 }
-                Err(e) => {
-                    total_stats.add_error(format!("Failed to copy {:?}: {}", entry.path, e));
+
+                match process_small_files_tar(&small_files, &source, &destination, false) {
+                    Ok((files, bytes)) => {
+                        stats.files_copied = files;
+                        stats.bytes_copied = bytes;
+                    }
+                    Err(e) => {
+                        stats.add_error(format!("Tar streaming failed: {}", e));
+                    }
+                }
+            } else {
+                // Process small files individually
+                let small_pairs = prepare_copy_pairs(&small_files, &source, &destination);
+                stats = parallel_copy_files(small_pairs, buffer_sizer_clone, is_network);
+            }
+
+            let _ = tx_clone.send(("small", stats));
+        });
+        handles.push(handle);
+    }
+
+    // Thread 2: Process medium files in parallel
+    if !medium.is_empty() {
+        let medium_files = medium;
+        let source = args.source.clone();
+        let destination = args.destination.clone();
+        let buffer_sizer_clone = buffer_sizer.clone();
+        let tx_clone = tx.clone();
+        let verbose = args.verbose;
+        let show_files = args.progress;
+
+        let handle = thread::spawn(move || {
+            if verbose {
+                println!("Processing {} medium files in parallel", medium_files.len());
+            }
+
+            let medium_pairs = prepare_copy_pairs(&medium_files, &source, &destination);
+            let stats = parallel_copy_files(medium_pairs, buffer_sizer_clone, is_network);
+
+            let _ = tx_clone.send(("medium", stats));
+        });
+        handles.push(handle);
+    }
+
+    // Thread 3: Process large files with chunked copy
+    if !large.is_empty() {
+        let large_files = large;
+        let source = args.source.clone();
+        let destination = args.destination.clone();
+        let buffer_sizer_clone = buffer_sizer.clone();
+        let tx_clone = tx.clone();
+        let verbose = args.verbose;
+        let show_files = args.progress;
+
+        let handle = thread::spawn(move || {
+            if verbose {
+                println!("Processing {} large files", large_files.len());
+            }
+
+            let mut stats = CopyStats::default();
+
+            for entry in &large_files {
+                let dst = compute_destination(&entry.path, &source, &destination);
+
+                // Simple chunked copy for all large files
+                match chunked_copy_file(&entry.path, &dst, &buffer_sizer_clone, is_network, None) {
+                    Ok(bytes) => {
+                        stats.add_file(bytes);
+
+                        if show_files {
+                            println!("  Chunked: {} → {} ({} bytes)", 
+                                entry.path.display(), dst.display(), bytes);
+                        }
+                    }
+                    Err(e) => {
+                        stats.add_error(format!("Failed to copy {:?}: {}", entry.path, e));
+                    }
                 }
             }
-        }
+
+            let _ = tx_clone.send(("large", stats));
+        });
+        handles.push(handle);
+    }
+
+    // Collect results from all threads
+    drop(tx); // Close sender so receiver knows when all threads are done
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    // Collect all stats
+    while let Ok((_category, stats)) = rx.recv() {
+        merge_stats(&mut total_stats, stats);
     }
     
     
@@ -323,9 +373,9 @@ fn main() -> Result<()> {
             println!("Scanning destination for extra files...");
         }
         
-        let deletion_stats = handle_mirror_deletion(&args.source, &args.destination, &filter, args.verbose || args.progress, args.dry_run)?;
+        let deletion_stats = handle_mirror_deletion(&args.source, &args.destination, &filter, args.progress, args.dry_run)?;
         
-        if (args.verbose || args.progress) && (deletion_stats.0 > 0 || deletion_stats.1 > 0) {
+        if args.verbose && (deletion_stats.0 > 0 || deletion_stats.1 > 0) {
             println!("Deleted {} files and {} directories", deletion_stats.0, deletion_stats.1);
         }
     }
@@ -390,15 +440,29 @@ fn is_network_path(_path: &Path) -> bool {
     false
 }
 
-/// Determine if tar streaming would be beneficial
+/// Determine if tar streaming would be beneficial with dynamic threshold
 fn should_use_tar(small_files: &[FileEntry], is_network: bool) -> bool {
-    // Use tar if we have many small files
-    // Thresholds tuned for Windows performance
-    if is_network {
-        small_files.len() > 100  // Lower threshold for network
+    let count = small_files.len();
+    
+    // Quick analysis (O(1) operations only)
+    let total_size: u64 = small_files.iter().map(|f| f.size).sum();
+    let avg_size = if count > 0 { total_size / count as u64 } else { 0 };
+    
+    // Dynamic threshold based on file characteristics
+    let threshold = if is_network {
+        100  // Network always uses lower threshold
     } else {
-        small_files.len() > 500  // Higher threshold for local
-    }
+        // Local dynamic threshold based on average file size
+        if avg_size < 1024 {        // Very tiny files (<1KB avg)
+            200                     // Lower threshold - tar helps more
+        } else if avg_size < 8192 { // Small files (<8KB avg) 
+            500                     // Standard threshold
+        } else {                    // Larger small files (>8KB avg)
+            1000                    // Higher threshold - parallel copy better
+        }
+    };
+    
+    count > threshold
 }
 
 /// Copy a single file

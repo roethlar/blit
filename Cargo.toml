@@ -1,6 +1,6 @@
 [package]
 name = "robosync"
-version = "2.1.1"
+version = "2.1.11"
 edition = "2021"
 authors = ["RoboSync Contributors"]
 description = "High-performance file synchronization with robocopy-style CLI"
@@ -16,6 +16,13 @@ rayon = "1.10"      # Parallel iterators
 tar = "0.4"         # For tar streaming
 walkdir = "2.5"     # Directory traversal
 parking_lot = "0.12" # Better mutexes
+md5 = "0.7"         # For checksum support
+sha2 = "0.10"       # For strong checksums
+blake3 = "1.0"      # For fast checksums
+
+# Unix-specific dependencies
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"        # For sendfile, copy_file_range
 
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]

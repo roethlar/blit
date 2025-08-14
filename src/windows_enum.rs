@@ -87,6 +87,8 @@ impl FileFilter {
             for component in path.components() {
                 if let Some(component_str) = component.as_os_str().to_str() {
                     if glob_match(pattern, component_str) {
+                        // Debug: uncomment to see what's being excluded
+                        // eprintln!("DEBUG: Excluding {} (matched pattern '{}')", path.display(), pattern);
                         return false;
                     }
                 }

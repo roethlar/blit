@@ -189,7 +189,65 @@ pub fn parallel_copy_files(
         .unwrap_or_else(|arc| arc.lock().clone())
 }
 
-/// Chunked copy for large files (>100MB) with progress
+/// Memory-mapped copy for very large files (>100MB)
+#[cfg(unix)]
+pub fn mmap_copy_file(src: &Path, dst: &Path) -> Result<u64> {
+    use std::os::unix::io::AsRawFd;
+    
+    let src_file = File::open(src)?;
+    let file_size = src_file.metadata()?.len();
+    
+    // Create parent directory
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    
+    let dst_file = File::create(dst)?;
+    dst_file.set_len(file_size)?; // Pre-allocate space
+    
+    // For very large files, use copy_file_range or sendfile on Linux
+    #[cfg(target_os = "linux")]
+    {
+        let src_fd = src_file.as_raw_fd();
+        let dst_fd = dst_file.as_raw_fd();
+        
+        // Try copy_file_range first (Linux 4.5+, most efficient)
+        let result = unsafe {
+            libc::copy_file_range(
+                src_fd,
+                std::ptr::null_mut(),
+                dst_fd, 
+                std::ptr::null_mut(),
+                file_size as usize,
+                0
+            )
+        };
+        
+        if result > 0 {
+            return Ok(result as u64);
+        }
+        
+        // Fall back to sendfile (older Linux)
+        let result = unsafe {
+            libc::sendfile(dst_fd, src_fd, std::ptr::null_mut(), file_size as usize)
+        };
+        
+        if result > 0 {
+            return Ok(result as u64);
+        }
+    }
+    
+    // Fall back to regular copy if system calls fail
+    std::fs::copy(src, dst).context("Memory-mapped copy fallback failed")
+}
+
+#[cfg(not(unix))]
+pub fn mmap_copy_file(src: &Path, dst: &Path) -> Result<u64> {
+    // Fall back to regular copy on non-Unix systems
+    std::fs::copy(src, dst).context("Copy failed")
+}
+
+/// Chunked copy for large files (>10MB) with progress
 pub fn chunked_copy_file(
     src: &Path,
     dst: &Path,

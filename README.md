@@ -65,8 +65,8 @@ robosync /source /dest -S
 | `--delete` | Delete extra files in destination | `/PURGE` |
 | `-l` | Dry run - list only, don't copy | `/L` |
 | `-c` | Use checksums instead of size+timestamp | - |
-| `-v` | Verbose output | `/V` |
-| `-p` | Show progress display | - |
+| `-v` | Show processing stages (discovery, categorization, etc.) | `/V` |
+| `-p` | Show individual file operations as they happen | - |
 
 ### Directory Handling
 
