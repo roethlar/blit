@@ -8,7 +8,6 @@ use anyhow::{Result, Context};
 use rayon::prelude::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use crate::progress::CargoProgress;
 
 use crate::buffer::BufferSizer;
 use crate::windows_enum::FileEntry;
@@ -108,19 +107,13 @@ pub fn parallel_copy_files(
     files: Vec<(FileEntry, PathBuf)>,
     buffer_sizer: Arc<BufferSizer>,
     is_network: bool,
-    progress_display: &Option<CargoProgress>,
 ) -> CopyStats {
     let stats = Arc::new(Mutex::new(CopyStats::default()));
     
     // Use rayon for parallel copying
     files.par_iter().enumerate().for_each(|(i, (entry, dst))| {
         // Show progress for verbose mode
-        // Show progress for verbose mode
-        if let Some(ref p) = progress_display {
-            if files.len() < 20 || i % (files.len() / 10).max(1) == 0 {
-                p.print_file_op("Copying", &entry.path.display().to_string());
-            }
-        }
+        // No progress display for maximum performance
         
         match copy_file(&entry.path, dst, &buffer_sizer, is_network) {
             Ok(bytes) => {

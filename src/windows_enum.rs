@@ -221,25 +221,15 @@ pub fn enumerate_directory_filtered(root: &Path, filter: &FileFilter) -> Result<
     
     let mut entries = Vec::new();
     
-    let mut dir_entries = Vec::new();
-    
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
         let path = entry.path();
         
+        // Check directory filtering
         if entry.file_type().is_dir() {
-            // Skip the root directory itself
-            if path == root {
-                continue;
-            }
-            
-            // Check directory filtering
             if !filter.should_include_dir(path) {
                 continue;
             }
-            
-            // Add directory to list for potential empty directory copying
-            dir_entries.push(path.to_path_buf());
         }
         
         if entry.file_type().is_file() {
@@ -252,25 +242,6 @@ pub fn enumerate_directory_filtered(root: &Path, filter: &FileFilter) -> Result<
                     path: path.to_path_buf(),
                     size,
                     is_directory: false,
-                });
-            }
-        }
-    }
-    
-    // Handle empty directory copying based on filter settings
-    if filter.include_empty_dirs {
-        // Add empty directories to entries
-        for dir_path in dir_entries {
-            // Check if directory is empty (no files in our entries list are under this dir)
-            let is_empty = !entries.iter().any(|entry| {
-                entry.path.starts_with(&dir_path)
-            });
-            
-            if is_empty {
-                entries.push(FileEntry {
-                    path: dir_path,
-                    size: 0,
-                    is_directory: true,
                 });
             }
         }

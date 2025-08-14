@@ -11,7 +11,7 @@ license = "MIT"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 indicatif = "0.17"  # Progress bars
-crossterm = "0.27"  # Terminal control
+ctrlc = "3.4"        # Signal handling
 rayon = "1.10"      # Parallel iterators
 tar = "0.4"         # For tar streaming
 walkdir = "2.5"     # Directory traversal
