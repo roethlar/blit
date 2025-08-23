@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "robosync"
-version = "2.1.11"
+version = "2.1.12"
 dependencies = [
  "anyhow",
  "blake3",

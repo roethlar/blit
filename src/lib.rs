@@ -10,3 +10,4 @@ pub mod copy;
 pub mod streaming_delta;
 pub mod tar_stream;
 pub mod windows_enum;
+pub mod log;

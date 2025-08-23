@@ -11,6 +11,8 @@ use anyhow::{Result, Context};
 use rayon::prelude::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use crate::log::{TransferLog, TransferLogEntry, TransferStatus};
+use chrono::Utc;
 
 use crate::buffer::BufferSizer;
 use crate::windows_enum::FileEntry;
@@ -88,46 +90,92 @@ impl CopyStats {
 }
 
 /// Copy a single file with optimal buffer size
-pub fn copy_file(src: &Path, dst: &Path, buffer_sizer: &BufferSizer, is_network: bool) -> Result<u64> {
-    // Get file size for buffer calculation
-    let metadata = fs::metadata(src)?;
-    let file_size = metadata.len();
-    
-    // Calculate optimal buffer size
-    let buffer_size = buffer_sizer.calculate_buffer_size(file_size, is_network);
-    
-    // Create parent directory if needed
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    
-    // Open files
-    let mut reader = BufReader::with_capacity(buffer_size, File::open(src)?);
-    let mut writer = BufWriter::with_capacity(buffer_size, File::create(dst)?);
-    
-    // Allocate copy buffer
-    let mut buffer = vec![0u8; buffer_size];
-    let mut total_bytes = 0u64;
-    
-    // Copy loop
-    loop {
-        let bytes_read = reader.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
+pub fn copy_file(src: &Path, dst: &Path, buffer_sizer: &BufferSizer, is_network: bool, sync_job_id: &str, transfer_log: &TransferLog) -> Result<u64> {
+    // Log IN_PROGRESS
+    let initial_entry = TransferLogEntry {
+        timestamp: Utc::now().to_rfc3339(),
+        sync_job_id: sync_job_id.to_string(),
+        source: src.to_path_buf(),
+        destination: dst.to_path_buf(),
+        temp_path: None,
+        status: TransferStatus::InProgress,
+        bytes_transferred: 0,
+        error: None,
+    };
+    transfer_log.add_entry(initial_entry).context("Failed to log initial copy_file entry")?;
+
+    let result = (|| {
+        // Get file size for buffer calculation
+        let metadata = fs::metadata(src)?;
+        let file_size = metadata.len();
+        
+        // Calculate optimal buffer size
+        let buffer_size = buffer_sizer.calculate_buffer_size(file_size, is_network);
+        
+        // Create parent directory if needed
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
         }
-        writer.write_all(&buffer[..bytes_read])?;
-        total_bytes += bytes_read as u64;
+        
+        // Open files
+        let mut reader = BufReader::with_capacity(buffer_size, File::open(src)?);
+        let mut writer = BufWriter::with_capacity(buffer_size, File::create(dst)?);
+        
+        // Allocate copy buffer
+        let mut buffer = vec![0u8; buffer_size];
+        let mut total_bytes = 0u64;
+        
+        // Copy loop
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..bytes_read])?;
+            total_bytes += bytes_read as u64;
+        }
+        
+        writer.flush()?;
+        
+        // Copy metadata on Windows
+        #[cfg(windows)]
+        {
+            copy_windows_metadata(src, dst)?;
+        }
+        
+        Ok(total_bytes)
+    })();
+
+    match result {
+        Ok(bytes) => {
+            let completed_entry = TransferLogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                sync_job_id: sync_job_id.to_string(),
+                source: src.to_path_buf(),
+                destination: dst.to_path_buf(),
+                temp_path: None,
+                status: TransferStatus::Completed,
+                bytes_transferred: bytes,
+                error: None,
+            };
+            transfer_log.add_entry(completed_entry).context("Failed to log completed copy_file entry")?;
+            Ok(bytes)
+        },
+        Err(e) => {
+            let failed_entry = TransferLogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                sync_job_id: sync_job_id.to_string(),
+                source: src.to_path_buf(),
+                destination: dst.to_path_buf(),
+                temp_path: None,
+                status: TransferStatus::Failed,
+                bytes_transferred: 0,
+                error: Some(format!("Failed to copy: {}", e)),
+            };
+            transfer_log.add_entry(failed_entry).context("Failed to log failed copy_file entry")?;
+            Err(e)
+        }
     }
-    
-    writer.flush()?;
-    
-    // Copy metadata on Windows
-    #[cfg(windows)]
-    {
-        copy_windows_metadata(src, dst)?;
-    }
-    
-    Ok(total_bytes)
 }
 
 /// Copy Windows-specific metadata (attributes, timestamps)
@@ -160,18 +208,21 @@ fn copy_windows_metadata(_src: &Path, _dst: &Path) -> Result<()> {
 
 /// Parallel copy for medium-sized files (1-100MB)
 pub fn parallel_copy_files(
-    files: Vec<(FileEntry, PathBuf)>,
+    jobs: Vec<CopyJob>,
     buffer_sizer: Arc<BufferSizer>,
     is_network: bool,
+    sync_job_id: &str,
+    transfer_log: &TransferLog,
+    interrupted: Arc<AtomicBool>,
 ) -> CopyStats {
     let stats = Arc::new(Mutex::new(CopyStats::default()));
     
     // Use rayon for parallel copying
-    files.par_iter().enumerate().for_each(|(i, (entry, dst))| {
+    files.par_iter().enumerate().for_each(|(_i, (entry, dst))| {
         // Show progress for verbose mode
         // No progress display for maximum performance
         
-        match copy_file(&entry.path, dst, &buffer_sizer, is_network) {
+        match copy_file(&entry.path, dst, &buffer_sizer, is_network, sync_job_id, transfer_log) {
             Ok(bytes) => {
                 let mut s = stats.lock();
                 s.add_file(bytes);
@@ -254,45 +305,93 @@ pub fn chunked_copy_file(
     buffer_sizer: &BufferSizer,
     is_network: bool,
     progress: Option<&indicatif::ProgressBar>,
+    sync_job_id: &str,
+    transfer_log: &TransferLog,
 ) -> Result<u64> {
-    let metadata = fs::metadata(src)?;
-    let file_size = metadata.len();
-    
-    // For very large files, use 16MB chunks
-    let chunk_size = if file_size > 1_073_741_824 { // > 1GB
-        16 * 1024 * 1024
-    } else {
-        buffer_sizer.calculate_buffer_size(file_size, is_network)
+    // Log IN_PROGRESS
+    let initial_entry = TransferLogEntry {
+        timestamp: Utc::now().to_rfc3339(),
+        sync_job_id: sync_job_id.to_string(),
+        source: src.to_path_buf(),
+        destination: dst.to_path_buf(),
+        temp_path: None,
+        status: TransferStatus::InProgress,
+        bytes_transferred: 0,
+        error: None,
     };
-    
-    // Create parent directory
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    
-    let mut reader = File::open(src)?;
-    let mut writer = File::create(dst)?;
-    let mut buffer = vec![0u8; chunk_size];
-    let mut total_bytes = 0u64;
-    
-    loop {
-        let bytes_read = reader.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
+    transfer_log.add_entry(initial_entry).context("Failed to log initial chunked_copy_file entry")?;
+
+    let result = (|| {
+        let metadata = fs::metadata(src)?;
+        let file_size = metadata.len();
+        
+        // For very large files, use 16MB chunks
+        let chunk_size = if file_size > 1_073_741_824 { // > 1GB
+            16 * 1024 * 1024
+        } else {
+            buffer_sizer.calculate_buffer_size(file_size, is_network)
+        };
+        
+        // Create parent directory
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
         }
         
-        writer.write_all(&buffer[..bytes_read])?;
-        total_bytes += bytes_read as u64;
+        let mut reader = File::open(src)?;
+        let mut writer = File::create(dst)?;
+        let mut buffer = vec![0u8; chunk_size];
+        let mut total_bytes = 0u64;
         
-        if let Some(pb) = progress {
-            pb.set_position(total_bytes);
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            
+            writer.write_all(&buffer[..bytes_read])?;
+            total_bytes += bytes_read as u64;
+            
+            if let Some(pb) = progress {
+                pb.set_position(total_bytes);
+            }
+        }
+        
+        #[cfg(windows)]
+        copy_windows_metadata(src, dst)?;
+        
+        Ok(total_bytes)
+    })();
+
+    match result {
+        Ok(bytes) => {
+            let completed_entry = TransferLogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                sync_job_id: sync_job_id.to_string(),
+                source: src.to_path_buf(),
+                destination: dst.to_path_buf(),
+                temp_path: None,
+                status: TransferStatus::Completed,
+                bytes_transferred: bytes,
+                error: None,
+            };
+            transfer_log.add_entry(completed_entry).context("Failed to log completed chunked_copy_file entry")?;
+            Ok(bytes)
+        },
+        Err(e) => {
+            let failed_entry = TransferLogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                sync_job_id: sync_job_id.to_string(),
+                source: src.to_path_buf(),
+                destination: dst.to_path_buf(),
+                temp_path: None,
+                status: TransferStatus::Failed,
+                bytes_transferred: 0,
+                error: Some(format!("Failed to copy: {}", e)),
+            };
+            transfer_log.add_entry(failed_entry).context("Failed to log failed chunked_copy_file entry")?;
+            Err(e)
         }
     }
-    
-    #[cfg(windows)]
-    copy_windows_metadata(src, dst)?;
-    
-    Ok(total_bytes)
 }
 
 /// Direct system copy for local-to-local transfers on Windows

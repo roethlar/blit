@@ -267,18 +267,18 @@ pub fn enumerate_directory(root: &Path) -> Result<Vec<FileEntry>> {
 }
 
 /// Categorize files by size for optimal copy strategy
-pub fn categorize_files(entries: Vec<FileEntry>) -> (Vec<FileEntry>, Vec<FileEntry>, Vec<FileEntry>) {
+pub fn categorize_files(entries: Vec<CopyJob>) -> (Vec<CopyJob>, Vec<CopyJob>, Vec<CopyJob>) {
     let mut small = Vec::new();   // < 1MB - tar streaming candidates
     let mut medium = Vec::new();  // 1-100MB - parallel copy
     let mut large = Vec::new();   // > 100MB - chunked copy
     
-    for entry in entries {
-        if entry.size < 1_048_576 {
-            small.push(entry);
-        } else if entry.size < 104_857_600 {
-            medium.push(entry);
+    for job in entries {
+        if job.entry.size < 1_048_576 {
+            small.push(job);
+        } else if job.entry.size < 104_857_600 {
+            medium.push(job);
         } else {
-            large.push(entry);
+            large.push(job);
         }
     }
     

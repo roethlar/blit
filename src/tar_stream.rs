@@ -93,6 +93,7 @@ pub fn tar_stream_transfer(
     dest: &Path,
     config: &TarConfig,
     show_progress: bool,
+    start_offset: u64, // For tar streams, this indicates a resume attempt, but the stream restarts from the beginning.
 ) -> Result<(u64, u64)> {
     // Ensure destination exists
     fs::create_dir_all(dest)?;
