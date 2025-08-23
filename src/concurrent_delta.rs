@@ -1,15 +1,15 @@
 //! Concurrent delta analysis for intelligent transfer decisions
-//! 
+//!
 //! This module implements the key insight from Grok/Gemini: analyze files
 //! WHILE copying others, not before. Make decisions based on actual data.
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use anyhow::Result;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
 // use blake3::Hasher; // Not currently used
 
 /// Block size for delta analysis (default 1MB for efficiency)
@@ -76,17 +76,17 @@ impl ConcurrentDeltaAnalyzer {
         // Spawn background analysis thread
         let handle = thread::spawn(move || {
             let start_time = std::time::Instant::now();
-            
+
             // Perform the analysis
             if let Ok(analysis) = analyze_file_pair(&source, &dest) {
                 let mut analysis = analysis;
                 analysis.analysis_time_ms = start_time.elapsed().as_millis();
-                
+
                 // Store result
                 let mut results = results.lock().unwrap();
                 results.insert(source.clone(), analysis);
             }
-            
+
             // Remove from in progress
             let mut in_progress = in_progress.lock().unwrap();
             in_progress.remove(&source_clone);
@@ -110,23 +110,23 @@ impl ConcurrentDeltaAnalyzer {
     /// Wait for a specific analysis to complete (with timeout)
     pub fn wait_for_analysis(&self, source: &Path, timeout_ms: u64) -> Option<DeltaAnalysis> {
         let start = std::time::Instant::now();
-        
+
         loop {
             // Check if complete
             if let Some(analysis) = self.get_analysis(source) {
                 return Some(analysis);
             }
-            
+
             // Check timeout
             if start.elapsed().as_millis() > timeout_ms as u128 {
                 return None;
             }
-            
+
             // Not analyzing and not complete means it failed or wasn't started
             if !self.is_analyzing(source) {
                 return None;
             }
-            
+
             // Brief sleep to avoid spinning
             thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -144,17 +144,17 @@ pub fn analyze_file_pair(source: &Path, dest: &Path) -> Result<DeltaAnalysis> {
     // Get file sizes
     let source_meta = std::fs::metadata(source)?;
     let dest_meta = std::fs::metadata(dest)?;
-    
+
     let source_size = source_meta.len();
     let dest_size = dest_meta.len();
-    
+
     // Quick decision: if sizes are very different, don't use delta
     let size_ratio = if source_size > dest_size {
         source_size as f64 / dest_size.max(1) as f64
     } else {
         dest_size as f64 / source_size.max(1) as f64
     };
-    
+
     if size_ratio > 1.5 {
         // Sizes too different, probably different files
         return Ok(DeltaAnalysis {
@@ -169,44 +169,44 @@ pub fn analyze_file_pair(source: &Path, dest: &Path) -> Result<DeltaAnalysis> {
             analysis_time_ms: 0,
         });
     }
-    
+
     // Sample blocks to estimate difference
-    let blocks_total = ((source_size.min(dest_size) + ANALYSIS_BLOCK_SIZE as u64 - 1) 
-                        / ANALYSIS_BLOCK_SIZE as u64) as usize;
-    
+    let blocks_total = ((source_size.min(dest_size) + ANALYSIS_BLOCK_SIZE as u64 - 1)
+        / ANALYSIS_BLOCK_SIZE as u64) as usize;
+
     // For very large files, sample instead of checking everything
     let sample_rate = if blocks_total > 1000 {
         // Sample 10% of blocks for files with >1000 blocks
         10
     } else if blocks_total > 100 {
-        // Sample 25% of blocks for files with >100 blocks  
+        // Sample 25% of blocks for files with >100 blocks
         4
     } else {
         // Check all blocks for smaller files
         1
     };
-    
+
     let mut source_file = File::open(source)?;
     let mut dest_file = File::open(dest)?;
-    
+
     let mut blocks_different = 0;
     let mut blocks_checked = 0;
     let mut source_buf = vec![0u8; ANALYSIS_BLOCK_SIZE];
     let mut dest_buf = vec![0u8; ANALYSIS_BLOCK_SIZE];
-    
+
     for block_idx in (0..blocks_total).step_by(sample_rate) {
         let offset = block_idx as u64 * ANALYSIS_BLOCK_SIZE as u64;
-        
+
         // Read source block
         source_file.seek(SeekFrom::Start(offset))?;
         let source_bytes = source_file.read(&mut source_buf)?;
-        
+
         // Read dest block
         dest_file.seek(SeekFrom::Start(offset))?;
         let dest_bytes = dest_file.read(&mut dest_buf)?;
-        
+
         blocks_checked += 1;
-        
+
         // Quick byte comparison first
         if source_bytes != dest_bytes || source_buf[..source_bytes] != dest_buf[..dest_bytes] {
             blocks_different += 1;
@@ -218,7 +218,7 @@ pub fn analyze_file_pair(source: &Path, dest: &Path) -> Result<DeltaAnalysis> {
                 blocks_different += 1;
             }
         }
-        
+
         // Early exit if too many differences
         if blocks_different > blocks_checked / 2 {
             // More than 50% different in sample, not worth delta
@@ -235,20 +235,20 @@ pub fn analyze_file_pair(source: &Path, dest: &Path) -> Result<DeltaAnalysis> {
             });
         }
     }
-    
+
     // Extrapolate from sample to estimate total difference
     let estimated_different = if sample_rate > 1 {
         (blocks_different * sample_rate).min(blocks_total)
     } else {
         blocks_different
     };
-    
+
     let percentage_different = (estimated_different as f32 / blocks_total.max(1) as f32) * 100.0;
-    
+
     // Decision logic: use delta if <20% different and file is large enough
     // Lowered minimum from 10MB → 4MB to benefit medium-size updates
     let should_use_delta = percentage_different < 20.0 && source_size >= 4 * 1024 * 1024; // 4MB minimum
-    
+
     Ok(DeltaAnalysis {
         source_path: source.to_path_buf(),
         dest_path: dest.to_path_buf(),
@@ -268,23 +268,23 @@ pub fn quick_delta_check(source: &Path, dest: &Path) -> bool {
     if !dest.exists() {
         return false;
     }
-    
+
     // Get file sizes
     let source_size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
     let dest_size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-    
+
     // Quick heuristics
     // Lowered minimum from 10MB → 4MB
     if source_size < 4 * 1024 * 1024 || dest_size < 4 * 1024 * 1024 {
         return false; // Too small to benefit
     }
-    
+
     // Check size similarity
     let size_ratio = if source_size > dest_size {
         source_size as f64 / dest_size.max(1) as f64
     } else {
         dest_size as f64 / source_size.max(1) as f64
     };
-    
+
     size_ratio < 1.2 // Sizes within 20% of each other
 }

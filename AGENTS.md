@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 - `src/main.rs`: Binary entry; CLI and orchestration.
 - `src/lib.rs`: Library exports for internal modules.
-- Key modules: `algorithm`, `checksum`, `buffer`, `copy`, `tar_stream`, `streaming_delta`, `concurrent_delta`, `windows_enum`, `progress`, `log`.
+- Key modules: `algorithm`, `checksum`, `buffer`, `copy`, `tar_stream`, `streaming_delta`, `concurrent_delta`, `windows_enum`, `progress`, `logger`.
 - Tests: unit tests co-located in modules (e.g., `src/algorithm.rs`, `src/checksum.rs`).
 
 ## Build, Test, and Development Commands
@@ -30,11 +30,10 @@
 ## Commit & Pull Request Guidelines
 - Commits: concise, imperative subject; keep related changes together.
   - Examples: `Fix mirror deletions on empty dirs`, `v2.1.12: optimize small-file tar path`.
-- PRs must include: clear description, rationale, notable perf or memory impact, platforms tested (Linux/macOS/Windows), and any CLI/help updates.
+- PRs must include: clear description, rationale, notable perf or memory impact, platforms tested (Linux/macOS), and any CLI/help updates.
 - Link issues and include minimal repros or sample commands when fixing bugs.
 
 ## Architecture & Platform Notes
 - Strategy by file size: small→tar streaming, medium→parallel copy, large→chunked I/O.
-- Cross-platform: Unix uses `libc`; Windows uses Win32 (`winapi`, `windows-sys`). Guard OS-specific code with `cfg(...)`.
+- Cross-platform: Unix uses `libc`. Guard OS-specific code with `cfg(...)`.
 - Prefer non-allocating, streaming approaches in hot paths; measure before changing algorithms.
-

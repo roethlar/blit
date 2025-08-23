@@ -111,13 +111,13 @@ impl StreamingDelta {
 
         // Use a reasonable buffer size for streaming based on file size
         let buffer_size = if source_size < 10 * 1024 * 1024 {
-            1024 * 1024  // 1MB for smaller files
+            1024 * 1024 // 1MB for smaller files
         } else if source_size < 100 * 1024 * 1024 {
-            4 * 1024 * 1024  // 4MB for medium files
+            4 * 1024 * 1024 // 4MB for medium files
         } else {
-            16 * 1024 * 1024  // 16MB for large files
+            16 * 1024 * 1024 // 16MB for large files
         };
-        
+
         let mut lookahead_buffer = vec![0u8; buffer_size];
         let mut last_progress_report = std::time::Instant::now();
         let report_interval = std::time::Duration::from_secs(5);
@@ -125,7 +125,7 @@ impl StreamingDelta {
         while source_offset < source_size {
             let bytes_to_read = std::cmp::min(
                 std::cmp::min(CHUNK_SIZE, (source_size - source_offset) as usize),
-                buffer_size  // Also limit by actual buffer size
+                buffer_size, // Also limit by actual buffer size
             );
             source_reader.read_exact(&mut lookahead_buffer[..bytes_to_read])?;
 

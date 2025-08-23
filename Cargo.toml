@@ -1,6 +1,6 @@
 [package]
 name = "robosync"
-version = "2.1.12"
+version = "3.0.0"
 edition = "2021"
 authors = ["RoboSync Contributors"]
 description = "High-performance file synchronization with robocopy-style CLI"
@@ -20,36 +20,16 @@ md5 = "0.7"         # For checksum support
 sha2 = "0.10"       # For strong checksums
 blake3 = "1.0"      # For fast checksums
 uuid = { version = "1.0", features = ["v4"] } # Added for unique sync job IDs
-serde = { version = "1.0", features = ["derive"] } # Added for serialization
-serde_json = "1.0" # Added for JSON serialization
-chrono = { version = "0.4", features = ["serde"] } # Added for timestamps
+serde = { version = "1.0", features = ["derive"] } # (may be used elsewhere)
+serde_json = "1.0"
+chrono = { version = "0.4" }
+filetime = "0.2"
 
 # Unix-specific dependencies
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"        # For sendfile, copy_file_range
 
 # Windows-specific dependencies
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = [
-    "fileapi",
-    "handleapi", 
-    "ioapiset",
-    "minwinbase",
-    "processthreadsapi",
-    "synchapi",
-    "sysinfoapi",
-    "winbase",
-    "winerror",
-    "winnt",
-    "errhandlingapi",
-    "std"
-]}
-windows-sys = { version = "0.52", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-    "Win32_System_Threading",
-]}
 
 [profile.release]
 lto = true

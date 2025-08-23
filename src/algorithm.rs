@@ -35,7 +35,6 @@ impl DeltaAlgorithm {
         self
     }
 
-
     /// Generate checksums for destination file blocks
     pub fn generate_checksums(&self, data: &[u8]) -> Result<Vec<BlockChecksum>> {
         let mut checksums = Vec::new();

@@ -1,5 +1,5 @@
-//! RoboSync Rev3 - Simplified, Windows-optimized file synchronization
-//! 
+//! RoboSync Rev3 - Simplified, high-performance file synchronization
+//!
 //! Design goals:
 //! - Saturate 10GbE network (1+ GB/s throughput)
 //! - Minimal startup overhead
@@ -8,147 +8,201 @@
 
 mod buffer;
 mod copy;
+mod fs_enum;
+mod logger;
+mod net;
 mod tar_stream;
-mod windows_enum;
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use std::time::Instant;
-use uuid::Uuid;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use clap::Parser;
-use crate::log::{TransferLog, TransferLogEntry, TransferStatus};
-use chrono::Utc;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::buffer::BufferSizer;
-use crate::copy::{CopyStats, chunked_copy_file, parallel_copy_files, windows_copyfile, file_needs_copy};
-use crate::tar_stream::{tar_stream_transfer, TarConfig};
-use crate::windows_enum::{enumerate_directory_filtered, categorize_files, FileEntry, FileFilter};
+use crate::copy::{
+    chunked_copy_file, file_needs_copy, parallel_copy_files, windows_copyfile, CopyStats,
+};
+use crate::fs_enum::{
+    categorize_files, enumerate_directory_filtered, CopyJob, FileEntry, FileFilter,
+};
+use crate::logger::{Logger, NoopLogger, TextLogger};
+use crate::tar_stream::{tar_stream_transfer_list, TarConfig};
 
 /// Command-line arguments
 #[derive(Parser, Debug)]
-#[command(author, version, about = "RoboSync v2.1 - High-performance file synchronization with robocopy-style CLI")]
+#[command(
+    author,
+    version,
+    about = "RoboSync - Fast local + daemon sync with rsync-style delta (push/pull) and robocopy-style CLI"
+)]
 struct Args {
-    /// Source directory or file
-    source: PathBuf,
-    
-    /// Destination directory or file
-    destination: PathBuf,
-    
+    /// Source directory or file (not required with --serve)
+    #[arg(required_unless_present = "serve")]
+    source: Option<PathBuf>,
+
+    /// Destination directory or file (not required with --serve)
+    #[arg(required_unless_present = "serve")]
+    destination: Option<PathBuf>,
+
     /// Number of threads (0 = auto)
     #[arg(short = 't', long, default_value_t = 0)]
     threads: usize,
-    
+
     /// Show processing stages and operations (discovery, categorization, etc.)
     #[arg(short, long)]
     verbose: bool,
-    
+
     /// Show individual file operations as they happen
     #[arg(short, long)]
     progress: bool,
-    
+
     /// Mirror mode - copy and delete extra files (same as --delete)
     #[arg(long = "mir", alias = "mirror")]
     mirror: bool,
-    
+
     /// Delete extra files in destination
     #[arg(long, alias = "del", alias = "purge")]
     delete: bool,
-    
+
     /// Copy subdirectories, but not empty ones (/S)
     #[arg(short = 's', long)]
     subdirs: bool,
-    
+
     /// Copy subdirectories including empty ones (/E) - default behavior
     #[arg(short = 'e', long)]
     empty_dirs: bool,
-    
+
+    /// Do not include empty directories (alias for /S)
+    #[arg(long = "no-empty-dirs")]
+    no_empty_dirs: bool,
+
     /// List only - don't copy files (dry run) (/L)
     #[arg(short = 'l', long, alias = "list-only")]
     dry_run: bool,
-    
+
     /// Exclude files matching patterns (/XF)
     #[arg(long = "xf", action = clap::ArgAction::Append)]
     exclude_files: Vec<String>,
-    
+
     /// Exclude directories matching patterns (/XD)
     #[arg(long = "xd", action = clap::ArgAction::Append)]
     exclude_dirs: Vec<String>,
-    
+
     /// Use checksums for comparison instead of size+timestamp
     #[arg(short = 'c', long)]
     checksum: bool,
-    
+
     /// Force tar streaming for small files
     #[arg(long)]
     force_tar: bool,
-    
+
     /// Disable tar streaming
     #[arg(long)]
     no_tar: bool,
+
+    /// Run as daemon (server mode)
+    #[arg(long)]
+    serve: bool,
+
+    /// Bind address for --serve
+    #[arg(long, default_value = "0.0.0.0:9031")]
+    bind: String,
+
+    /// Root directory for --serve
+    #[arg(long, default_value = "/")]
+    root: PathBuf,
+    /// Write JSONL log entries to file
+    #[arg(long = "log-file")]
+    log_file: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     // Set up Ctrl-C handler
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let r = interrupted.clone();
     ctrlc::set_handler(move || {
-        eprintln!("\nInterrupted by user. Attempting graceful shutdown...");
-        r.store(true, Ordering::SeqCst);
-    }).expect("Error setting Ctrl-C handler");
-    
-    let args = Args::parse();
-    let sync_job_id = Uuid::new_v4().to_string();
-    let transfer_log = TransferLog::new(&args.destination);
+        eprintln!("\nInterrupted by user. Exiting (Ctrl-C)...");
+        // Exit immediately with 130 (128 + SIGINT)
+        std::process::exit(130);
+    })
+    .expect("Error setting Ctrl-C handler");
 
-    let initial_entry = TransferLogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        sync_job_id: sync_job_id.clone(),
-        source: args.source.clone(),
-        destination: args.destination.clone(),
-        temp_path: None,
-        status: TransferStatus::InProgress,
-        bytes_transferred: 0,
-        error: None,
+    let args = Args::parse();
+
+    // Server mode
+    if args.serve {
+        return server_main(&args.bind, &args.root);
+    }
+    // Choose logger once; zero overhead in hot paths with NoopLogger
+    let logger: Arc<dyn Logger + Send + Sync> = if let Some(ref p) = args.log_file {
+        match TextLogger::new(p) {
+            Ok(l) => Arc::new(l),
+            Err(_) => Arc::new(NoopLogger),
+        }
+    } else {
+        Arc::new(NoopLogger)
     };
-    transfer_log.add_entry(initial_entry).context("Failed to log initial sync job entry")?;
 
     let start = Instant::now();
-    
+
     // Handle delete/mirror flags (robocopy compatibility)
     let delete_extra = args.delete || args.mirror;
-    
+
+    // Extract required positional args in non-serve mode
+    let dest_path = args
+        .destination
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("destination required unless --serve"))?;
+    let src_path = args
+        .source
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("source required unless --serve"))?;
+
+    // Network paths: support push (remote destination) and pull (remote source)
+    if let Some(remote) = parse_remote_url(&dest_path) {
+        return client_push(remote, &src_path, &args);
+    }
+    if let Some(remote_src) = parse_remote_url(&src_path) {
+        return client_pull(remote_src, &dest_path, &args);
+    }
+
     // Detect if this is a network transfer
-    let is_network = is_network_path(&args.destination);
-    
+    let is_network = is_network_path(&dest_path);
+
     // Simple activity indicator (no performance impact)
     let show_activity = !(args.verbose || args.progress); // Only show simple indicator if not verbose or progress
-    
+
     // Simple activity indicator with spinner
     let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let mut spinner_index = 0;
-    
+
     if show_activity {
-        print!("{} RoboSync v2.1.12...", spinner_chars[spinner_index]);
+        print!(
+            "{} RoboSync {}...",
+            spinner_chars[spinner_index],
+            env!("CARGO_PKG_VERSION")
+        );
         std::io::Write::flush(&mut std::io::stdout()).ok();
         spinner_index = (spinner_index + 1) % spinner_chars.len();
     }
-    
+
     // Dry run mode - just list what would be copied
     if args.dry_run {
         println!("DRY RUN MODE - No files will be copied");
     }
-    
+
     if args.verbose {
-        println!("RoboSync v2.1.12 - Linux/macOS Optimized");
-        println!("Source: {:?}", args.source);
-        println!("Destination: {:?}", args.destination);
+        println!(
+            "RoboSync {} - Linux/macOS Optimized",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!("Source: {:?}", src_path);
+        println!("Destination: {:?}", dest_path);
         println!("Network transfer: {}", is_network);
         if delete_extra {
             println!("Delete mode: enabled (mirror/purge)");
         }
     }
-    
+
     // Set thread count for rayon
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -156,32 +210,40 @@ fn main() -> Result<()> {
             .build_global()
             .context("Failed to set thread count")?;
     }
-    
+
     // Check if source is a single file
-    if args.source.is_file() {
-        return copy_single_file(&args.source, &args.destination, is_network, args.progress, &sync_job_id, &transfer_log, interrupted.clone());
+    if src_path.is_file() {
+        return copy_single_file(&src_path, &dest_path, is_network, args.progress);
     }
-    
+
     // Enumerate files with progress
     if args.verbose {
         println!("Enumerating files...");
     }
-    
+
+    // Decide empty-dir behavior (Robocopy semantics: --mir implies including empties)
+    let include_empty_dirs = if delete_extra {
+        if args.subdirs || args.no_empty_dirs {
+            if args.verbose { println!("Note: --mir implies --empty-dirs; including empty directories."); }
+        }
+        true
+    } else if args.subdirs || args.no_empty_dirs {
+        false
+    } else if args.empty_dirs {
+        true
+    } else {
+        true
+    };
+
     // Build filter from CLI arguments
     let filter = FileFilter {
         exclude_files: args.exclude_files.clone(),
         exclude_dirs: args.exclude_dirs.clone(),
         min_size: None,
         max_size: None,
-        include_empty_dirs: if args.subdirs {
-            false  // -s means skip empty dirs
-        } else if args.empty_dirs {
-            true   // -e means include empty dirs
-        } else {
-            true   // default is include empty dirs (/E behavior)
-        },
+        include_empty_dirs,
     };
-    
+
     if args.verbose {
         if !args.exclude_dirs.is_empty() {
             println!("Excluding directories: {:?}", args.exclude_dirs);
@@ -190,94 +252,133 @@ fn main() -> Result<()> {
             println!("Excluding files: {:?}", args.exclude_files);
         }
     }
-    
-    let initial_entries = enumerate_directory_filtered(&args.source, &filter)
+
+    let initial_entries = enumerate_directory_filtered(&src_path, &filter)
         .context("Failed to enumerate source directory")?;
 
-    // Handle resume or restart
-    let copy_jobs_option = handle_resume_or_restart(&transfer_log, &sync_job_id, &args.source, &args.destination, initial_entries, &args)?;
-
-    let copy_jobs = if let Some(jobs) = copy_jobs_option {
-        jobs
-    } else {
-        return Ok(()); // Exit if user chose not to proceed
-    };
+    // Build copy jobs from enumerated entries
+    let copy_jobs: Vec<CopyJob> = initial_entries
+        .into_iter()
+        .map(|entry| CopyJob {
+            entry,
+            start_offset: 0,
+        })
+        .collect();
 
     let total_files = copy_jobs.len();
     let total_size: u64 = copy_jobs.iter().map(|job| job.entry.size).sum();
-    
+
     if show_activity {
-        print!("\r{} found {}, copying...", spinner_chars[spinner_index], total_files);
+        print!(
+            "\r{} found {}, copying...",
+            spinner_chars[spinner_index], total_files
+        );
         std::io::Write::flush(&mut std::io::stdout()).ok();
         spinner_index = (spinner_index + 1) % spinner_chars.len();
     } else if args.verbose {
-        println!("Found {} files ({:.2} GB)", total_files, total_size as f64 / 1_073_741_824.0);
+        println!(
+            "Found {} files ({:.2} GB)",
+            total_files,
+            total_size as f64 / 1_073_741_824.0
+        );
     }
-    
+
     // Filter out files that don't need copying (mirror mode optimization)
-    let entries = if delete_extra {
+    let copy_jobs = if delete_extra {
         if show_activity {
             print!("\r{} comparing...", spinner_chars[spinner_index]);
             std::io::Write::flush(&mut std::io::stdout()).ok();
             spinner_index = (spinner_index + 1) % spinner_chars.len();
         }
-        
+
         use rayon::prelude::*;
-        entries.into_par_iter()
-            .filter(|entry| {
-                let dst = compute_destination(&entry.path, &args.source, &args.destination);
-                match file_needs_copy(&entry.path, &dst, args.checksum) {
+        copy_jobs
+            .into_par_iter()
+            .filter(|job| {
+                let src = &job.entry.path;
+                let dst = compute_destination(src, &src_path, &dest_path);
+                match file_needs_copy(src, &dst, args.checksum) {
                     Ok(needs_copy) => needs_copy,
                     Err(_) => true, // Copy if we can't determine (file might not exist)
                 }
             })
             .collect()
     } else {
-        entries
+        copy_jobs
     };
-    
+
     // Categorize files by size
     let (small, medium, large) = categorize_files(copy_jobs);
-    
+
     // Handle dry run mode
     if args.dry_run {
         println!("\n=== DRY RUN - Files that would be copied ===");
         println!("Small files (<1MB): {}", small.len());
         println!("Medium files (1-100MB): {}", medium.len());
         println!("Large files (>100MB): {}", large.len());
-        println!("Total: {} files ({:.2} GB)", total_files, total_size as f64 / 1_073_741_824.0);
-        
+        println!(
+            "Total: {} files ({:.2} GB)",
+            total_files,
+            total_size as f64 / 1_073_741_824.0
+        );
+
         if args.verbose {
             println!("\n--- Files to copy ---");
-            for (i, entry) in small.iter().chain(medium.iter()).chain(large.iter()).enumerate() {
-                if i < 20 { // Limit output
-                    println!("  {} ({} bytes)", entry.path.display(), entry.size);
+            for (i, entry) in small
+                .iter()
+                .chain(medium.iter())
+                .chain(large.iter())
+                .enumerate()
+            {
+                if i < 20 {
+                    // Limit output
+                    println!(
+                        "  {} ({} bytes)",
+                        entry.entry.path.display(),
+                        entry.entry.size
+                    );
                 } else if i == 20 {
                     println!("  ... and {} more files", total_files - 20);
                     break;
                 }
             }
-            
         }
-        
+
         // Handle mirror mode deletion in dry run
         if delete_extra {
             println!("\nWould also delete extra files in destination.");
-            println!("\nWould delete extra files in destination.");
         }
-        
+
         return Ok(());
     }
-    
+
     if args.verbose {
         println!("Small files (<1MB): {}", small.len());
         println!("Medium files (1-100MB): {}", medium.len());
         println!("Large files (>100MB): {}", large.len());
     }
-    
+
     // Track overall progress
     let mut total_stats = CopyStats::default();
     let buffer_sizer = Arc::new(BufferSizer::new());
+
+    // Optional heartbeat spinner to show activity (local mode)
+    let mut hb_handle = None;
+    let hb_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if show_activity {
+        hb_running.store(true, std::sync::atomic::Ordering::SeqCst);
+        let running = hb_running.clone();
+        hb_handle = Some(std::thread::spawn(move || {
+            let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut idx = 0usize;
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
+                print!("\r{} copying...", spinner[idx]);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                idx = (idx + 1) % spinner.len();
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }));
+    }
 
     // Process all file categories concurrently using separate threads
     use std::sync::mpsc;
@@ -289,13 +390,14 @@ fn main() -> Result<()> {
     // Thread 1: Process small files with tar streaming (if beneficial)
     if !small.is_empty() {
         let use_tar = !args.no_tar && (args.force_tar || should_use_tar(&small, is_network));
-        let small_files = small;
-        let source = args.source.clone();
-        let destination = args.destination.clone();
+        let small_files = small.clone();
+        let source = src_path.clone();
+        let destination = dest_path.clone();
         let buffer_sizer_clone = buffer_sizer.clone();
         let tx_clone = tx.clone();
         let verbose = args.verbose;
         let _show_files = args.progress;
+        let logger_clone = logger.clone();
 
         let handle = thread::spawn(move || {
             let mut stats = CopyStats::default();
@@ -305,7 +407,13 @@ fn main() -> Result<()> {
                     println!("Using tar streaming for {} small files", small_files.len());
                 }
 
-                match process_small_files_tar(&small, &source, &destination, false, &sync_job_id, &transfer_log, interrupted.clone()) {
+                match process_small_files_tar(
+                    &small_files,
+                    &source,
+                    &destination,
+                    false,
+                    &*logger_clone,
+                ) {
                     Ok((files, bytes)) => {
                         stats.files_copied = files;
                         stats.bytes_copied = bytes;
@@ -317,7 +425,12 @@ fn main() -> Result<()> {
             } else {
                 // Process small files individually
                 let small_pairs = prepare_copy_pairs(&small_files, &source, &destination);
-                stats = parallel_copy_files(small_pairs, buffer_sizer_clone, is_network);
+                stats = parallel_copy_files(
+                    small_pairs,
+                    buffer_sizer_clone,
+                    is_network,
+                    &*logger_clone,
+                );
             }
 
             let _ = tx_clone.send(("small", stats));
@@ -328,12 +441,13 @@ fn main() -> Result<()> {
     // Thread 2: Process medium files in parallel
     if !medium.is_empty() {
         let medium_files = medium;
-        let source = args.source.clone();
-        let destination = args.destination.clone();
+        let source = src_path.clone();
+        let destination = dest_path.clone();
         let buffer_sizer_clone = buffer_sizer.clone();
         let tx_clone = tx.clone();
         let verbose = args.verbose;
         let _show_files = args.progress;
+        let logger_clone = logger.clone();
 
         let handle = thread::spawn(move || {
             if verbose {
@@ -341,7 +455,8 @@ fn main() -> Result<()> {
             }
 
             let medium_pairs = prepare_copy_pairs(&medium_files, &source, &destination);
-            let stats = parallel_copy_files(medium_pairs, buffer_sizer_clone, is_network, &sync_job_id, &transfer_log, interrupted.clone());
+            let stats =
+                parallel_copy_files(medium_pairs, buffer_sizer_clone, is_network, &*logger_clone);
 
             let _ = tx_clone.send(("medium", stats));
         });
@@ -351,12 +466,13 @@ fn main() -> Result<()> {
     // Thread 3: Process large files with chunked copy
     if !large.is_empty() {
         let large_files = large;
-        let source = args.source.clone();
-        let destination = args.destination.clone();
+        let source = src_path.clone();
+        let destination = dest_path.clone();
         let buffer_sizer_clone = buffer_sizer.clone();
         let tx_clone = tx.clone();
         let verbose = args.verbose;
         let show_files = args.progress;
+        let logger_clone = logger.clone();
 
         let handle = thread::spawn(move || {
             if verbose {
@@ -366,20 +482,31 @@ fn main() -> Result<()> {
             let mut stats = CopyStats::default();
 
             for entry in &large_files {
-                let dst = compute_destination(&entry.path, &source, &destination);
+                let dst = compute_destination(&entry.entry.path, &source, &destination);
 
                 // Simple chunked copy for all large files
-                match chunked_copy_file(&entry.path, &dst, &buffer_sizer_clone, is_network, None, &sync_job_id, &transfer_log, interrupted.clone()) {
+                match chunked_copy_file(
+                    &entry.entry.path,
+                    &dst,
+                    &buffer_sizer_clone,
+                    is_network,
+                    None,
+                    &*logger_clone,
+                ) {
                     Ok(bytes) => {
                         stats.add_file(bytes);
 
                         if show_files {
-                            println!("  Chunked: {} → {} ({} bytes)", 
-                                entry.path.display(), dst.display(), bytes);
+                            println!(
+                                "  Chunked: {} → {} ({} bytes)",
+                                entry.entry.path.display(),
+                                dst.display(),
+                                bytes
+                            );
                         }
                     }
                     Err(e) => {
-                        stats.add_error(format!("Failed to copy {:?}: {}", entry.path, e));
+                        stats.add_error(format!("Failed to copy {:?}: {}", entry.entry.path, e));
                     }
                 }
             }
@@ -400,39 +527,56 @@ fn main() -> Result<()> {
     while let Ok((_category, stats)) = rx.recv() {
         merge_stats(&mut total_stats, stats);
     }
-    
-    
+
     // Handle mirror mode - delete extra files in destination
     if delete_extra {
         if args.verbose || args.progress {
             println!("Scanning destination for extra files...");
         }
-        
-        let deletion_stats = handle_mirror_deletion(&args.source, &args.destination, &filter, args.progress, args.dry_run)?;
-        
+
+        let deletion_stats =
+            handle_mirror_deletion(&src_path, &dest_path, &filter, args.progress, args.dry_run)?;
+
         if args.verbose && (deletion_stats.0 > 0 || deletion_stats.1 > 0) {
-            println!("Deleted {} files and {} directories", deletion_stats.0, deletion_stats.1);
+            println!(
+                "Deleted {} files and {} directories",
+                deletion_stats.0, deletion_stats.1
+            );
         }
     }
-    
+
+    // Finish heartbeat spinner
+    if let Some(h) = hb_handle.take() {
+        hb_running.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = h.join();
+    }
+
     // Finish progress and print results
     // Simple completion indicator
     if show_activity {
-        print!("\r{} done!                    \n", spinner_chars[spinner_index]);
+        print!(
+            "\r{} done!                    \n",
+            spinner_chars[spinner_index]
+        );
     }
-    
+
     // Print summary (always show)
     let elapsed = start.elapsed();
     if !args.progress || args.verbose {
         println!();
         println!("=== Copy Complete ===");
         println!("Files copied: {}", total_stats.files_copied);
-        println!("Total size: {:.2} GB", total_stats.bytes_copied as f64 / 1_073_741_824.0);
+        println!(
+            "Total size: {:.2} GB",
+            total_stats.bytes_copied as f64 / 1_073_741_824.0
+        );
         println!("Time: {:.2}s", elapsed.as_secs_f64());
-        println!("Throughput: {:.2} MB/s", 
-            (total_stats.bytes_copied as f64 / 1_048_576.0) / elapsed.as_secs_f64());
+        println!(
+            "Throughput: {:.2} MB/s",
+            (total_stats.bytes_copied as f64 / 1_048_576.0) / elapsed.as_secs_f64()
+        );
     }
-    
+
     if !total_stats.errors.is_empty() {
         println!("\nErrors encountered: {}", total_stats.errors.len());
         if args.verbose || args.progress {
@@ -441,90 +585,69 @@ fn main() -> Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }
 
 /// Check if path is a network location
-fn is_network_path(path: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        if let Some(s) = path.to_str() {
-            // UNC paths are network
-            if s.starts_with("\\\\") {
-                return true;
-            }
-            // Check if drive is a network drive using Windows API
-            if s.len() >= 2 && s.chars().nth(1) == Some(':') {
-                use winapi::um::fileapi::GetDriveTypeW;
-                use winapi::um::winbase::DRIVE_REMOTE;
-                use std::ffi::OsStr;
-                use std::os::windows::ffi::OsStrExt;
-                
-                let drive_root = format!("{}:\\", &s[0..1]);
-                let drive_wide: Vec<u16> = OsStr::new(&drive_root)
-                    .encode_wide()
-                    .chain(Some(0))
-                    .collect();
-                
-                let drive_type = unsafe { GetDriveTypeW(drive_wide.as_ptr()) };
-                return drive_type == DRIVE_REMOTE;
-            }
-        }
-    }
+fn is_network_path(_path: &Path) -> bool {
     false
 }
 
 /// Determine if tar streaming would be beneficial with dynamic threshold
-fn should_use_tar(small_files: &[FileEntry], is_network: bool) -> bool {
+fn should_use_tar(small_files: &[CopyJob], is_network: bool) -> bool {
     let count = small_files.len();
-    
+
     // Quick analysis (O(1) operations only)
-    let total_size: u64 = small_files.iter().map(|f| f.size).sum();
-    let avg_size = if count > 0 { total_size / count as u64 } else { 0 };
-    
+    let total_size: u64 = small_files.iter().map(|j| j.entry.size).sum();
+    let avg_size = if count > 0 {
+        total_size / count as u64
+    } else {
+        0
+    };
+
     // Dynamic threshold based on file characteristics
     let threshold = if is_network {
-        100  // Network always uses lower threshold
+        100 // Network always uses lower threshold
     } else {
         // Local dynamic threshold based on average file size
-        if avg_size < 1024 {        // Very tiny files (<1KB avg)
-            200                     // Lower threshold - tar helps more
-        } else if avg_size < 8192 { // Small files (<8KB avg) 
-            500                     // Standard threshold
-        } else {                    // Larger small files (>8KB avg)
-            1000                    // Higher threshold - parallel copy better
+        if avg_size < 1024 {
+            // Very tiny files (<1KB avg)
+            200 // Lower threshold - tar helps more
+        } else if avg_size < 8192 {
+            // Small files (<8KB avg)
+            500 // Standard threshold
+        } else {
+            // Larger small files (>8KB avg)
+            1000 // Higher threshold - parallel copy better
         }
     };
-    
+
     count > threshold
 }
 
 /// Copy a single file
-fn copy_single_file(
-    src: &Path,
-    dst: &Path,
-    is_network: bool,
-    verbose: bool,
-    sync_job_id: &str,
-    transfer_log: &TransferLog,
-    interrupted: Arc<AtomicBool>,
-) -> Result<()> {
+fn copy_single_file(src: &Path, dst: &Path, is_network: bool, verbose: bool) -> Result<()> {
     if verbose {
         println!("Copying single file...");
     }
-    
+
     let buffer_sizer = BufferSizer::new();
     let bytes = if !is_network {
         // Use Windows CopyFileW for local copies
         windows_copyfile(src, dst)?
     } else {
-        copy::copy_file(src, dst, &buffer_sizer, is_network, sync_job_id, transfer_log, interrupted)?
+        copy::copy_file(
+            src,
+            dst,
+            &buffer_sizer,
+            is_network,
+            &crate::logger::NoopLogger,
+        )?
     };
-    
+
     println!("Copied {} bytes", bytes);
     Ok(())
-}
 }
 
 /// Process small files using tar streaming
@@ -533,108 +656,37 @@ fn process_small_files_tar(
     src_root: &Path,
     dst_root: &Path,
     _show_progress: bool,
-    sync_job_id: &str,
-    transfer_log: &TransferLog,
-    interrupted: Arc<AtomicBool>,
+    logger: &dyn Logger,
 ) -> Result<(u64, u64)> {
-    if interrupted.load(Ordering::SeqCst) {
-        return Ok((0, 0)); // Exit early if interrupted
-    }
-
-    // Log IN_PROGRESS for the overall tar streaming operation
-    let initial_tar_entry = TransferLogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        sync_job_id: sync_job_id.to_string(),
-        source: src_root.to_path_buf(),
-        destination: dst_root.to_path_buf(),
-        temp_path: Some(dst_root.join(format!(".robosync_temp_{}", sync_job_id))), // Predict temp path
-        status: TransferStatus::InProgress,
-        bytes_transferred: 0,
-        error: None,
-    };
-    transfer_log.add_entry(initial_tar_entry).context("Failed to log initial tar stream entry")?;
-
-    let temp_src = dst_root.join(format!(".robosync_temp_{}", sync_job_id));
-    std::fs::create_dir_all(&temp_src)?;
-    
-    // Link or copy files to temp structure
+    logger.start(src_root, dst_root);
+    // Build explicit file list: (source_path, tar_relative_path)
+    let mut file_list: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(jobs.len());
     for job in jobs {
-        if interrupted.load(Ordering::SeqCst) { // Check inside loop
-            let _ = std::fs::remove_dir_all(&temp_src); // Attempt cleanup
-            return Ok((0, 0)); // Exit early if interrupted
-        }
-        let rel_path = job.entry.path.strip_prefix(src_root).unwrap_or(&job.entry.path);
-        let temp_path = temp_src.join(rel_path);
-        
-        if let Some(parent) = temp_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        
-        #[cfg(windows)]
-        {
-            // Try hard link first, fall back to copy
-            if std::fs::hard_link(&job.entry.path, &temp_path).is_err() {
-                std::fs::copy(&job.entry.path, &temp_path)?;
-            }
-        }
-        
-        #[cfg(not(windows))]
-        {
-            std::fs::copy(&job.entry.path, &temp_path)?;
-        }
+        let rel_path = job
+            .entry
+            .path
+            .strip_prefix(src_root)
+            .unwrap_or(&job.entry.path)
+            .to_path_buf();
+        file_list.push((job.entry.path.clone(), rel_path));
     }
-    
-    // Stream via tar  
     let config = TarConfig::default();
-    let result = match tar_stream_transfer(&temp_src, dst_root, &config, false, 0) {
-        Ok(res) => {
-            // Log COMPLETED
-            let completed_tar_entry = TransferLogEntry {
-                timestamp: Utc::now().to_rfc3339(),
-                sync_job_id: sync_job_id.to_string(),
-                source: src_root.to_path_buf(),
-                destination: dst_root.to_path_buf(),
-                temp_path: Some(temp_src.clone()),
-                status: TransferStatus::Completed,
-                bytes_transferred: res.1, // Total bytes transferred by tar_stream_transfer
-                error: None,
-            };
-            transfer_log.add_entry(completed_tar_entry).context("Failed to log completed tar stream entry")?;
-            Ok(res)
-        },
-        Err(e) => {
-            // Log FAILED
-            let failed_tar_entry = TransferLogEntry {
-                timestamp: Utc::now().to_rfc3339(),
-                sync_job_id: sync_job_id.to_string(),
-                source: src_root.to_path_buf(),
-                destination: dst_root.to_path_buf(),
-                temp_path: Some(temp_src.clone()),
-                status: TransferStatus::Failed,
-                bytes_transferred: 0, // Or partial bytes if available
-                error: Some(format!("Tar streaming failed: {}", e)),
-            };
-            transfer_log.add_entry(failed_tar_entry).context("Failed to log failed tar stream entry")?;
-            Err(e) // Re-propagate the error
-        }
-    }?;
-
-    // Cleanup temp directory
-    let _ = std::fs::remove_dir_all(&temp_src);
-    
+    let result = tar_stream_transfer_list(&file_list, dst_root, &config, false)?;
+    logger.done(result.0, result.1, 0.0);
     Ok(result)
 }
 
 /// Prepare source-destination pairs for copying
 fn prepare_copy_pairs(
-    files: &[FileEntry],
+    files: &[CopyJob],
     src_root: &Path,
     dst_root: &Path,
 ) -> Vec<(FileEntry, PathBuf)> {
-    files.iter()
+    files
+        .iter()
         .map(|entry| {
-            let dst = compute_destination(&entry.path, src_root, dst_root);
-            (entry.clone(), dst)
+            let dst = compute_destination(&entry.entry.path, src_root, dst_root);
+            (entry.entry.clone(), dst)
         })
         .collect()
 }
@@ -657,17 +709,16 @@ fn handle_mirror_deletion(
     dry_run: bool,
 ) -> Result<(u64, u64)> {
     use std::collections::HashSet;
-    
+
     // Get all files that should exist (from source)
     let source_entries = enumerate_directory_filtered(source, filter)?;
     let mut source_files: HashSet<PathBuf> = HashSet::new();
     let mut source_dirs: HashSet<PathBuf> = HashSet::new();
-    
+
     for entry in &source_entries {
-        let rel_path = entry.path.strip_prefix(source)
-            .unwrap_or(&entry.path);
+        let rel_path = entry.path.strip_prefix(source).unwrap_or(&entry.path);
         let dest_path = destination.join(rel_path);
-        
+
         if entry.is_directory {
             source_dirs.insert(dest_path);
         } else {
@@ -682,16 +733,16 @@ fn handle_mirror_deletion(
             }
         }
     }
-    
+
     // Scan destination to find extra files
     if !destination.exists() {
         return Ok((0, 0)); // Nothing to delete
     }
-    
+
     let dest_entries = enumerate_directory_filtered(destination, &FileFilter::default())?;
     let mut files_to_delete = Vec::new();
     let mut dirs_to_delete = Vec::new();
-    
+
     for entry in &dest_entries {
         if entry.is_directory {
             if !source_dirs.contains(&entry.path) {
@@ -701,15 +752,15 @@ fn handle_mirror_deletion(
             files_to_delete.push(entry.path.clone());
         }
     }
-    
+
     let total_deletions = files_to_delete.len() + dirs_to_delete.len();
-    
+
     if dry_run {
         if total_deletions > 0 {
             println!("\n=== Mirror Mode - Would Delete ===");
             println!("Extra files: {}", files_to_delete.len());
             println!("Extra directories: {}", dirs_to_delete.len());
-            
+
             if verbose {
                 if !files_to_delete.is_empty() {
                     println!("\n--- Files to delete ---");
@@ -739,15 +790,15 @@ fn handle_mirror_deletion(
         }
         return Ok((files_to_delete.len() as u64, dirs_to_delete.len() as u64));
     }
-    
+
     // Actually delete files and directories
     let mut deleted_files = 0u64;
     let mut deleted_dirs = 0u64;
-    
+
     // Delete files first
     for (_i, path) in files_to_delete.iter().enumerate() {
         // Simple deletion without progress display
-        
+
         match std::fs::remove_file(path) {
             Ok(_) => {
                 deleted_files += 1;
@@ -760,14 +811,14 @@ fn handle_mirror_deletion(
             }
         }
     }
-    
+
     // Delete directories (in reverse order to handle nested dirs)
     dirs_to_delete.sort();
     dirs_to_delete.reverse(); // Delete deepest first
-    
+
     for (_i, path) in dirs_to_delete.iter().enumerate() {
         // Simple deletion without progress display
-        
+
         match std::fs::remove_dir(path) {
             Ok(_) => {
                 deleted_dirs += 1;
@@ -777,90 +828,66 @@ fn handle_mirror_deletion(
             }
             Err(e) => {
                 if verbose {
-                    eprintln!("Failed to delete directory {:?}: {} (may not be empty)", path, e);
+                    eprintln!(
+                        "Failed to delete directory {:?}: {} (may not be empty)",
+                        path, e
+                    );
                 }
             }
         }
     }
-    
-    Ok((deleted_files, deleted_dirs)) 
+
+    Ok((deleted_files, deleted_dirs))
 }
 
-fn handle_resume_or_restart(
-    transfer_log: &TransferLog,
-    sync_job_id: &str,
-    source_root: &Path,
-    destination_root: &Path,
-    initial_entries: Vec<FileEntry>,
-    args: &Args,
-) -> Result<Option<Vec<CopyJob>>> {
-    let all_log_entries = transfer_log.read_log()?;
-
-    let current_job_entries: Vec<&TransferLogEntry> = all_log_entries.iter()
-        .filter(|e| e.sync_job_id == sync_job_id)
-        .collect();
-
-    let last_incomplete_entry = current_job_entries.iter()
-        .filter(|e| e.status == TransferStatus::InProgress || e.status == TransferStatus::Interrupted)
-        .max_by_key(|e| e.timestamp.clone());
-
-    if let Some(entry) = last_incomplete_entry {
-        println!("\nPrevious sync job ({}) was interrupted or incomplete.", sync_job_id);
-        println!("Last known file: {:?} (Status: {:?})", entry.source, entry.status);
-        println!("Do you want to (R)esume, (S)tart fresh, or (E)xit?");
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let choice = input.trim().to_lowercase();
-
-        match choice.as_str() {
-            "r" => {
-                println!("Resuming sync job...");
-                let completed_files: std::collections::HashSet<PathBuf> = current_job_entries.iter()
-                    .filter(|e| e.status == TransferStatus::Completed)
-                    .map(|e| e.source.clone())
-                    .collect();
-
-                let mut copy_jobs = Vec::new();
-                for entry in initial_entries {
-                    if completed_files.contains(&entry.path) {
-                        continue; // Skip already completed files
-                    }
-
-                    let start_offset = current_job_entries.iter()
-                        .filter(|e| e.source == entry.path && (e.status == TransferStatus::InProgress || e.status == TransferStatus::Interrupted))
-                        .max_by_key(|e| e.timestamp.clone())
-                        .map_or(0, |e| e.current_bytes_transferred);
-                    
-                    copy_jobs.push(CopyJob { entry, start_offset });
-                }
-                println!("Skipping {} already completed files.", completed_files.len());
-                Ok(Some(copy_jobs))
-            },
-            "s" => {
-                println!("Starting fresh. Previous log entries for this job will be ignored.");
-                let copy_jobs = initial_entries.into_iter().map(|entry| CopyJob { entry, start_offset: 0 }).collect();
-                Ok(Some(copy_jobs))
-            },
-            "e" => {
-                println!("Exiting.");
-                Ok(None)
-            },
-            _ => {
-                println!("Invalid choice. Exiting.");
-                Ok(None)
-            }
-        }
-    } else {
-        // No incomplete sync found, proceed normally with all files and 0 offset
-        let copy_jobs = initial_entries.into_iter().map(|entry| CopyJob { entry, start_offset: 0 }).collect();
-        Ok(Some(copy_jobs))
-    }
-}
+// Interactivity removed: previous resume/restart logic deleted for non-interactive behavior
 
 /// Merge copy statistics
 fn merge_stats(total: &mut CopyStats, other: CopyStats) {
     total.files_copied += other.files_copied;
     total.bytes_copied += other.bytes_copied;
     total.errors.extend(other.errors);
+}
+/// Remove leftover `.robosync_temp_*` directories from previous runs (best-effort)
+// --- Daemon and client URL helpers ---
+
+#[derive(Debug, Clone)]
+struct RemoteDest {
+    host: String,
+    port: u16,
+    path: PathBuf,
+}
+
+fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
+    let s = path.to_string_lossy();
+    let prefix = "robosync://";
+    if !s.starts_with(prefix) {
+        return None;
+    }
+    let rest = &s[prefix.len()..];
+    let (hp, p) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = match hp.split_once(':') {
+        Some((h, pr)) => (h.to_string(), pr.parse().unwrap_or(9031)),
+        None => (hp.to_string(), 9031),
+    };
+    Some(RemoteDest {
+        host,
+        port,
+        path: PathBuf::from("/".to_string() + p),
+    })
+}
+
+fn server_main(bind: &str, root: &Path) -> Result<()> {
+    net::serve(bind, root)
+}
+
+fn client_push(remote: RemoteDest, src_root: &Path, args: &Args) -> Result<()> {
+    if !src_root.exists() {
+        anyhow::bail!("Source does not exist: {:?}", src_root);
+    }
+    net::client_start(&remote.host, remote.port, &remote.path, src_root, args)
+}
+
+fn client_pull(remote: RemoteDest, dest_root: &Path, args: &Args) -> Result<()> {
+    net::client_pull(&remote.host, remote.port, &remote.path, dest_root, args)
 }

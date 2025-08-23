@@ -1,179 +1,139 @@
-# RoboSync v2.1 🚀
+# RoboSync 3.0.0
 
-**High-performance file synchronization with robocopy-style CLI**
+Fast local + daemon sync with rsync-style delta (push/pull) and a robocopy-style CLI. Linux/macOS only.
 
-RoboSync v2.1 is a cross-platform file synchronization tool built for speed and simplicity. It provides robocopy-compatible command line options while delivering consistently faster performance than rsync.
+RoboSync v3 adds a compact daemon protocol with a manifest handshake so only changed files transfer, server-side mirror deletions, symlink preservation, empty-directory mirroring, and both push and pull modes.
 
-## 🎯 Key Features
+## Key Features
 
-- **⚡ High Performance**: Consistently 2-6× faster than rsync across different workloads
-- **🎮 Robocopy CLI**: Familiar command syntax with `--mir`, `-l`, `--xf`, etc.
-- **📊 Simple Progress**: Lightweight activity indicator without performance impact
-- **🧠 Smart Strategy**: Tar streaming for small files, parallel copy for medium, chunked for large
-- **🌍 Cross-Platform**: Native support for Linux, macOS, and Windows
-- **🔒 Reliable**: Proper empty directory handling, mirror mode, file filtering
+- High throughput: tar streaming for small files, parallel streams for medium, chunked I/O for large.
+- Robocopy-style flags: `--mir`, `-l`, `--xf/--xd`, `-s/--subdirs`, `-e/--empty-dirs`.
+- Daemon push and pull with rsync-style delta (size+mtime) and mirror deletions.
+- Symlink preservation (tar mode and per-file path), timestamps preserved.
+- Empty directories mirrored (and implied by `--mir`).
 
-## 🚀 Quick Start
+## Quick Start
 
-### Installation
+Build:
 
 ```bash
-# Build from source
 cargo build --release
-
-# Binary will be at: target/release/robosync
+# Binary: target/release/robosync
 ```
 
-### Basic Usage
+Local copy:
 
 ```bash
-# Simple copy
-robosync /source /destination
-
-# Mirror mode (most common) - copy and delete extra files
-robosync /source /dest --mir
-
-# Dry run to see what would happen
-robosync /source /dest --mir -l
-
-# Exclude files and directories
-robosync /source /dest --xf "*.tmp" --xd "node_modules" --xd ".git"
-
-# Skip empty directories (robocopy /S style)
-robosync /source /dest -S
+robosync /src /dst --mir -v
 ```
 
-## 📊 Performance Benchmarks
-
-**Linux Performance vs rsync:**
-
-| Test Case | RoboSync v2.1 | rsync | Improvement |
-|-----------|---------------|-------|-------------|
-| Small files (1000 × 13B) | 0.019s | 0.052s | **2.7× faster** |
-| Medium files (50 × 1MB) | 0.010s | 0.061s | **6.1× faster** |
-| Large files (5 × 100MB) | 0.087s | 0.192s | **2.2× faster** |
-
-*Performance varies by hardware, filesystem, and file characteristics*
-
-## 🎛️ Command Reference
-
-### Essential Options
-
-| Option | Description | Robocopy Equivalent |
-|--------|-------------|-------------------|
-| `--mir` | Mirror directory (copy + delete extra) | `/MIR` |
-| `--delete` | Delete extra files in destination | `/PURGE` |
-| `-l` | Dry run - list only, don't copy | `/L` |
-| `-c` | Use checksums instead of size+timestamp | - |
-| `-v` | Show processing stages (discovery, categorization, etc.) | `/V` |
-| `-p` | Show individual file operations as they happen | - |
-
-### Directory Handling
-
-| Option | Description | Robocopy Equivalent |
-|--------|-------------|-------------------|
-| `-e` | Copy subdirectories including empty ones (default) | `/E` |
-| `-s` | Copy subdirectories but not empty ones | `/S` |
-
-### File Selection
-
-| Option | Description | Robocopy Equivalent |
-|--------|-------------|-------------------|
-| `--xf <pattern>` | Exclude files matching pattern | `/XF` |
-| `--xd <pattern>` | Exclude directories matching pattern | `/XD` |
-
-### Advanced Options
-
-| Option | Description |
-|--------|-------------|
-| `-t <n>` | Number of threads (0 = auto) |
-| `--force-tar` | Force tar streaming for small files |
-| `--no-tar` | Disable tar streaming |
-| `-r <n>` | Retry count on failures (default: 3) |
-| `-w <n>` | Wait seconds between retries (default: 1) |
-
-## 🎨 Progress Display
-
-RoboSync v2.1 features a simple, lightweight progress indicator:
-
-```
-RoboSync v2.1... found 316646, copying... comparing... done!
-```
-
-Provides immediate feedback that the tool is working without any performance impact. Use `-v` for detailed verbose output.
-
-## 🏗️ Architecture
-
-RoboSync uses intelligent strategy selection based on file characteristics:
-
-- **Small files (<1MB)**: Tar streaming for reduced syscall overhead
-- **Medium files (1-100MB)**: Parallel copy with optimal thread distribution  
-- **Large files (>100MB)**: Chunked copy with memory-mapped I/O
-- **Empty directories**: Proper creation with `-E`/`-S` flag support
-- **Mirror mode**: Efficient detection and removal of extra files
-
-## 🌍 Platform Support
-
-### Linux 🐧
-- Optimized for ext4, xfs, btrfs filesystems
-- High-performance parallel I/O
-- Memory-mapped file operations
-
-### macOS 🍎  
-- APFS optimizations
-- Extended attribute preservation
-- Conservative threading for stability
-
-### Windows 🪟
-- Native Win32 API integration
-- NTFS optimizations
-- Fast directory enumeration
-
-## 📝 Examples
-
-### Backup with exclusions
-```bash
-robosync ~/Documents/ /backup/docs/ \
-  --mirror \
-  --xd ".cache" --xd "node_modules" \
-  --xf "*.tmp" --xf ".DS_Store" \
-  -v
-```
-
-### Server synchronization
-```bash
-robosync /var/www/ /mnt/backup/www/ \
-  --mirror \
-  -v -p
-```
-
-### Preview changes (dry run)
-```bash
-robosync /source /dest --mir -l -v
-```
-
-## 🔧 Building
+Daemon (push and pull):
 
 ```bash
-# Debug build
-cargo build
+# On server
+robosync --serve --bind 0.0.0.0:9031 --root /srv/root
 
-# Optimized release build
+# Push from client to server
+robosync /data robosync://server:9031/backup --mir -v
+
+# Pull from server to client
+robosync robosync://server:9031/data /backup --mir -v
+```
+
+Notes:
+- Client and server must both be v3.x.
+- `--no-tar` disables tar streaming in daemon push (tar preserves symlinks by default).
+- Pull mirrors empty dirs via MkDir frames; push mirrors via manifest.
+
+## CLI (common flags)
+
+```text
+robosync [OPTIONS] <SOURCE> <DESTINATION>
+
+Options:
+  -v, --verbose              Verbose output
+      --progress             Show per-file operations
+      --mir, --mirror        Mirror mode (copy + delete extras)
+      --delete               Delete extras (same as --mir)
+  -e, --empty-dirs           Include empty directories (/E)
+  -s, --subdirs              Copy subdirectories but skip empty dirs (/S)
+      --no-empty-dirs        Alias for skipping empty directories
+  -l, --dry-run              List only (no changes)
+      --xf <PATTERN>         Exclude files matching pattern(s)
+      --xd <PATTERN>         Exclude directories matching pattern(s)
+  -c, --checksum             Use checksums instead of size+mtime
+      --force-tar            Force tar streaming for small files
+      --no-tar               Disable tar streaming (daemon push)
+      --serve                Run as daemon (server)
+      --bind <ADDR>          Bind address (default 0.0.0.0:9031)
+      --root <DIR>           Root directory for --serve
+
+Semantics:
+- `--mir` implies including empty directories (robocopy /E).
+- Pull uses the same delta protocol in reverse; only needed files transfer.
+```
+
+## Platform Support
+
+Linux and macOS. Tested on Ubuntu and TrueNAS SCALE (daemon).
+
+## Build, Test, Lint
+
+```bash
+cargo build          # debug
 cargo build --release
-
-# Run tests
 cargo test
-
-# Lint
 cargo clippy
 ```
 
-## 📜 License
+## Systemd Service (Daemon)
 
-MIT License - see LICENSE file for details.
+On Linux distributions that use systemd, you can run the RoboSync daemon as a service:
 
----
+1) Create a dedicated user and directories (recommended):
 
-**Ready to sync at robocopy speed?** 🚀
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin robosync || true
+sudo mkdir -p /srv/robosync_root
+sudo chown -R robosync:robosync /srv/robosync_root
+sudo install -m 0755 target/release/robosync /usr/local/bin/robosync
+```
 
-RoboSync v2.1 delivers the familiar robocopy experience with consistently faster performance across all platforms.
+2) Create the unit file at `/etc/systemd/system/robosync.service`:
+
+```ini
+[Unit]
+Description=RoboSync Daemon (file sync server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=robosync
+Group=robosync
+ExecStart=/usr/local/bin/robosync --serve --bind 0.0.0.0:9031 --root /srv/robosync_root
+Restart=on-failure
+RestartSec=2s
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+WorkingDirectory=/srv/robosync_root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+3) Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now robosync.service
+sudo systemctl status robosync.service --no-pager
+```
+
+Firewall note: open TCP port 9031 (or the port you configure in `--bind`).
+
+## Changelog
+
+See CHANGELOG.md.

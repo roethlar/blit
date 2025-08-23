@@ -34,3 +34,5 @@ errors_*
 # Platform-specific
 .DS_Store
 Thumbs.db
+
+TODO.md
