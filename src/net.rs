@@ -148,6 +148,32 @@ fn handle_tar_stream(stream: &mut TcpStream, base: &Path, received: &mut HashSet
             // Skip special device/FIFO entries for safety
             continue;
         }
+        // On Windows, create symlinks explicitly to avoid tar crate failures when privileges are missing
+        #[cfg(windows)]
+        if et.is_symlink() {
+            if let Some(target) = entry.link_name()? {
+                let rel = entry.path()?.to_path_buf();
+                let mut dst = PathBuf::from(base);
+                use std::path::Component::{CurDir, Normal, RootDir, ParentDir, Prefix};
+                for comp in rel.components() {
+                    match comp {
+                        CurDir => {}
+                        Normal(s) => dst.push(s),
+                        RootDir | Prefix(_) => {}
+                        ParentDir => anyhow::bail!("tar symlink contains parent component"),
+                    }
+                }
+                if let Some(parent) = dst.parent() { fs::create_dir_all(parent).ok(); }
+                let t = target.into_owned();
+                let created = std::os::windows::fs::symlink_file(&t, &dst)
+                    .or_else(|_| std::os::windows::fs::symlink_dir(&t, &dst));
+                if created.is_ok() {
+                    received.insert(dst);
+                    continue;
+                }
+            }
+            // If we couldn't handle symlink specially, fall back to default unpack
+        }
         // Unpack within base safely (allows files, dirs, symlinks, hardlinks)
         entry.unpack_in(base)?;
         // Track created path under base without resolving symlinks to avoid false escapes
@@ -238,6 +264,8 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
 
     // Optional manifest: client may send a manifest to decide what to transfer
     let mut need_set: Option<std::collections::HashSet<String>> = None;
+    // Tracks all relative paths the client reported in its manifest (files, symlinks, dirs)
+    let mut client_present: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut expected_paths: HashSet<PathBuf> = HashSet::new();
     let mut pending: Option<(u8, Vec<u8>)> = None;
     if let Ok((t0, pl0)) = read_frame(stream) {
@@ -253,6 +281,8 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                     let rel = std::str::from_utf8(&pl2[3..3 + nlen]).context("utf8 rel")?;
                     let relp = PathBuf::from(rel);
                     let dst = normalize_under_root(&base, &relp)?;
+                    // Record that the client has this path
+                    client_present.insert(rel.to_string());
                     match kind {
                         0 => {
                             // file: size u64 | mtime i64
@@ -300,6 +330,11 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                             fs::create_dir_all(&dst).ok();
                             expected_paths.insert(dst.clone());
                         }
+                        2 => {
+                            // directory: ensure exists; never needed for transfer
+                            fs::create_dir_all(&dst).ok();
+                            expected_paths.insert(dst.clone());
+                        }
                         _ => {}
                     }
                 } else if t2 == FrameType::ManifestEnd as u8 {
@@ -320,7 +355,8 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
             // If pull mode, send needed entries now
             if pull {
                 let needed = need_set.clone().unwrap_or_default();
-                // Only send all if there was no manifest (not the case here); otherwise send exactly the needed set
+                // Send all if there was no manifest; otherwise send paths that are either needed (changed)
+                // or missing on the client (not present in client manifest).
                 let send_all = need_set.is_none();
                 // Send directory creation frames to ensure empty dirs exist on client
                 if include_dirs {
@@ -340,7 +376,10 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                     let rel = ent.path().strip_prefix(&base).unwrap_or(ent.path());
                     if rel.as_os_str().is_empty() { continue; }
                     let rels = rel.to_string_lossy();
-                    if !send_all && !needed.contains(&rels.to_string()) { continue; }
+                    let rels_owned = rels.to_string();
+                    if !send_all {
+                        if !(needed.contains(&rels_owned) || !client_present.contains(&rels_owned)) { continue; }
+                    }
                     if ent.file_type().is_symlink() {
                         if let Ok(t) = std::fs::read_link(ent.path()) {
                             let targ = t.to_string_lossy();
@@ -408,6 +447,14 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                     let _ = std::fs::remove_file(&dst_path);
                     std::os::unix::fs::symlink(target, &dst_path)
                         .with_context(|| format!("symlink {} -> {}", dst_path.display(), target))?;
+                }
+                #[cfg(windows)]
+                {
+                    let _ = std::fs::remove_file(&dst_path);
+                    let _ = std::fs::remove_dir(&dst_path);
+                    // Try file, then dir symlink
+                    let _ = std::os::windows::fs::symlink_file(target, &dst_path)
+                        .or_else(|_| std::os::windows::fs::symlink_dir(target, &dst_path));
                 }
                 received_paths.insert(dst_path.clone());
                 expected_paths.insert(dst_path);
@@ -546,6 +593,7 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn normalize_under_root(root: &Path, p: &Path) -> Result<PathBuf> {
     // Ensure the destination stays under root (no traversal)
     use std::path::Component;
@@ -565,6 +613,22 @@ fn normalize_under_root(root: &Path, p: &Path) -> Result<PathBuf> {
         anyhow::bail!("destination escapes root");
     }
     Ok(canon)
+}
+
+#[cfg(windows)]
+fn normalize_under_root(root: &Path, p: &Path) -> Result<PathBuf> {
+    // Windows-safe normalization: strip any drive/UNC prefix and root components; reject ParentDir
+    use std::path::Component::{CurDir, Normal, ParentDir, Prefix, RootDir};
+    let mut joined = PathBuf::from(root);
+    for comp in p.components() {
+        match comp {
+            ParentDir => anyhow::bail!("destination contains parent component"),
+            Normal(s) => joined.push(s),
+            CurDir => {}
+            Prefix(_) | RootDir => {}
+        }
+    }
+    Ok(joined)
 }
 
 fn mirror_delete_under(base: &Path, received: &HashSet<PathBuf>) -> Result<(u64, u64)> {
@@ -648,15 +712,45 @@ pub fn client_start(
         max_size: None,
         include_empty_dirs: true,
     };
-    let entries = crate::fs_enum::enumerate_directory_filtered(src_root, &filter)?;
+    // Link policy: daemon client defaults to dereference unless preserving links with --sl/--sj
+    #[cfg(windows)]
+    let preserve_links = args.sl || args.sj;
+    #[cfg(not(windows))]
+    let preserve_links = args.sl;
+
+    let entries = if preserve_links {
+        crate::fs_enum::enumerate_directory_filtered(src_root, &filter)?
+    } else {
+        crate::fs_enum::enumerate_directory_deref_filtered(src_root, &filter)?
+    };
     let files: Vec<_> = entries.into_iter().filter(|e| !e.is_directory).collect();
 
-    // Collect symlinks (not included in enumerate_directory_filtered)
+    // Collect symlinks only if preserving; else we dereference and do not send symlink frames
     let mut symlinks: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-    for ent in walkdir::WalkDir::new(src_root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
-        if ent.file_type().is_symlink() {
-            if let Ok(t) = std::fs::read_link(ent.path()) {
-                symlinks.push((ent.path().to_path_buf(), t));
+    if preserve_links {
+        let exclude_all_links = args.xj;
+        let exclude_dir_links = args.xjd;
+        let exclude_file_links = args.xjf;
+        for ent in walkdir::WalkDir::new(src_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if ent.file_type().is_symlink() {
+                if exclude_all_links {
+                    continue;
+                }
+                let path = ent.path().to_path_buf();
+                let target = match std::fs::read_link(&path) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                // Determine if this symlink targets a directory or a file (best-effort)
+                let target_is_dir = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+                if (target_is_dir && exclude_dir_links) || (!target_is_dir && exclude_file_links) {
+                    continue;
+                }
+                symlinks.push((path, target));
             }
         }
     }

@@ -40,11 +40,7 @@ impl TextLogger {
 
 impl Logger for TextLogger {
     fn start(&self, src: &Path, dst: &Path) {
-        self.line(&format!(
-            "START src={} dst={}",
-            src.display(),
-            dst.display()
-        ));
+        self.line(&format!("START src={} dst={}", src.display(), dst.display()));
     }
     fn copy_done(&self, src: &Path, dst: &Path, bytes: u64) {
         self.line(&format!(
@@ -58,17 +54,9 @@ impl Logger for TextLogger {
         self.line(&format!("DELETE path={}", path.display()));
     }
     fn error(&self, context: &str, path: &Path, msg: &str) {
-        self.line(&format!(
-            "ERROR ctx={} path={} msg={}",
-            context,
-            path.display(),
-            msg
-        ));
+        self.line(&format!("ERROR ctx={} path={} msg={}", context, path.display(), msg));
     }
     fn done(&self, files: u64, bytes: u64, seconds: f64) {
-        self.line(&format!(
-            "DONE files={} bytes={} seconds={:.3}",
-            files, bytes, seconds
-        ));
+        self.line(&format!("DONE files={files} bytes={bytes} seconds={seconds:.3}"));
     }
 }

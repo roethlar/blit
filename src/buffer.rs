@@ -3,9 +3,6 @@
 
 use parking_lot::Mutex;
 
-#[cfg(windows)]
-use winapi::um::sysinfoapi::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-
 pub struct BufferSizer {
     max_buffer_size: usize,
     min_buffer_size: usize,
@@ -22,25 +19,11 @@ impl BufferSizer {
         }
     }
 
-    /// Get available memory on Windows
-    #[cfg(windows)]
+    /// Get available memory (conservative fallback to avoid extra dependencies)
     fn get_available_memory() -> u64 {
-        unsafe {
-            let mut mem_status: MEMORYSTATUSEX = std::mem::zeroed();
-            mem_status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-
-            if GlobalMemoryStatusEx(&mut mem_status) != 0 {
-                mem_status.ullAvailPhys
-            } else {
-                // Fallback to 4GB if API fails
-                4 * 1024 * 1024 * 1024
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    fn get_available_memory() -> u64 {
-        4 * 1024 * 1024 * 1024 // 4GB fallback for non-Windows
+        // Use a fixed, conservative value to bound buffer sizing without OS calls.
+        // This keeps behavior consistent across platforms and avoids Windows-only deps.
+        4 * 1024 * 1024 * 1024 // 4GB fallback
     }
 
     /// Calculate optimal buffer size based on file size and available memory
@@ -87,5 +70,11 @@ impl BufferSizer {
 
         // Divide by thread count but maintain minimum
         (single_buffer / thread_count).max(256 * 1024) // 256KB minimum
+    }
+}
+
+impl Default for BufferSizer {
+    fn default() -> Self {
+        Self::new()
     }
 }

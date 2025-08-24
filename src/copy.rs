@@ -42,7 +42,7 @@ pub fn file_needs_copy(src: &Path, dst: &Path, use_checksum: bool) -> Result<boo
         // Copy if source is newer (allow 2 second tolerance for filesystem precision)
         Ok(src_time
             .duration_since(dst_time)
-            .map_or(false, |diff| diff.as_secs() > 2))
+            .is_ok_and(|diff| diff.as_secs() > 2))
     }
 }
 
@@ -132,7 +132,8 @@ pub fn copy_file(
 
         writer.flush()?;
 
-        // No Windows-specific metadata handling
+        // Preserve basic metadata on Windows if available (stubbed)
+        copy_windows_metadata(src, dst)?;
 
         Ok(total_bytes)
     })();
@@ -149,7 +150,10 @@ pub fn copy_file(
     }
 }
 
-// Windows metadata copy removed (Windows support dropped)
+// Minimal stub: on all platforms, do nothing (safe, cross-platform)
+fn copy_windows_metadata(_src: &Path, _dst: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// Parallel copy for medium-sized files (1-100MB)
 pub fn parallel_copy_files(

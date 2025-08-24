@@ -115,6 +115,27 @@ struct Args {
     /// Write JSONL log entries to file
     #[arg(long = "log-file")]
     log_file: Option<PathBuf>,
+
+    /// Copy symbolic links as links (preserve), instead of following targets (robocopy /SL)
+    #[arg(long = "sl", help = "Copy symbolic links as links (preserve)")]
+    sl: bool,
+
+    /// Copy junctions as junctions (preserve), instead of following targets (robocopy /SJ) [Windows only]
+    #[cfg(windows)]
+    #[arg(long = "sj", help = "Copy junctions as junctions (preserve) [Windows]")]
+    sj: bool,
+
+    /// Exclude symbolic links and junction points (robocopy /XJ)
+    #[arg(long = "xj", help = "Exclude all symbolic links and junctions")]
+    xj: bool,
+
+    /// Exclude symbolic links for directories and junction points (robocopy /XJD)
+    #[arg(long = "xjd", help = "Exclude directory symlinks and junctions")]
+    xjd: bool,
+
+    /// Exclude symbolic links for files (robocopy /XJF)
+    #[arg(long = "xjf", help = "Exclude file symlinks")]
+    xjf: bool,
 }
 
 fn main() -> Result<()> {
@@ -253,7 +274,17 @@ fn main() -> Result<()> {
         }
     }
 
-    let initial_entries = enumerate_directory_filtered(&src_path, &filter)
+    // Determine link policy: with --mir, default to dereference unless explicitly preserving
+    #[cfg(windows)]
+    let preserve_links = args.sl || args.sj;
+    #[cfg(not(windows))]
+    let preserve_links = args.sl;
+
+    let initial_entries = if delete_extra && !preserve_links {
+        crate::fs_enum::enumerate_directory_deref_filtered(&src_path, &filter)
+    } else {
+        enumerate_directory_filtered(&src_path, &filter)
+    }
         .context("Failed to enumerate source directory")?;
 
     // Build copy jobs from enumerated entries

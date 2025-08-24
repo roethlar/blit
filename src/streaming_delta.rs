@@ -187,6 +187,7 @@ impl StreamingDelta {
         Ok(transferred_bytes)
     }
 
+    #[allow(clippy::type_complexity)]
     fn find_all_matches(
         &self,
         buffer: &[u8],

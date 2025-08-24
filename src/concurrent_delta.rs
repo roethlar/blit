@@ -139,6 +139,12 @@ impl ConcurrentDeltaAnalyzer {
     }
 }
 
+impl Default for ConcurrentDeltaAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Analyze a file pair to determine if delta transfer makes sense
 pub fn analyze_file_pair(source: &Path, dest: &Path) -> Result<DeltaAnalysis> {
     // Get file sizes
@@ -171,8 +177,9 @@ pub fn analyze_file_pair(source: &Path, dest: &Path) -> Result<DeltaAnalysis> {
     }
 
     // Sample blocks to estimate difference
-    let blocks_total = ((source_size.min(dest_size) + ANALYSIS_BLOCK_SIZE as u64 - 1)
-        / ANALYSIS_BLOCK_SIZE as u64) as usize;
+    let blocks_total = source_size
+        .min(dest_size)
+        .div_ceil(ANALYSIS_BLOCK_SIZE as u64) as usize;
 
     // For very large files, sample instead of checking everything
     let sample_rate = if blocks_total > 1000 {
