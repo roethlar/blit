@@ -21,6 +21,9 @@ test_*.ps1
 # AI assistant files
 .claude/
 .grok/
+chat_transcript.md
+DEVLOG.md
+TODO.md
 
 # Error reports
 robosync_errors_*

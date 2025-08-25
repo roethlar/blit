@@ -5,9 +5,7 @@ use crate::logger::Logger;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,9 +51,9 @@ fn files_have_different_content(src: &Path, dst: &Path) -> Result<bool> {
     Ok(src_hash != dst_hash)
 }
 
-/// Fast file content hashing
-fn hash_file_content(path: &Path) -> Result<u64> {
-    let mut hasher = DefaultHasher::new();
+/// Fast file content hashing using BLAKE3
+fn hash_file_content(path: &Path) -> Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024]; // 64KB chunks
     let mut file = File::open(path)?;
 
@@ -64,10 +62,10 @@ fn hash_file_content(path: &Path) -> Result<u64> {
         if bytes_read == 0 {
             break;
         }
-        buffer[..bytes_read].hash(&mut hasher);
+        hasher.update(&buffer[..bytes_read]);
     }
 
-    Ok(hasher.finish())
+    Ok(hasher.finalize().into())
 }
 
 /// Statistics for copy operations
@@ -310,6 +308,32 @@ pub fn chunked_copy_file(
 }
 
 /// Direct system copy for local-to-local transfers on Windows
+#[cfg(windows)]
+pub fn windows_copyfile(src: &Path, dst: &Path) -> Result<u64> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::Storage::FileSystem::CopyFileExW;
+
+    // Ensure destination directory exists
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let to_wide = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
+    let src_w = to_wide(src.as_os_str());
+    let dst_w = to_wide(dst.as_os_str());
+    let ok = unsafe { CopyFileExW(src_w.as_ptr(), dst_w.as_ptr(), None, None, None, 0).as_bool() };
+    if ok {
+        let bytes = std::fs::metadata(dst)?.len();
+        Ok(bytes)
+    } else {
+        // Fall back to Rust copy if API not available/failed
+        std::fs::copy(src, dst).context("Failed to copy file via CopyFileExW (fallback)")
+    }
+}
+
+#[cfg(not(windows))]
 pub fn windows_copyfile(src: &Path, dst: &Path) -> Result<u64> {
     fs::copy(src, dst).context("Failed to copy file")
 }

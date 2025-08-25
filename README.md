@@ -79,11 +79,42 @@ Linux and macOS. Tested on Ubuntu and TrueNAS SCALE (daemon).
 
 ## Build, Test, Lint
 
+Standard cargo:
+
 ```bash
 cargo build          # debug
 cargo build --release
 cargo test
 cargo clippy
+```
+
+OS-specific build scripts (avoid target collisions):
+
+```bash
+# macOS (outputs under target/macos)
+scripts/build-macos.sh [--release] [--test] [--clippy]
+
+# Linux (outputs under target/linux)
+scripts/build-linux.sh [--release] [--test] [--clippy] [--target <triple>]
+
+# MUSL static (outputs under target/musl)
+scripts/build-musl.sh [--release] [--test] [--clippy] [--target <musl-triple>]
+
+# Windows (outputs under target/windows)
+scripts/build-windows.sh [--release] [--test] [--clippy] [--target <triple>|--msvc]
+```
+
+Makefile shortcuts:
+
+```bash
+make macos          # macOS debug
+make macos-release  # macOS release
+make linux          # Linux debug
+make linux-release  # Linux release
+make musl           # MUSL debug (x86_64 musl)
+make musl-release   # MUSL release (x86_64 musl)
+make windows-gnu    # Windows (MinGW) build
+make windows-msvc   # Windows (MSVC) build
 ```
 
 ## Systemd Service (Daemon)
@@ -137,3 +168,41 @@ Firewall note: open TCP port 9031 (or the port you configure in `--bind`).
 ## Changelog
 
 See CHANGELOG.md.
+
+
+### Build Targets & CPU ISA Portability
+
+If you see this when moving a binary between machines:
+
+  robosync: CPU ISA level is lower than required
+
+it means the binary was built with newer CPU features (e.g., x86-64-v3: AVX2/BMI2) than the target machine supports. This is not a bug in RoboSync; it’s how native-optimized builds behave.
+
+Portable build options (choose one):
+
+- Build on the target machine (recommended):
+  cargo build --release
+
+- Force a portable glibc baseline on the build host:
+  RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release
+  # If the target CPU is very old, use v1:
+  # RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
+
+- Fully static MUSL build (widely portable across distros):
+  cargo build --release --target x86_64-unknown-linux-musl
+
+Tips:
+- Ensure your environment isn’t forcing native features (unset RUSTFLAGS, remove any .cargo/config that sets target-cpu=native).
+- On the target, check /proc/cpuinfo for avx2/bmi2 support if you’re unsure.
+- For maximum performance on a single host, build there (native). For portability, use v2 or MUSL.
+
+## CI
+
+GitHub Actions builds artifacts for Linux (GNU), Linux (MUSL static), macOS, and Windows (MSVC).
+
+- Workflow: .github/workflows/ci.yml
+- Artifacts (per job):
+  - Linux (GNU): target/linux/release/robosync
+  - Linux (MUSL x86_64): target/musl/x86_64-unknown-linux-musl/release/robosync
+  - macOS: target/macos/release/robosync
+  - Windows (MSVC): target/windows/x86_64-pc-windows-msvc/release/robosync.exe

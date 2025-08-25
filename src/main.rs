@@ -11,17 +11,21 @@ mod copy;
 mod fs_enum;
 mod logger;
 mod net;
+mod net_async;
 mod tar_stream;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use parking_lot::Mutex;
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::buffer::BufferSizer;
 use crate::copy::{
-    chunked_copy_file, file_needs_copy, parallel_copy_files, windows_copyfile, CopyStats,
+    chunked_copy_file, file_needs_copy, mmap_copy_file, parallel_copy_files, windows_copyfile,
+    CopyStats,
 };
 use crate::fs_enum::{
     categorize_files, enumerate_directory_filtered, CopyJob, FileEntry, FileFilter,
@@ -37,12 +41,12 @@ use crate::tar_stream::{tar_stream_transfer_list, TarConfig};
     about = "RoboSync - Fast local + daemon sync with rsync-style delta (push/pull) and robocopy-style CLI"
 )]
 struct Args {
-    /// Source directory or file (not required with --serve)
-    #[arg(required_unless_present = "serve")]
+    /// Source directory or file (not required with --serve/--serve-async)
+    #[arg(required_unless_present_any = ["serve", "serve_async"])]
     source: Option<PathBuf>,
 
-    /// Destination directory or file (not required with --serve)
-    #[arg(required_unless_present = "serve")]
+    /// Destination directory or file (not required with --serve/--serve-async)
+    #[arg(required_unless_present_any = ["serve", "serve_async"])]
     destination: Option<PathBuf>,
 
     /// Number of threads (0 = auto)
@@ -101,9 +105,21 @@ struct Args {
     #[arg(long)]
     no_tar: bool,
 
+    /// Disable post-transfer verification (not recommended)
+    #[arg(long = "no-verify")]
+    no_verify: bool,
+
+    /// Disable resumable transfers (delta/ranged writes)
+    #[arg(long = "no-restart")]
+    no_restart: bool,
+
     /// Run as daemon (server mode)
     #[arg(long)]
     serve: bool,
+
+    /// Run as async daemon (Tokio-based server)
+    #[arg(long = "serve-async", hide = true)]
+    serve_async: bool,
 
     /// Bind address for --serve
     #[arg(long, default_value = "0.0.0.0:9031")]
@@ -152,6 +168,9 @@ fn main() -> Result<()> {
     // Server mode
     if args.serve {
         return server_main(&args.bind, &args.root);
+    }
+    if args.serve_async {
+        return server_main_async(&args.bind, &args.root);
     }
     // Choose logger once; zero overhead in hot paths with NoopLogger
     let logger: Arc<dyn Logger + Send + Sync> = if let Some(ref p) = args.log_file {
@@ -245,7 +264,9 @@ fn main() -> Result<()> {
     // Decide empty-dir behavior (Robocopy semantics: --mir implies including empties)
     let include_empty_dirs = if delete_extra {
         if args.subdirs || args.no_empty_dirs {
-            if args.verbose { println!("Note: --mir implies --empty-dirs; including empty directories."); }
+            if args.verbose {
+                println!("Note: --mir implies --empty-dirs; including empty directories.");
+            }
         }
         true
     } else if args.subdirs || args.no_empty_dirs {
@@ -285,7 +306,7 @@ fn main() -> Result<()> {
     } else {
         enumerate_directory_filtered(&src_path, &filter)
     }
-        .context("Failed to enumerate source directory")?;
+    .context("Failed to enumerate source directory")?;
 
     // Build copy jobs from enumerated entries
     let copy_jobs: Vec<CopyJob> = initial_entries
@@ -510,26 +531,31 @@ fn main() -> Result<()> {
                 println!("Processing {} large files", large_files.len());
             }
 
-            let mut stats = CopyStats::default();
+            let stats = Arc::new(Mutex::new(CopyStats::default()));
 
-            for entry in &large_files {
+            large_files.par_iter().for_each(|entry| {
                 let dst = compute_destination(&entry.entry.path, &source, &destination);
+                let mut s = stats.lock();
 
-                // Simple chunked copy for all large files
-                match chunked_copy_file(
-                    &entry.entry.path,
-                    &dst,
-                    &buffer_sizer_clone,
-                    is_network,
-                    None,
-                    &*logger_clone,
-                ) {
+                let copy_result = if !is_network && cfg!(unix) {
+                    mmap_copy_file(&entry.entry.path, &dst)
+                } else {
+                    chunked_copy_file(
+                        &entry.entry.path,
+                        &dst,
+                        &buffer_sizer_clone,
+                        is_network,
+                        None,
+                        &*logger_clone,
+                    )
+                };
+
+                match copy_result {
                     Ok(bytes) => {
-                        stats.add_file(bytes);
-
+                        s.add_file(bytes);
                         if show_files {
                             println!(
-                                "  Chunked: {} → {} ({} bytes)",
+                                "  Copied: {} → {} ({} bytes)",
                                 entry.entry.path.display(),
                                 dst.display(),
                                 bytes
@@ -537,12 +563,15 @@ fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        stats.add_error(format!("Failed to copy {:?}: {}", entry.entry.path, e));
+                        s.add_error(format!("Failed to copy {:?}: {}", entry.entry.path, e));
                     }
                 }
-            }
+            });
 
-            let _ = tx_clone.send(("large", stats));
+            let final_stats = Arc::try_unwrap(stats)
+                .map(|m| m.into_inner())
+                .unwrap_or_default();
+            let _ = tx_clone.send(("large", final_stats));
         });
         handles.push(handle);
     }
@@ -910,6 +939,14 @@ fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
 
 fn server_main(bind: &str, root: &Path) -> Result<()> {
     net::serve(bind, root)
+}
+
+fn server_main_async(bind: &str, root: &Path) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    rt.block_on(net_async::server::serve(bind, root))
 }
 
 fn client_push(remote: RemoteDest, src_root: &Path, args: &Args) -> Result<()> {

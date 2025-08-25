@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.1.0 — 2025-08-25
+- Async pull: implement small-file TAR bundling (TarStart/TarData/TarEnd) with SetAttr for POSIX modes on Unix.
+- Push: fix sent-files accounting to include TAR-bundled files; summary now counts each file exactly once.
+- Pull: fix receive counters to include files unpacked from TAR streams.
+- Cleanup: address clippy issues in networking paths; minor I/O error mapping fixes.
+- Docs: update TODO to reflect completed async pull TAR bundling.
+
 All notable changes to this project will be documented in this file.
 
 ## 3.0.0 – 2025-08-23
@@ -16,4 +23,3 @@ All notable changes to this project will be documented in this file.
 Notes:
 - Client and server must both be on v3.x due to protocol changes.
 - Windows is not supported.
-

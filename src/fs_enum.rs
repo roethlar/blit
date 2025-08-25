@@ -1,6 +1,6 @@
 use anyhow::Result;
-use std::path::{Path, PathBuf};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 // Filesystem enumeration and categorization (Unix focus)
 
 /// Entry with size information for categorization
@@ -220,7 +220,10 @@ pub fn categorize_files(entries: Vec<CopyJob>) -> (Vec<CopyJob>, Vec<CopyJob>, V
 
 /// Enumerate files while following directory links and treating symlinked files as files.
 /// Applies filters and avoids simple symlink cycles by tracking visited canonical directories.
-pub fn enumerate_directory_deref_filtered(root: &Path, filter: &FileFilter) -> Result<Vec<FileEntry>> {
+pub fn enumerate_directory_deref_filtered(
+    root: &Path,
+    filter: &FileFilter,
+) -> Result<Vec<FileEntry>> {
     use walkdir::{DirEntry, WalkDir};
 
     let mut entries = Vec::new();
@@ -256,7 +259,11 @@ pub fn enumerate_directory_deref_filtered(root: &Path, filter: &FileFilter) -> R
             if md.is_file() {
                 let size = md.len();
                 if filter.should_include_file(path, size) {
-                    entries.push(FileEntry { path: path.to_path_buf(), size, is_directory: false });
+                    entries.push(FileEntry {
+                        path: path.to_path_buf(),
+                        size,
+                        is_directory: false,
+                    });
                 }
             }
         }
