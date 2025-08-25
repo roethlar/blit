@@ -1,6 +1,11 @@
-# RoboSync 3.0.0
+# RoboSync 3.1.0
 
-Fast local + daemon sync with rsync-style delta (push/pull) and a robocopy-style CLI. Linux/macOS only.
+Fast local + daemon sync with rsync-style delta (push/pull) and a robocopy-style CLI. Linux and macOS supported; Windows builds are experimental (see Platform Support).
+
+3.1 highlights:
+- Async pull small-file TAR bundling to reduce frame overhead and boost throughput.
+- Accurate “sent files” and byte counters, including tar-bundled files.
+- General polish and clippy cleanups.
 
 RoboSync v3 adds a compact daemon protocol with a manifest handshake so only changed files transfer, server-side mirror deletions, symlink preservation, empty-directory mirroring, and both push and pull modes.
 
@@ -11,6 +16,9 @@ RoboSync v3 adds a compact daemon protocol with a manifest handshake so only cha
 - Daemon push and pull with rsync-style delta (size+mtime) and mirror deletions.
 - Symlink preservation (tar mode and per-file path), timestamps preserved.
 - Empty directories mirrored (and implied by `--mir`).
+
+Experimental (opt-in):
+- Async I/O server prototype behind `--serve-async` with streaming tar unpack and improved pull performance.
 
 ## Quick Start
 
@@ -30,8 +38,11 @@ robosync /src /dst --mir -v
 Daemon (push and pull):
 
 ```bash
-# On server
+# On server (classic)
 robosync --serve --bind 0.0.0.0:9031 --root /srv/root
+
+# On server (experimental async)
+robosync --serve-async --bind 0.0.0.0:9031 --root /srv/root
 
 # Push from client to server
 robosync /data robosync://server:9031/backup --mir -v
@@ -44,6 +55,7 @@ Notes:
 - Client and server must both be v3.x.
 - `--no-tar` disables tar streaming in daemon push (tar preserves symlinks by default).
 - Pull mirrors empty dirs via MkDir frames; push mirrors via manifest.
+- Async mode is experimental and currently optimized for pull; keep client and server on the same minor version.
 
 ## CLI (common flags)
 
@@ -75,7 +87,14 @@ Semantics:
 
 ## Platform Support
 
-Linux and macOS. Tested on Ubuntu and TrueNAS SCALE (daemon).
+- Linux/macOS: supported and tested. Daemon push/pull, mirror deletions, symlinks, and small‑file TAR bundling are enabled.
+- Windows: experimental. CI publishes MSVC builds and helper scripts are provided. Core copy and daemon modes may work, but full parity (e.g., symlink behavior, attribute mirroring, case‑insensitive paths, service setup) is still in progress.
+
+Notes for Windows:
+- Symlink creation may require Developer Mode or elevated privileges; otherwise symlinks fall back or may fail.
+- Read‑only attribute is preserved; broader NTFS ACL/attributes are not yet mirrored.
+- Case‑insensitive path logic and full mirror semantics are being finalized.
+- Use the MSVC artifact or build with `scripts/build-windows.sh --msvc`.
 
 ## Build, Test, Lint
 

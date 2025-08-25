@@ -5,12 +5,12 @@
 *.so
 *.dylib
 *.a
+bench/
 
 # Test data and benchmarks
 benchmark_*.csv
 benchmark_*.ps1
 test_*.ps1
-*.ps1
 
 # Temporary files
 *.tmp
