@@ -1,13 +1,15 @@
 # RoboSync 3.1.0
 
-Fast local + daemon sync with rsync-style delta (push/pull) and a robocopy-style CLI. Linux and macOS supported; Windows builds are experimental (see Platform Support).
+Fast local and remote sync with an async-first daemon, rsync-style delta, and robocopy-style ergonomics. Linux and macOS supported; Windows builds are experimental (see Platform Support).
 
 3.1 highlights:
-- Async pull small-file TAR bundling to reduce frame overhead and boost throughput.
-- Accurate “sent files” and byte counters, including tar-bundled files.
-- General polish and clippy cleanups.
+- Async daemon is the default server, started with the `daemon` subcommand.
+- Direction-agnostic verbs: `mirror`, `copy`, `move` with URL inference (`robosync://host:port/path`).
+- Async small-file TAR bundling to reduce frame overhead and boost throughput.
+- Accurate file/byte counters including tar-bundled files.
+- TUI shell (feature-gated) with Dracula theme preview.
 
-RoboSync v3 adds a compact daemon protocol with a manifest handshake so only changed files transfer, server-side mirror deletions, symlink preservation, empty-directory mirroring, and both push and pull modes.
+RoboSync v3 uses a compact daemon protocol with a manifest handshake so only changed files transfer, server-side mirror deletions, symlink preservation, empty-directory mirroring, and both push and pull modes.
 
 ## Key Features
 
@@ -16,9 +18,6 @@ RoboSync v3 adds a compact daemon protocol with a manifest handshake so only cha
 - Daemon push and pull with rsync-style delta (size+mtime) and mirror deletions.
 - Symlink preservation (tar mode and per-file path), timestamps preserved.
 - Empty directories mirrored (and implied by `--mir`).
-
-Experimental (opt-in):
-- Async I/O server prototype behind `--serve-async` with streaming tar unpack and improved pull performance.
 
 ## Quick Start
 
@@ -29,61 +28,128 @@ cargo build --release
 # Binary: target/release/robosync
 ```
 
-Local copy:
+Local copy (direction-agnostic verbs):
 
 ```bash
-robosync /src /dst --mir -v
+# Mirror: copy + delete extras (includes empty dirs)
+robosync mirror /src /dst -v
+
+# Copy: copy only, never delete
+robosync copy /src /dst -v
+
+# Move: mirror, then remove source after confirmation
+robosync move /src /dst -v
 ```
 
-Daemon (push and pull):
+Daemon and remote paths:
 
 ```bash
-# On server (classic)
-robosync --serve --bind 0.0.0.0:9031 --root /srv/root
+# Start async daemon (default server)
+robosync daemon /srv/root 9031
 
-# On server (experimental async)
-robosync --serve-async --bind 0.0.0.0:9031 --root /srv/root
+# Legacy classic server (temporary fallback)
+robosync --serve-legacy --bind 0.0.0.0:9031 --root /srv/root
 
-# Push from client to server
-robosync /data robosync://server:9031/backup --mir -v
+# Mirror local → remote (direction inferred by robosync://)
+robosync mirror /data robosync://server:9031/backup -v
 
-# Pull from server to client
-robosync robosync://server:9031/data /backup --mir -v
+# Mirror remote → local
+robosync mirror robosync://server:9031/data /backup -v
+```
+
+Verify examples:
+
+```bash
+# Verify two local trees (size+mtime)
+robosync verify /src /dst --limit 20
+
+# Verify with checksums (slower, stronger)
+robosync verify /src /dst --checksum --json > verify.json
+
+# Verify local vs remote and write CSV
+robosync verify /src robosync://server:9031/dst --csv verify.csv --limit 50
+```
+
+Common recipes:
+
+```bash
+# Mirror local data to a server path
+robosync mirror /data robosync://server:9031/backup -v
+
+# High-throughput LAN push
+robosync mirror /big robosync://server:9031/big --net-workers 8 --net-chunk-mb 8 --ludicrous-speed -v
+
+# Pull and verify quickly (size+mtime)
+robosync mirror robosync://server:9031/dataset /local/dataset -v && \
+  robosync verify robosync://server:9031/dataset /local/dataset --limit 20
 ```
 
 Notes:
 - Client and server must both be v3.x.
 - `--no-tar` disables tar streaming in daemon push (tar preserves symlinks by default).
 - Pull mirrors empty dirs via MkDir frames; push mirrors via manifest.
-- Async mode is experimental and currently optimized for pull; keep client and server on the same minor version.
 
-## CLI (common flags)
+## CLI
+
+Subcommands:
 
 ```text
-robosync [OPTIONS] <SOURCE> <DESTINATION>
-
-Options:
-  -v, --verbose              Verbose output
-      --progress             Show per-file operations
-      --mir, --mirror        Mirror mode (copy + delete extras)
-      --delete               Delete extras (same as --mir)
-  -e, --empty-dirs           Include empty directories (/E)
-  -s, --subdirs              Copy subdirectories but skip empty dirs (/S)
-      --no-empty-dirs        Alias for skipping empty directories
-  -l, --dry-run              List only (no changes)
-      --xf <PATTERN>         Exclude files matching pattern(s)
-      --xd <PATTERN>         Exclude directories matching pattern(s)
-  -c, --checksum             Use checksums instead of size+mtime
-      --force-tar            Force tar streaming for small files
-      --no-tar               Disable tar streaming (daemon push)
-      --serve                Run as daemon (server)
-      --bind <ADDR>          Bind address (default 0.0.0.0:9031)
-      --root <DIR>           Root directory for --serve
-
-Semantics:
-- `--mir` implies including empty directories (robocopy /E).
-- Pull uses the same delta protocol in reverse; only needed files transfer.
+robosync daemon <ROOT> <PORT>
+robosync mirror <SRC> <DEST>
+robosync copy   <SRC> <DEST>
+robosync move   <SRC> <DEST>
+robosync verify <SRC> <DEST> [--checksum] [--json] [--csv <file>] [--limit N]
+robosync shell [robosync://host:port[/path]]   # feature: tui
 ```
+
+Direction inference:
+- If either side uses `robosync://host:port/path`, that side is remote.
+- Remote→remote is not supported in this release.
+
+Common options:
+- `-v, --verbose`: verbose output
+- `--progress`: show per-file operations
+- `--xf/--xd`: exclude files/dirs by pattern (repeatable)
+- `-e/--empty-dirs`: include empty directories
+- `-s/--subdirs` or `--no-empty-dirs`: skip empty directories
+- `-l/--dry-run`: list only (no changes)
+- `-c/--checksum`: compare by checksum instead of size+mtime (verify)
+- `--force-tar` / `--no-tar`: control small-file TAR streaming (push)
+- `--ludicrous-speed`: favor throughput (bigger buffers, fewer guards)
+- `--never-tell-me-the-odds`: unsafe max speed (trusted LAN only)
+
+Daemon options:
+- `--serve-legacy`: run the classic (non-async) server as a temporary fallback.
+- `--bind` and `--root`: only for legacy server; the `daemon` subcommand takes positional `ROOT` and `PORT`.
+
+Performance tuning:
+- `--net-workers <N>`: number of parallel large-file workers for async push (default: 4; 1–32).
+- `--net-chunk-mb <MB>`: network I/O chunk size for large files (default: 4; 1–32 MB).
+- `--ludicrous-speed`: also enables low-latency socket mode (TCP_NODELAY) and larger defaults.
+
+## TUI Shell (Preview)
+
+- Feature-gated behind `--features tui`.
+- Dracula theme, dual-pane (local/local by default).
+- Toggle right pane remote with `R` (connects to `127.0.0.1:9031`); navigation with arrows/Enter, pick src/dest with `s`/`d`.
+- Run transfer with `g` (mirror/copy/move based on current mode). Shows a spinner and last few lines of output; press `x` to cancel a running transfer. Remote→remote transfers are not supported.
+
+## Best Practices
+
+- Mirror vs copy: use `mirror` for one-way backups (adds/deletes to match src), `copy` when you never want deletions.
+- Direction inference: any `robosync://host:port/path` side is remote. Remote→remote is not supported.
+- Excludes: use repeated `--xf/--xd` patterns for large trees to avoid unnecessary scans.
+- Verify: after first big sync, prefer size+mtime verify; use `--checksum` for spot checks or sensitive data.
+- Performance on LAN:
+  - Start with defaults; for larger datasets increase parallelism: `--net-workers 6..8` and `--net-chunk-mb 8`.
+  - Use `--ludicrous-speed` on trusted networks to reduce latency and boost chunk sizes.
+  - Keep source/target on fast local disks; avoid network filesystems on both ends simultaneously.
+- Windows:
+  - Run daemon as a service and allow port 9031 in the firewall.
+  - Symlinks need Developer Mode or elevation; mirror deletions clear read-only automatically.
+- TUI:
+  - Use R to browse a remote, set src/dest with s/d, and g to run; x cancels.
+  - Prefer CLI for scripted or long-running jobs; TUI is a simple interactive front-end.
 
 ## Platform Support
 
@@ -93,7 +159,8 @@ Semantics:
 Notes for Windows:
 - Symlink creation may require Developer Mode or elevated privileges; otherwise symlinks fall back or may fail.
 - Read‑only attribute is preserved; broader NTFS ACL/attributes are not yet mirrored.
-- Case‑insensitive path logic and full mirror semantics are being finalized.
+ - Mirror deletions will attempt to clear the read‑only attribute before removing files/dirs.
+ - Case‑insensitive path logic for mirror semantics is under active polish.
 - Use the MSVC artifact or build with `scripts/build-windows.sh --msvc`.
 
 ## Build, Test, Lint
@@ -107,20 +174,25 @@ cargo test
 cargo clippy
 ```
 
-OS-specific build scripts (avoid target collisions):
+OS-specific build scripts (default to release; isolate by target):
+
+Artifacts layout with scripts: `target/<triple>/{release|debug}/robosync[.exe]`
 
 ```bash
-# macOS (outputs under target/macos)
-scripts/build-macos.sh [--release] [--test] [--clippy]
+# macOS (Bash)
+scripts/build-macos.sh [--debug] [--target <triple>]
 
-# Linux (outputs under target/linux)
-scripts/build-linux.sh [--release] [--test] [--clippy] [--target <triple>]
+# Linux (Bash)
+scripts/build-linux.sh [--debug] [--target <triple>]
 
-# MUSL static (outputs under target/musl)
-scripts/build-musl.sh [--release] [--test] [--clippy] [--target <musl-triple>]
+# MUSL static (Bash)
+scripts/build-musl.sh --target x86_64-unknown-linux-musl [--debug]
 
-# Windows (outputs under target/windows)
-scripts/build-windows.sh [--release] [--test] [--clippy] [--target <triple>|--msvc]
+# Windows (Bash)
+scripts/build-windows.sh [--debug] [--target <triple>|--msvc]
+
+# Windows (PowerShell)
+./scripts/build-windows.ps1 [-Debug] [-Target <triple>] [-MSVC]
 ```
 
 Makefile shortcuts:
@@ -160,7 +232,7 @@ Wants=network-online.target
 [Service]
 User=robosync
 Group=robosync
-ExecStart=/usr/local/bin/robosync --serve --bind 0.0.0.0:9031 --root /srv/robosync_root
+ExecStart=/usr/local/bin/robosync daemon /srv/robosync_root 9031
 Restart=on-failure
 RestartSec=2s
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -182,11 +254,17 @@ sudo systemctl enable --now robosync.service
 sudo systemctl status robosync.service --no-pager
 ```
 
-Firewall note: open TCP port 9031 (or the port you configure in `--bind`).
+Firewall note: open TCP port 9031 on the server.
+
+Windows firewall note: if running the legacy server on Windows, allow inbound TCP 9031 (or your chosen port). Symlink creation may require Developer Mode or elevated privileges.
 
 ## Changelog
 
 See CHANGELOG.md.
+
+## Roadmap
+
+See ROADMAP.md for upcoming high-impact features and milestones.
 
 
 ### Build Targets & CPU ISA Portability

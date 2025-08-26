@@ -62,3 +62,84 @@ Planned Next
    - Windows: `scripts/build-windows.sh [--release|--test|--clippy|--target <triple>|--msvc]` → `target/windows/...`
 - Added Makefile shortcuts: `make macos|macos-release|linux|linux-release|musl|musl-release|windows-gnu|windows-msvc`.
  - Added GitHub Actions CI matrix for Linux (GNU/MUSL), macOS, and Windows (MSVC) with artifact upload.
+## 2025-08-26 — Async Client Implementation Complete
+
+Summary: Completed the full asynchronous client implementation (`net_async::client`), enabling high-performance push and pull operations.
+
+- Implemented `net_async::client::push` for asynchronous file uploads:
+  - Handles manifest exchange and server-side need list processing.
+  - Uses TAR streaming for efficient transfer of small files.
+  - Implements parallel raw file transfers for large files via multiple worker connections.
+- Implemented `net_async::client::pull` for asynchronous file downloads:
+  - Handles manifest exchange and server-side delta calculation.
+  - Supports TAR unpacking for small files.
+  - Manages individual file reception, symlink creation, and attribute setting.
+  - Includes mirror deletion logic for destination cleanup.
+- Refactored URL parsing logic into a shared `src/url.rs` module, improving code organization and reusability.
+- Integrated the new async client into `src/main.rs`, making it the default for network operations.
+- Added `net_async::client::complete_remote` as a client-side helper for remote tab completion.
+
+## 2025-08-26 — Async-first sprint status (Bunny)
+
+- Protocol/versioning:
+  - Added protocol version handshake to classic and async paths; mixed client/server builds fail fast with a clear error.
+- Async reliability:
+  - Implemented size-aware read timeouts (header/payload) in async server.
+  - Added timed write wrapper (write_frame_timed + write_frame) and applied across key async writes.
+  - Added per-connection counters (files/bytes sent/received) and a summary log at Done with elapsed_ms.
+- Speed profiles:
+  - Client hints speed via Start flags; async server parses and raises TAR chunk and file send buffers when set.
+  - Classic TransmitFile chunk raised to 16MB under --ludicrous-speed.
+- CI + smokes:
+  - macOS async: scripts/smoke-macos.sh and workflow (.github/workflows/macos-async.yml).
+  - Linux async: scripts/smoke-linux.sh and workflow (.github/workflows/linux-async.yml).
+  - Windows async: workflow added; smoke-windows.ps1 supports -Async and now asserts read-only + mtime on push/pull.
+- In progress:
+  - Windows async parity validation (CreateSymbolicLinkW path; mtime/readonly checks).
+  - Ensure all async writes go through the timed wrapper.
+  - Wire async CI to green across macOS/Linux/Windows; fix any flakes.
+ - Implemented async pull small-file TAR bundling to reduce frame overhead.
+ - Fixed push 'sent files' counter to count each file once, including tar-bundled counts.
+## 2025-08-26 — Async Default, CLI Refresh, Async Delta
+
+- Async daemon is now default; classic server available via `--serve-legacy`.
+- Added protocol module (`src/protocol.rs`) with shared MAGIC/VERSION/frame IDs.
+- Finished async large-file delta (DELTA_* + NeedRanges), with ranged writes and mtime set.
+- TAR counters on async server now reflect logical bytes/files on unpack (not transport frame sizes).
+- Robustness: size-aware timeouts on framed I/O and raw body chunks; safe path normalization; mirror delete via expected set.
+- Windows: local mirror deletions compare relpaths case-insensitively.
+- CLI: added subcommands `daemon <root> <port>`, `mirror <src> <dest>`, `copy <src> <dest>`, `move <src> <dest>`; direction inferred by presence of `robosync://`.
+- Designed `verify <src> <dest> [--checksum] [--json] [--csv <file>]` (read-only) and remote delete frames for move: RemoveTreeReq/Resp (42/43).
+- Planned interactive TUI: `robosync` (local/local) and `robosync shell robosync://server:port` (right pane remote) with Dracula theme; ListReq/Resp for remote with tight deadlines + caching.
+- Deferred: TUI “Quick Share” (ephemeral inbound mode) to a future release; will use a simple y/N warning and bind to a LAN IP + random port.
+
+## 2025-08-26 — Finalize async default, TUI execution, Windows mirror polish, tuning + cleanup
+
+- TUI execution + progress
+  - Wired `g` to execute mirror/copy/move by spawning the CLI; streams stdout/stderr into a small log pane; spinner on status line.
+  - Added `x` to cancel a running transfer.
+  - Added `h` overlay for quick key help.
+
+- Windows reliability
+  - Async server mirror delete uses case-insensitive path comparison on Windows to align with filesystem semantics.
+  - Local mirror deletion clears read-only attribute and retries before erroring.
+
+- Performance tuning (FAST)
+  - New flags: `--net-workers` (1–32) and `--net-chunk-mb` (1–32 MB) to tune async push.
+  - Auto‑tune: if not overridden, scale workers with CPU and workload; bump chunks under `--ludicrous-speed`.
+  - Enabled TCP_NODELAY for client/accepted sockets.
+
+- Simplicity + docs
+  - README: performance tuning, best practices, common recipes; TUI keys updated (g/x).
+  - Explicitly disallow remote→remote transfers with a clear error.
+
+- Cleanup
+  - Removed unused modules: `streaming_delta.rs`, `concurrent_delta.rs`, `algorithm.rs`, and `progress.rs`.
+  - Kept classic server (`src/net.rs`) for `--serve-legacy`.
+
+- Smoke scripts
+  - `scripts/smoke-local.sh`: push/pull mirror, verify JSON, extra-file deletion check, best-effort symlink on Unix.
+  - `scripts/smoke-perf.sh`: quick large-file throughput estimate with configurable size and tuning flags.
+
+- Session context
+  - Chat context captured in `agent_bus.ndjson` at repo root for auditability (saved prior to reboot).

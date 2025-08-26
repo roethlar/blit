@@ -105,11 +105,9 @@ pub fn tar_stream_transfer(
     // Progress bar
     let progress = if show_progress {
         let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} [{elapsed_precise}] {msg}")
-                .unwrap(),
-        );
+        if let Ok(style) = ProgressStyle::default_spinner().template("{spinner:.green} [{elapsed_precise}] {msg}") {
+            pb.set_style(style);
+        }
         pb.set_message("Streaming files via tar...");
         Some(pb)
     } else {
@@ -211,11 +209,9 @@ pub fn tar_stream_transfer_list(
     // Progress bar
     let progress = if show_progress {
         let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} [{elapsed_precise}] {msg}")
-                .unwrap(),
-        );
+        if let Ok(style) = ProgressStyle::default_spinner().template("{spinner:.green} [{elapsed_precise}] {msg}") {
+            pb.set_style(style);
+        }
         pb.set_message("Streaming selected files via tar...");
         Some(pb)
     } else {

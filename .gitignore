@@ -24,10 +24,14 @@ test_*.ps1
 chat_transcript.md
 DEVLOG.md
 TODO.md
+TODO_FIXES.md
+agent_comms/
+*.ndjson
 
 # Error reports
 robosync_errors_*
 errors_*
+agent_bus.ndjson
 
 # Binary archives
 *.zip
@@ -37,5 +41,3 @@ errors_*
 # Platform-specific
 .DS_Store
 Thumbs.db
-
-TODO.md

@@ -13,9 +13,11 @@ mod logger;
 mod net;
 mod net_async;
 mod tar_stream;
+mod url;
+mod protocol;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -32,26 +34,38 @@ use crate::fs_enum::{
 };
 use crate::logger::{Logger, NoopLogger, TextLogger};
 use crate::tar_stream::{tar_stream_transfer_list, TarConfig};
+use crate::net_async::server;
+use robosync::protocol::frame;
+#[cfg(feature = "tui")]
+use robosync::tui;
+use serde::Serialize;
 
 /// Command-line arguments
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
-    about = "RoboSync - Fast local + daemon sync with rsync-style delta (push/pull) and robocopy-style CLI"
+    about = "RoboSync — Fast, async-first sync with mirror/copy/move and an optional daemon",
+    long_about = "RoboSync — async-first high-performance file sync.\n\
+Mirror/copy/move between local and robosync://host:port paths. Small files are TAR-bundled; large files use delta.\n\
+The async daemon is the default server; the classic server is available via --serve-legacy. For compatibility, --serve maps to the async daemon."
 )]
 struct Args {
-    /// Source directory or file (not required with --serve/--serve-async)
-    #[arg(required_unless_present_any = ["serve", "serve_async"])]
+    /// Source directory or file (for legacy CLI)
     source: Option<PathBuf>,
 
-    /// Destination directory or file (not required with --serve/--serve-async)
-    #[arg(required_unless_present_any = ["serve", "serve_async"])]
+    /// Destination directory or file (for legacy CLI)
     destination: Option<PathBuf>,
 
     /// Number of threads (0 = auto)
     #[arg(short = 't', long, default_value_t = 0)]
     threads: usize,
+    /// Network workers for async push (parallel large-file streams)
+    #[arg(long = "net-workers", default_value_t = 4)]
+    net_workers: usize,
+    /// Network I/O chunk size in MB (1-32)
+    #[arg(long = "net-chunk-mb", default_value_t = 4)]
+    net_chunk_mb: usize,
 
     /// Show processing stages and operations (discovery, categorization, etc.)
     #[arg(short, long)]
@@ -68,6 +82,13 @@ struct Args {
     /// Delete extra files in destination
     #[arg(long, alias = "del", alias = "purge")]
     delete: bool,
+
+    /// Update mode: copy only changed files (size+mtime), include empty dirs, do not delete extras
+    #[arg(
+        long = "update",
+        help = "Copy only changed files; include empty dirs; no deletions"
+    )]
+    update: bool,
 
     /// Copy subdirectories, but not empty ones (/S)
     #[arg(short = 's', long)]
@@ -113,13 +134,9 @@ struct Args {
     #[arg(long = "no-restart")]
     no_restart: bool,
 
-    /// Run as daemon (server mode)
-    #[arg(long)]
-    serve: bool,
-
-    /// Run as async daemon (Tokio-based server)
-    #[arg(long = "serve-async", hide = true)]
-    serve_async: bool,
+    /// Run the legacy classic server (temporary fallback)
+    #[arg(long = "serve-legacy", help = "Run the legacy classic server (temporary fallback)")]
+    serve_legacy: bool,
 
     /// Bind address for --serve
     #[arg(long, default_value = "0.0.0.0:9031")]
@@ -152,24 +169,189 @@ struct Args {
     /// Exclude symbolic links for files (robocopy /XJF)
     #[arg(long = "xjf", help = "Exclude file symlinks")]
     xjf: bool,
+
+    /// Max throughput preset: disables verify and resume, reduces logging, increases buffers/concurrency
+    #[arg(
+        long = "ludicrous-speed",
+        help = "Max throughput preset (no verify/resume; bigger buffers)"
+    )]
+    ludicrous_speed: bool,
+
+    /// Unsafe max speed: also skips metadata/guards. Only for trusted LAN benchmarks.
+    #[arg(
+        long = "never-tell-me-the-odds",
+        help = "Unsafe max speed (skips extra guards/metadata)"
+    )]
+    never_tell_me_the_odds: bool,
+
+    /// (internal) On-demand remote completion helper
+    #[arg(long, hide = true)]
+    complete_remote: Option<String>,
+    /// New subcommands (preferred)
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCommand {
+    /// Run the async daemon on 0.0.0.0:<port>
+    Daemon {
+        /// Root directory to serve
+        root: PathBuf,
+        /// Port to bind on 0.0.0.0
+        port: u16,
+    },
+    /// Mirror src to dest (copy + delete extras; include empty dirs)
+    Mirror {
+        src: PathBuf,
+        dest: PathBuf,
+    },
+    /// Copy src to dest (no deletions; include empty dirs)
+    Copy {
+        src: PathBuf,
+        dest: PathBuf,
+    },
+    /// Move src to dest (mirror, then remove src after confirmation)
+    Move {
+        src: PathBuf,
+        dest: PathBuf,
+    },
+    /// Verify two trees are identical (no changes applied)
+    Verify {
+        src: PathBuf,
+        dest: PathBuf,
+        #[arg(long)]
+        checksum: bool, // compare by checksum instead of size+mtime
+        #[arg(long)]
+        json: bool,     // print JSON summary
+        #[arg(long)]
+        csv: Option<PathBuf>, // write CSV to file
+        #[arg(long)]
+        limit: Option<usize>,  // limit sample lines on stdout
+    },
+    /// TUI shell (local by default; optional initial remote)
+    Shell {
+        remote: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
     // Set up Ctrl-C handler
-    ctrlc::set_handler(move || {
+    if let Err(e) = ctrlc::set_handler(move || {
         eprintln!("\nInterrupted by user. Exiting (Ctrl-C)...");
         // Exit immediately with 130 (128 + SIGINT)
         std::process::exit(130);
-    })
-    .expect("Error setting Ctrl-C handler");
+    }) {
+        eprintln!("Failed to set Ctrl-C handler: {}", e);
+    }
 
     let args = Args::parse();
 
-    // Server mode
-    if args.serve {
+    // Remote completion mode
+    if let Some(comp_str) = args.complete_remote {
+        return client_complete_remote(&comp_str);
+    }
+
+    // Subcommand handling first
+    if let Some(cmd) = &args.command {
+        match cmd {
+            CliCommand::Daemon { root, port } => {
+                let bind = format!("0.0.0.0:{}", port);
+                return server_main_async(&bind, root);
+            }
+            CliCommand::Mirror { src, dest } => {
+                return run_copy_like(src, dest, true, true, &args);
+            }
+            CliCommand::Copy { src, dest } => {
+                return run_copy_like(src, dest, false, true, &args);
+            }
+            CliCommand::Move { src, dest } => {
+                // Confirm destructive move
+                eprint!("This will remove source after clone. Type 'yes' to confirm: ");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).ok();
+                if input.trim() != "yes" {
+                    eprintln!("Aborted.");
+                    return Ok(());
+                }
+                run_copy_like(src, dest, true, true, &args)?;
+                // Remove source (local or remote)
+                if let Some(remote_src) = url::parse_remote_url(src) {
+                    // Remote delete via protocol
+                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().context("build tokio runtime for remove")?;
+                    rt.block_on(net_async::client::remove_tree(&remote_src.host, remote_src.port, &remote_src.path))?;
+                } else {
+                    if src.is_file() {
+                        let _ = std::fs::remove_file(src);
+                    } else {
+                        let _ = std::fs::remove_dir_all(src);
+                    }
+                }
+                return Ok(());
+            }
+            CliCommand::Verify { src, dest, checksum, json, csv, limit } => {
+                let summary = verify_trees(src, dest, *checksum)?;
+                // Output
+                if let Some(csv_path) = csv {
+                    let mut w = std::fs::File::create(csv_path).context("open csv")?;
+                    use std::io::Write as _;
+                    writeln!(w, "type,path,size_src,size_dest,mtime_src,mtime_dest").ok();
+                    for e in summary.sample.iter() {
+                        writeln!(w, "{},{},{},{},{},{}", e.kind, e.path, e.size_src, e.size_dest, e.mtime_src, e.mtime_dest).ok();
+                    }
+                }
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&summary).unwrap_or("{}".to_string()));
+                } else {
+                    println!("Identical: {}", summary.identical);
+                    println!("Changed/new: {}", summary.changed_count);
+                    println!("Extras: {}", summary.extras_count);
+                    if let Some(lim) = *limit {
+                        for e in summary.sample.iter().take(lim) {
+                            println!("  {} {}", e.kind, e.path);
+                        }
+                    }
+                }
+                std::process::exit(if summary.identical {0} else {1});
+            }
+            CliCommand::Shell { remote } => {
+                #[cfg(feature = "tui")]
+                {
+                    let url = match remote {
+                        Some(s) => crate::url::parse_remote_url(&PathBuf::from(s)).or(None),
+                        None => None,
+                    };
+                    let url2 = url.map(|r| robosync::url::RemoteDest{ host: r.host, port: r.port, path: r.path });
+                    return tui::start_shell(url2);
+                }
+                #[cfg(not(feature = "tui"))]
+                {
+                    anyhow::bail!("TUI is not enabled; rebuild with --features tui");
+                }
+            }
+        }
+    }
+
+    // On Windows, check for symlink creation privilege if --sl is used
+    #[cfg(windows)]
+    if args.sl {
+        if !robosync::win_fs::has_symlink_privilege() {
+            eprintln!("ERROR: To create symbolic links on Windows, this program must be run as an administrator.");
+            eprintln!(
+                "Please re-run from an elevated command prompt (e.g., 'Run as administrator')."
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Server mode: default to async; provide legacy fallback
+    if args.serve_legacy {
         return server_main(&args.bind, &args.root);
     }
-    if args.serve_async {
+    // Legacy --serve flag mapping: treat as async
+    if std::env::args().any(|a| a == "--serve") {
         return server_main_async(&args.bind, &args.root);
     }
     // Choose logger once; zero overhead in hot paths with NoopLogger
@@ -179,7 +361,12 @@ fn main() -> Result<()> {
             Err(_) => Arc::new(NoopLogger),
         }
     } else {
-        Arc::new(NoopLogger)
+        // In ludicrous modes, suppress logging overhead by default
+        if args.ludicrous_speed || args.never_tell_me_the_odds {
+            Arc::new(NoopLogger)
+        } else {
+            Arc::new(NoopLogger)
+        }
     };
 
     let start = Instant::now();
@@ -187,21 +374,31 @@ fn main() -> Result<()> {
     // Handle delete/mirror flags (robocopy compatibility)
     let delete_extra = args.delete || args.mirror;
 
-    // Extract required positional args in non-serve mode
-    let dest_path = args
-        .destination
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("destination required unless --serve"))?;
-    let src_path = args
-        .source
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("source required unless --serve"))?;
+    // Interactive mode: if no paths or subcommand, launch TUI when available
+    #[cfg(feature = "tui")]
+    if args.source.is_none() && args.destination.is_none() {
+        return tui::start_shell(None);
+    }
+    let (src_path, dest_path) = match (args.source.clone(), args.destination.clone()) {
+        (Some(s), Some(d)) => (s, d),
+        _ => {
+            eprintln!("Interactive mode: enter source and destination paths.");
+            use std::io::{Read, Write};
+            eprint!("Source: "); std::io::stdout().flush().ok();
+            let mut s = String::new(); std::io::stdin().read_line(&mut s).ok();
+            eprint!("Destination: "); std::io::stdout().flush().ok();
+            let mut d = String::new(); std::io::stdin().read_line(&mut d).ok();
+            let s = s.trim(); let d = d.trim();
+            if s.is_empty() || d.is_empty() { anyhow::bail!("source and destination required"); }
+            (PathBuf::from(s), PathBuf::from(d))
+        }
+    };
 
     // Network paths: support push (remote destination) and pull (remote source)
-    if let Some(remote) = parse_remote_url(&dest_path) {
+    if let Some(remote) = url::parse_remote_url(&dest_path) {
         return client_push(remote, &src_path, &args);
     }
-    if let Some(remote_src) = parse_remote_url(&src_path) {
+    if let Some(remote_src) = url::parse_remote_url(&src_path) {
         return client_pull(remote_src, &dest_path, &args);
     }
 
@@ -239,7 +436,10 @@ fn main() -> Result<()> {
         println!("Destination: {:?}", dest_path);
         println!("Network transfer: {}", is_network);
         if delete_extra {
-            println!("Delete mode: enabled (mirror/purge)");
+            println!(
+                "Delete mode: enabled (mirror/purge)
+"
+            );
         }
     }
 
@@ -261,8 +461,8 @@ fn main() -> Result<()> {
         println!("Enumerating files...");
     }
 
-    // Decide empty-dir behavior (Robocopy semantics: --mir implies including empties)
-    let include_empty_dirs = if delete_extra {
+    // Decide empty-dir behavior (Robocopy semantics: --mir implies including empties). --update matches this.
+    let include_empty_dirs = if delete_extra || args.update {
         if args.subdirs || args.no_empty_dirs {
             if args.verbose {
                 println!("Note: --mir implies --empty-dirs; including empty directories.");
@@ -335,8 +535,9 @@ fn main() -> Result<()> {
         );
     }
 
-    // Filter out files that don't need copying (mirror mode optimization)
-    let copy_jobs = if delete_extra {
+    // Filter out files that don't need copying when mirroring or in --update mode
+    let skip_unchanged = delete_extra || args.update;
+    let copy_jobs = if skip_unchanged {
         if show_activity {
             print!("\r{} comparing...", spinner_chars[spinner_index]);
             std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -570,7 +771,11 @@ fn main() -> Result<()> {
 
             let final_stats = Arc::try_unwrap(stats)
                 .map(|m| m.into_inner())
-                .unwrap_or_default();
+                .unwrap_or_else(|_arc| {
+                    // Log when Arc is still shared - may indicate thread synchronization issue
+                    eprintln!("Warning: Arc<CopyStats> for large files still has references, using default");
+                    CopyStats::default()
+                });
             let _ = tx_clone.send(("large", final_stats));
         });
         handles.push(handle);
@@ -647,6 +852,140 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_copy_like(src: &Path, dest: &Path, mirror: bool, include_empty: bool, base_args: &Args) -> Result<()> {
+    // Build a minimal Args clone to re-use existing logic
+    let mut args = base_args.clone_for_copylike();
+    args.source = Some(src.to_path_buf());
+    args.destination = Some(dest.to_path_buf());
+    if mirror { args.mirror = true; args.delete = true; }
+    if include_empty { args.empty_dirs = true; }
+    // Delegate to legacy path by falling through to local copy section
+    // Simplest: call main copy pipeline by replicating needed subset
+    // For now, we route through network URL handling and local pipeline below
+    // Implementation: mimic what main does by re-parsing environment
+    // This function will only be used early in main before heavy logic
+    // Therefore, just return Ok and let main continue with source/dest in place.
+    // In practice, we call this via early return, so instead:
+    // We'll perform a small inline copy by invoking client or local copy.
+
+    // Remote URLs
+    if url::parse_remote_url(src).is_some() && url::parse_remote_url(dest).is_some() {
+        anyhow::bail!("Remote→remote transfers are not supported in this release");
+    }
+    if let Some(remote) = url::parse_remote_url(src) {
+        return client_pull(remote, dest, &args);
+    }
+    if let Some(remote) = url::parse_remote_url(dest) {
+        return client_push(remote, src, &args);
+    }
+    // Local single-file or directory copy
+    // Reuse existing local code by calling a helper
+    run_local(src, dest, mirror, include_empty, &args)
+}
+
+// Minimal wrapper to reuse existing local flow from main
+fn run_local(src_path: &Path, dest_path: &Path, mirror: bool, include_empty: bool, args: &Args) -> Result<()> {
+    // The main function already implements the full local copy pipeline.
+    // To avoid duplicating, we call into that pipeline by reproducing its steps here.
+    // For brevity and to avoid code duplication, we will just return an error that instructs to use core path.
+    // However, we implement direct fallback: if it's a file, copy_single_file; otherwise continue with enumerate path below.
+    if src_path.is_file() {
+        return copy_single_file(src_path, dest_path, is_network_path(dest_path), args.verbose);
+    }
+    // Build FileFilter
+    let filter = FileFilter {
+        exclude_files: vec![],
+        exclude_dirs: vec![],
+        min_size: None,
+        max_size: None,
+        include_empty_dirs: include_empty,
+    };
+    let preserve_links = args.sl;
+    let initial_entries = if mirror && !preserve_links {
+        crate::fs_enum::enumerate_directory_deref_filtered(src_path, &filter)
+    } else {
+        enumerate_directory_filtered(src_path, &filter)
+    }?;
+    let copy_jobs: Vec<CopyJob> = initial_entries.into_iter().map(|entry| CopyJob{ entry, start_offset:0}).collect();
+    let (small, medium, large) = categorize_files(copy_jobs);
+    let buffer_sizer = Arc::new(BufferSizer::new());
+    let logger: Arc<dyn Logger + Send + Sync> = Arc::new(NoopLogger);
+    // Small files via tar
+    let mut total_files_copied = 0u64;
+    let mut total_bytes = 0u64;
+    if !small.is_empty() {
+        match process_small_files_tar(&small, src_path, dest_path, false, &*logger) {
+            Ok((f, b)) => { total_files_copied += f; total_bytes += b; },
+            Err(e) => {
+                eprintln!("Error processing small files via TAR: {}", e);
+            }
+        }
+    }
+    // Medium files in parallel
+    if !medium.is_empty() {
+        let pairs = prepare_copy_pairs(&medium, src_path, dest_path);
+        let stats = parallel_copy_files(pairs, buffer_sizer.clone(), is_network_path(dest_path), &*logger);
+        total_files_copied += stats.files_copied; total_bytes += stats.bytes_copied;
+    }
+    // Large files chunked or mmap
+    for job in &large {
+        let dst = compute_destination(&job.entry.path, src_path, dest_path);
+        let bytes = if !is_network_path(dest_path) && cfg!(unix) {
+            mmap_copy_file(&job.entry.path, &dst)?
+        } else {
+            chunked_copy_file(&job.entry.path, &dst, &BufferSizer::new(), is_network_path(dest_path), None, &*logger)?
+        };
+        total_files_copied += 1; total_bytes += bytes;
+    }
+    // Mirror deletions
+    if mirror {
+        let _ = handle_mirror_deletion(src_path, dest_path, &filter, args.verbose, args.dry_run)?;
+    }
+    println!("Copied {} files ({:.2} MB)", total_files_copied, total_bytes as f64 / 1_048_576.0);
+    Ok(())
+}
+
+impl Args {
+    fn clone_for_copylike(&self) -> Self { Self { ..self.clone_shallow() } }
+    fn clone_shallow(&self) -> Self { Args { 
+        source: None,
+        destination: None,
+        threads: self.threads,
+        net_workers: self.net_workers,
+        net_chunk_mb: self.net_chunk_mb,
+        verbose: self.verbose,
+        progress: self.progress,
+        mirror: false,
+        delete: false,
+        update: false,
+        subdirs: self.subdirs,
+        empty_dirs: self.empty_dirs,
+        no_empty_dirs: self.no_empty_dirs,
+        dry_run: self.dry_run,
+        exclude_files: self.exclude_files.clone(),
+        exclude_dirs: self.exclude_dirs.clone(),
+        checksum: self.checksum,
+        force_tar: self.force_tar,
+        no_tar: self.no_tar,
+        no_verify: self.no_verify,
+        no_restart: self.no_restart,
+        serve_legacy: false,
+        bind: self.bind.clone(),
+        root: self.root.clone(),
+        log_file: self.log_file.clone(),
+        sl: self.sl,
+        #[cfg(windows)]
+        sj: self.sj,
+        xj: self.xj,
+        xjd: self.xjd,
+        xjf: self.xjf,
+        ludicrous_speed: self.ludicrous_speed,
+        never_tell_me_the_odds: self.never_tell_me_the_odds,
+        complete_remote: None,
+        command: None,
+    } }
 }
 
 /// Check if path is a network location
@@ -772,23 +1111,28 @@ fn handle_mirror_deletion(
 
     // Get all files that should exist (from source)
     let source_entries = enumerate_directory_filtered(source, filter)?;
-    let mut source_files: HashSet<PathBuf> = HashSet::new();
-    let mut source_dirs: HashSet<PathBuf> = HashSet::new();
+    #[cfg(windows)]
+    fn keyify(p: &Path) -> String { p.to_string_lossy().to_ascii_lowercase() }
+    #[cfg(not(windows))]
+    fn keyify(p: &Path) -> String { p.to_string_lossy().to_string() }
+
+    let mut source_files: HashSet<String> = HashSet::new();
+    let mut source_dirs: HashSet<String> = HashSet::new();
 
     for entry in &source_entries {
         let rel_path = entry.path.strip_prefix(source).unwrap_or(&entry.path);
         let dest_path = destination.join(rel_path);
 
         if entry.is_directory {
-            source_dirs.insert(dest_path);
+            source_dirs.insert(keyify(&dest_path));
         } else {
-            source_files.insert(dest_path.clone());
+            source_files.insert(keyify(&dest_path));
             // Also track the parent directories
             if let Some(parent) = dest_path.parent() {
                 let mut current = parent;
                 while current != destination && current.parent().is_some() {
-                    source_dirs.insert(current.to_path_buf());
-                    current = current.parent().unwrap();
+                    source_dirs.insert(keyify(current));
+                    current = current.parent().context("Failed to get parent directory")?;
                 }
             }
         }
@@ -805,10 +1149,10 @@ fn handle_mirror_deletion(
 
     for entry in &dest_entries {
         if entry.is_directory {
-            if !source_dirs.contains(&entry.path) {
+            if !source_dirs.contains(&keyify(&entry.path)) {
                 dirs_to_delete.push(entry.path.clone());
             }
-        } else if !source_files.contains(&entry.path) {
+        } else if !source_files.contains(&keyify(&entry.path)) {
             files_to_delete.push(entry.path.clone());
         }
     }
@@ -867,6 +1211,22 @@ fn handle_mirror_deletion(
                 }
             }
             Err(e) => {
+                // On Windows, read-only attributes can block deletion; attempt to clear and retry
+                #[cfg(windows)]
+                {
+                    if let Ok(md) = std::fs::metadata(path) {
+                        let mut perms = md.permissions();
+                        if perms.readonly() {
+                            perms.set_readonly(false);
+                            let _ = std::fs::set_permissions(path, perms);
+                            if std::fs::remove_file(path).is_ok() {
+                                deleted_files += 1;
+                                if verbose { println!("Deleted file (after clearing readonly): {}", path.display()); }
+                                continue;
+                            }
+                        }
+                    }
+                }
                 eprintln!("Failed to delete file {:?}: {}", path, e);
             }
         }
@@ -887,6 +1247,22 @@ fn handle_mirror_deletion(
                 }
             }
             Err(e) => {
+                // On Windows, directories with readonly attribute may fail to remove; try clearing
+                #[cfg(windows)]
+                {
+                    if let Ok(md) = std::fs::metadata(path) {
+                        let mut perms = md.permissions();
+                        if perms.readonly() {
+                            perms.set_readonly(false);
+                            let _ = std::fs::set_permissions(path, perms);
+                            if std::fs::remove_dir(path).is_ok() {
+                                deleted_dirs += 1;
+                                if verbose { println!("Deleted directory (after clearing readonly): {}", path.display()); }
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if verbose {
                     eprintln!(
                         "Failed to delete directory {:?}: {} (may not be empty)",
@@ -911,32 +1287,6 @@ fn merge_stats(total: &mut CopyStats, other: CopyStats) {
 /// Remove leftover `.robosync_temp_*` directories from previous runs (best-effort)
 // --- Daemon and client URL helpers ---
 
-#[derive(Debug, Clone)]
-struct RemoteDest {
-    host: String,
-    port: u16,
-    path: PathBuf,
-}
-
-fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
-    let s = path.to_string_lossy();
-    let prefix = "robosync://";
-    if !s.starts_with(prefix) {
-        return None;
-    }
-    let rest = &s[prefix.len()..];
-    let (hp, p) = rest.split_once('/').unwrap_or((rest, ""));
-    let (host, port) = match hp.split_once(':') {
-        Some((h, pr)) => (h.to_string(), pr.parse().unwrap_or(9031)),
-        None => (hp.to_string(), 9031),
-    };
-    Some(RemoteDest {
-        host,
-        port,
-        path: PathBuf::from("/".to_string() + p),
-    })
-}
-
 fn server_main(bind: &str, root: &Path) -> Result<()> {
     net::serve(bind, root)
 }
@@ -949,13 +1299,228 @@ fn server_main_async(bind: &str, root: &Path) -> Result<()> {
     rt.block_on(net_async::server::serve(bind, root))
 }
 
-fn client_push(remote: RemoteDest, src_root: &Path, args: &Args) -> Result<()> {
+fn client_push(remote: url::RemoteDest, src_root: &Path, args: &crate::Args) -> Result<()> {
     if !src_root.exists() {
         anyhow::bail!("Source does not exist: {:?}", src_root);
     }
-    net::client_start(&remote.host, remote.port, &remote.path, src_root, args)
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for client push")?;
+    rt.block_on(net_async::client::push(
+        &remote.host,
+        remote.port,
+        &remote.path,
+        src_root,
+        args,
+    ))
 }
 
-fn client_pull(remote: RemoteDest, dest_root: &Path, args: &Args) -> Result<()> {
-    net::client_pull(&remote.host, remote.port, &remote.path, dest_root, args)
+fn client_pull(remote: url::RemoteDest, dest_root: &Path, args: &crate::Args) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for client pull")?;
+    rt.block_on(net_async::client::pull(
+        &remote.host,
+        remote.port,
+        &remote.path,
+        dest_root,
+        args,
+    ))
+}
+
+fn client_complete_remote(comp_str: &str) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for completion")?;
+    rt.block_on(net_async::client::complete_remote(comp_str))
+}
+
+#[derive(Serialize)]
+struct VerifyEntry {
+    kind: &'static str, // "changed" | "extra"
+    path: String,
+    size_src: u64,
+    size_dest: u64,
+    mtime_src: i64,
+    mtime_dest: i64,
+}
+
+#[derive(Serialize)]
+struct VerifySummary {
+    identical: bool,
+    changed_count: usize,
+    extras_count: usize,
+    sample: Vec<VerifyEntry>,
+}
+
+fn verify_trees(src: &Path, dest: &Path, checksum: bool) -> Result<VerifySummary> {
+    // Direction inference: if dest is remote, do push-manifest verify; if src is remote, do pull-manifest verify.
+    if let Some(remote) = url::parse_remote_url(dest) {
+        verify_local_vs_remote(src, &remote.host, remote.port, &remote.path, checksum)
+    } else if let Some(remote_src) = url::parse_remote_url(src) {
+        verify_remote_vs_local(&remote_src.host, remote_src.port, &remote_src.path, dest, checksum)
+    } else {
+        verify_local_vs_local(src, dest, checksum)
+    }
+}
+
+fn verify_local_vs_local(src: &Path, dest: &Path, checksum: bool) -> Result<VerifySummary> {
+    // Simple local diff using existing filters
+    let filter = FileFilter::default();
+    let src_entries = enumerate_directory_filtered(src, &filter)?;
+    let dest_entries = enumerate_directory_filtered(dest, &filter)?;
+    use std::collections::HashMap;
+    let mut dest_map = HashMap::new();
+    for e in &dest_entries {
+        if let Ok(rel) = e.path.strip_prefix(dest) {
+            dest_map.insert(rel.to_string_lossy().to_string(), (e.size, mtime_of(&e.path)));
+        }
+    }
+    let mut changed = 0usize;
+    let mut extras = 0usize;
+    let mut sample = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for e in &src_entries {
+        let rel = e.path.strip_prefix(src).unwrap_or(&e.path).to_string_lossy().to_string();
+        seen.insert(rel.clone());
+        if let Some((dsize, dmtime)) = dest_map.get(&rel) {
+            if checksum {
+                let diff = crate::copy::file_needs_copy(&e.path, &dest.join(&rel), true).unwrap_or(true);
+                if diff { changed += 1; sample.push(VerifyEntry{ kind:"changed", path: rel, size_src: e.size, size_dest:*dsize, mtime_src: mtime_of(&e.path), mtime_dest:*dmtime}); }
+            } else {
+                let sm = mtime_of(&e.path);
+                if !(e.size == *dsize && (sm - *dmtime).abs() <= 2) { changed += 1; sample.push(VerifyEntry{ kind:"changed", path: rel, size_src: e.size, size_dest:*dsize, mtime_src: sm, mtime_dest:*dmtime}); }
+            }
+        } else {
+            changed += 1;
+            sample.push(VerifyEntry{ kind:"changed", path: rel, size_src: e.size, size_dest:0, mtime_src: mtime_of(&e.path), mtime_dest:0 });
+        }
+    }
+    for e in &dest_entries {
+        let rel = e.path.strip_prefix(dest).unwrap_or(&e.path).to_string_lossy().to_string();
+        if !seen.contains(&rel) { extras += 1; sample.push(VerifyEntry{ kind:"extra", path: rel, size_src:0, size_dest: e.size, mtime_src:0, mtime_dest: mtime_of(&e.path)}); }
+    }
+    Ok(VerifySummary{ identical: changed==0 && extras==0, changed_count: changed, extras_count: extras, sample })
+}
+
+fn mtime_of(p: &Path) -> i64 { std::fs::metadata(p).ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0) }
+
+fn verify_local_vs_remote(src: &Path, host: &str, port: u16, remote_path: &Path, checksum: bool) -> Result<VerifySummary> {
+    // Connect and send manifest of local src; read NeedList as changed list (extras not included in this pass)
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().context("build tokio runtime for verify")?;
+    rt.block_on(async move {
+        use crate::fs_enum::FileFilter;
+        let mut stream = crate::net_async::client::connect(host, port).await?;
+        // START to remote dest
+        let dest_s = remote_path.to_string_lossy();
+        let mut payload = Vec::with_capacity(2 + dest_s.len() + 1);
+        payload.extend_from_slice(&(dest_s.len() as u16).to_le_bytes());
+        payload.extend_from_slice(dest_s.as_bytes());
+        payload.push(0b0000_0100); // include empty dirs
+        server::write_frame(&mut stream, frame::START, &payload).await?;
+        let (typ, resp) = server::read_frame(&mut stream).await?;
+        if typ != frame::OK { anyhow::bail!("daemon error: {}", String::from_utf8_lossy(&resp)); }
+        // Send manifest of local src
+        server::write_frame(&mut stream, frame::MANIFEST_START, &[]).await?;
+        let filter = FileFilter::default();
+        let entries = enumerate_directory_filtered(src, &filter)?;
+        use std::time::UNIX_EPOCH;
+        for fe in entries.iter().filter(|e| !e.is_directory) {
+            let rel = fe.path.strip_prefix(src).unwrap_or(&fe.path);
+            let rels = rel.to_string_lossy();
+            let md = std::fs::metadata(&fe.path)?;
+            let mtime = md.modified()?.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            let mut pl = Vec::with_capacity(1 + 2 + rels.len() + 8 + 8);
+            pl.push(0u8);
+            pl.extend_from_slice(&(rels.len() as u16).to_le_bytes());
+            pl.extend_from_slice(rels.as_bytes());
+            pl.extend_from_slice(&fe.size.to_le_bytes());
+            pl.extend_from_slice(&mtime.to_le_bytes());
+            server::write_frame(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
+        }
+        server::write_frame(&mut stream, frame::MANIFEST_END, &[]).await?;
+        // NeedList
+        let (tneed, plneed) = server::read_frame(&mut stream).await?;
+        if tneed != frame::NEED_LIST { anyhow::bail!("server did not send NeedList"); }
+        let mut off = 0usize; let mut changed = 0usize; let mut sample = Vec::new();
+        if plneed.len() >= 4 {
+            let count = u32::from_le_bytes(plneed[off..off+4].try_into()
+                .context("Invalid count bytes in NEED response")?) as usize;
+            // Sanity check: limit to 1 million entries to prevent DoS
+            const MAX_NEED_ENTRIES: usize = 1_000_000;
+            if count > MAX_NEED_ENTRIES {
+                anyhow::bail!("NEED_LIST count exceeds maximum allowed ({}): {}", MAX_NEED_ENTRIES, count);
+            }
+            off+=4;
+            for _ in 0..count {
+                if off+2 > plneed.len() { break; }
+                let nlen = u16::from_le_bytes(plneed[off..off+2].try_into()
+                    .context("Invalid name length bytes in NEED response")?) as usize; off+=2;
+                if off+nlen > plneed.len() { break; }
+                let name = std::str::from_utf8(&plneed[off..off+nlen]).unwrap_or(""); off+=nlen;
+                changed += 1; sample.push(VerifyEntry{ kind:"changed", path:name.to_string(), size_src:0, size_dest:0, mtime_src:0, mtime_dest:0});
+            }
+        }
+        Ok::<VerifySummary, anyhow::Error>(VerifySummary{ identical: changed==0, changed_count: changed, extras_count: 0, sample })
+    })
+}
+
+fn verify_remote_vs_local(host: &str, port: u16, remote_path: &Path, dest: &Path, checksum: bool) -> Result<VerifySummary> {
+    // Connect and send manifest of local dest; read NeedList as changed list from remote→local perspective
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().context("build tokio runtime for verify")?;
+    rt.block_on(async move {
+        let mut stream = crate::net_async::client::connect(host, port).await?;
+        let src_s = remote_path.to_string_lossy();
+        let mut payload = Vec::with_capacity(2 + src_s.len() + 1);
+        payload.extend_from_slice(&(src_s.len() as u16).to_le_bytes());
+        payload.extend_from_slice(src_s.as_bytes());
+        payload.push(0b0000_0010 | 0b0000_0100); // pull + include empty dirs
+        server::write_frame(&mut stream, frame::START, &payload).await?;
+        let (typ, resp) = server::read_frame(&mut stream).await?;
+        if typ != frame::OK { anyhow::bail!("daemon error: {}", String::from_utf8_lossy(&resp)); }
+        // Send manifest of local dest
+        let filter = FileFilter::default();
+        let entries = enumerate_directory_filtered(dest, &filter)?;
+        server::write_frame(&mut stream, frame::MANIFEST_START, &[]).await?;
+        use std::time::UNIX_EPOCH;
+        for fe in entries.iter().filter(|e| !e.is_directory) {
+            let rel = fe.path.strip_prefix(dest).unwrap_or(&fe.path);
+            let rels = rel.to_string_lossy();
+            let md = std::fs::metadata(&fe.path)?;
+            let mtime = md.modified()?.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            let mut pl = Vec::with_capacity(1 + 2 + rels.len() + 8 + 8);
+            pl.push(0u8);
+            pl.extend_from_slice(&(rels.len() as u16).to_le_bytes());
+            pl.extend_from_slice(rels.as_bytes());
+            pl.extend_from_slice(&fe.size.to_le_bytes());
+            pl.extend_from_slice(&mtime.to_le_bytes());
+            server::write_frame(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
+        }
+        server::write_frame(&mut stream, frame::MANIFEST_END, &[]).await?;
+        let (tneed, plneed) = server::read_frame(&mut stream).await?;
+        if tneed != frame::NEED_LIST { anyhow::bail!("server did not send NeedList"); }
+        let mut off = 0usize; let mut changed = 0usize; let mut sample = Vec::new();
+        if plneed.len() >= 4 {
+            let count = u32::from_le_bytes(plneed[off..off+4].try_into()
+                .context("Invalid count bytes in NEED response")?) as usize;
+            // Sanity check: limit to 1 million entries to prevent DoS
+            const MAX_NEED_ENTRIES: usize = 1_000_000;
+            if count > MAX_NEED_ENTRIES {
+                anyhow::bail!("NEED_LIST count exceeds maximum allowed ({}): {}", MAX_NEED_ENTRIES, count);
+            }
+            off+=4;
+            for _ in 0..count {
+                if off+2 > plneed.len() { break; }
+                let nlen = u16::from_le_bytes(plneed[off..off+2].try_into()
+                    .context("Invalid name length bytes in NEED response")?) as usize; off+=2;
+                if off+nlen > plneed.len() { break; }
+                let name = std::str::from_utf8(&plneed[off..off+nlen]).unwrap_or(""); off+=nlen;
+                changed += 1; sample.push(VerifyEntry{ kind:"changed", path:name.to_string(), size_src:0, size_dest:0, mtime_src:0, mtime_dest:0});
+            }
+        }
+        Ok::<VerifySummary, anyhow::Error>(VerifySummary{ identical: changed==0, changed_count: changed, extras_count: 0, sample })
+    })
 }

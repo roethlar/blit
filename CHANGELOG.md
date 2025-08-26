@@ -6,6 +6,9 @@
 - Pull: fix receive counters to include files unpacked from TAR streams.
 - Cleanup: address clippy issues in networking paths; minor I/O error mapping fixes.
 - Docs: update TODO to reflect completed async pull TAR bundling.
+ - macOS: async smoke script added (`scripts/smoke-macos.sh`) and CI workflow (`.github/workflows/macos-async.yml`).
+ - macOS: `sendfile` honors preferred chunk size under `--ludicrous-speed`; APFS mtime/readonly preserved in async paths (tar mtimes + POSIX mode via SetAttr).
+ - Async server: logs per-connection summary (files_sent, bytes_sent, elapsed_ms) for observability.
 
 All notable changes to this project will be documented in this file.
 

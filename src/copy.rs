@@ -149,6 +149,19 @@ pub fn copy_file(
 }
 
 // Minimal stub: on all platforms, do nothing (safe, cross-platform)
+#[cfg(windows)]
+fn copy_windows_metadata(src: &Path, dst: &Path) -> Result<()> {
+    use filetime::{set_file_mtime, FileTime};
+    if let Ok(md) = std::fs::metadata(src) {
+        if let Ok(modified) = md.modified() {
+            let ft = FileTime::from_system_time(modified);
+            let _ = set_file_mtime(dst, ft);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn copy_windows_metadata(_src: &Path, _dst: &Path) -> Result<()> {
     Ok(())
 }
@@ -182,14 +195,16 @@ pub fn parallel_copy_files(
     // Extract the stats from Arc<Mutex<CopyStats>>
     Arc::try_unwrap(stats)
         .map(|mutex| mutex.into_inner())
-        .unwrap_or_else(|arc| arc.lock().clone())
+        .unwrap_or_else(|arc| {
+            // Log when we fall back to cloning because Arc is still shared
+            eprintln!("Warning: Arc<CopyStats> still has multiple references, falling back to clone");
+            arc.lock().clone()
+        })
 }
 
 /// Memory-mapped copy for very large files (>100MB)
 #[cfg(unix)]
 pub fn mmap_copy_file(src: &Path, dst: &Path) -> Result<u64> {
-    use std::os::unix::io::AsRawFd;
-
     let src_file = File::open(src)?;
     let file_size = src_file.metadata()?.len();
 
@@ -204,6 +219,7 @@ pub fn mmap_copy_file(src: &Path, dst: &Path) -> Result<u64> {
     // For very large files, use copy_file_range or sendfile on Linux
     #[cfg(target_os = "linux")]
     {
+        use std::os::unix::io::AsRawFd;
         let src_fd = src_file.as_raw_fd();
         let dst_fd = dst_file.as_raw_fd();
 
@@ -312,7 +328,7 @@ pub fn chunked_copy_file(
 pub fn windows_copyfile(src: &Path, dst: &Path) -> Result<u64> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::BOOL;
+    use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::CopyFileExW;
 
     // Ensure destination directory exists
@@ -323,7 +339,17 @@ pub fn windows_copyfile(src: &Path, dst: &Path) -> Result<u64> {
     let to_wide = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
     let src_w = to_wide(src.as_os_str());
     let dst_w = to_wide(dst.as_os_str());
-    let ok = unsafe { CopyFileExW(src_w.as_ptr(), dst_w.as_ptr(), None, None, None, 0).as_bool() };
+    let ok = unsafe {
+        CopyFileExW(
+            PCWSTR(src_w.as_ptr()),
+            PCWSTR(dst_w.as_ptr()),
+            None,
+            None,
+            None,
+            0,
+        )
+        .is_ok()
+    };
     if ok {
         let bytes = std::fs::metadata(dst)?.len();
         Ok(bytes)

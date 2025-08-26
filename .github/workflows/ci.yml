@@ -10,6 +10,16 @@ permissions:
   contents: read
 
 jobs:
+  protocol_guard:
+    name: Protocol Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate protocol constants centralization
+        run: |
+          chmod +x scripts/guard-protocol.sh
+          scripts/guard-protocol.sh
+        shell: bash
   linux:
     name: Linux (GNU)
     runs-on: ubuntu-latest
@@ -111,3 +121,19 @@ jobs:
           name: robosync-windows-msvc-x86_64
           path: target/windows/x86_64-pc-windows-msvc/release/robosync.exe
 
+  linux_async_smoke:
+    name: Linux Async Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+        shell: bash
+      - name: Build release
+        run: cargo build --release
+        shell: bash
+      - name: Run Linux async smoke
+        run: bash scripts/smoke-linux.sh
+        shell: bash
