@@ -1,5 +1,9 @@
 # Changelog
 
+## Rename Notice (2025-08-27)
+The project has been renamed to Blit. Source/binaries now use: blit, blitd, blitty, and blit://. This changelog retains historical "RoboSync" entries; future entries will use the new names.
+
+
 ## v3.1.0 — 2025-08-25
 - Async pull: implement small-file TAR bundling (TarStart/TarData/TarEnd) with SetAttr for POSIX modes on Unix.
 - Push: fix sent-files accounting to include TAR-bundled files; summary now counts each file exactly once.

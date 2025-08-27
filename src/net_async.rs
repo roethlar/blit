@@ -1,4 +1,4 @@
-//! Experimental async (Tokio) transport scaffolding for RoboSync daemon/client.
+//! Experimental async (Tokio) transport scaffolding for Blit daemon/client.
 //!
 //! This module is not yet wired into the CLI. It provides minimal, compiling
 //! stubs and a basic async server accept loop to start iterating toward the
@@ -10,8 +10,7 @@ use std::time::Instant;
 #[allow(dead_code)]
 pub mod server {
     use super::*;
-    use robosync::protocol::{MAGIC, VERSION};
-    use robosync::protocol::frame;
+    use crate::protocol::frame;
     use filetime::{set_file_mtime, FileTime};
     use std::collections::{HashMap, HashSet};
     use std::fs::File;
@@ -53,11 +52,7 @@ pub mod server {
         ms: u64,
     ) -> Result<()> {
         match timeout(Duration::from_millis(ms), async {
-            let mut hdr = Vec::with_capacity(4 + 2 + 1 + 4);
-            hdr.extend_from_slice(MAGIC);
-            hdr.extend_from_slice(&VERSION.to_le_bytes());
-            hdr.push(t);
-            hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            let hdr = crate::protocol_core::build_frame_header(t, payload.len() as u32);
             stream.write_all(&hdr).await?;
             if !payload.is_empty() {
                 stream.write_all(payload).await?;
@@ -88,18 +83,13 @@ pub mod server {
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => anyhow::bail!("frame header timeout ({} ms)", FRAME_HEADER_MS),
         }
-        if &hdr[0..4] != MAGIC {
-            anyhow::bail!("bad magic");
-        }
-        let ver = u16::from_le_bytes([hdr[4], hdr[5]]);
-        if ver != VERSION {
-            anyhow::bail!("protocol version mismatch: got {}, need {}", ver, VERSION);
-        }
-        let typ = hdr[6];
-        let len = u32::from_le_bytes([hdr[7], hdr[8], hdr[9], hdr[10]]) as usize;
-        if len > crate::protocol::MAX_FRAME_SIZE {
-            anyhow::bail!("frame too large: {} bytes (max: {} bytes)", len, crate::protocol::MAX_FRAME_SIZE);
-        }
+        
+        // Use protocol_core helper to parse header
+        let (typ, len_u32) = crate::protocol_core::parse_frame_header(&hdr)?;
+        let len = len_u32 as usize;
+        
+        // Validate frame size
+        crate::protocol_core::validate_frame_size(len)?;
         let mut payload = vec![0u8; len];
         if len > 0 {
             let ms = read_deadline_ms(len);
@@ -116,60 +106,8 @@ pub mod server {
     }
 
     fn normalize_under_root(root: &Path, p: &Path) -> Result<PathBuf> {
-        // Security: Ensure the destination stays under root (no traversal)
-        use std::path::Component::{CurDir, Normal, ParentDir, Prefix, RootDir};
-        
-        // Reject any parent directory components for security
-        for comp in p.components() {
-            if matches!(comp, ParentDir) {
-                anyhow::bail!("destination contains parent component");
-            }
-        }
-        
-        // Build the joined path, stripping any absolute/prefix components
-        let mut joined = root.to_path_buf();
-        for comp in p.components() {
-            match comp {
-                Normal(s) => {
-                    // Additional Windows ADS defense: reject ':' in path components
-                    #[cfg(windows)]
-                    if s.to_string_lossy().contains(':') {
-                        anyhow::bail!("path component contains colon (potential ADS attack)");
-                    }
-                    joined.push(s)
-                },
-                ParentDir => unreachable!(), // Already rejected above
-                CurDir => {}
-                Prefix(_) | RootDir => {} // Ignore absolute path components
-            }
-        }
-        
-        // Canonicalize root for comparison
-        let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        
-        // Try to canonicalize the full path (for existing files/dirs)
-        if let Ok(canon) = std::fs::canonicalize(&joined) {
-            if !canon.starts_with(&canon_root) {
-                anyhow::bail!("destination escapes root via symlinks");
-            }
-            return Ok(canon);
-        }
-        
-        // For new files, canonicalize parent and verify it's under root
-        if let Some(parent) = joined.parent() {
-            if let Ok(canon_parent) = std::fs::canonicalize(parent) {
-                if !canon_parent.starts_with(&canon_root) {
-                    anyhow::bail!("destination parent escapes root via symlinks");
-                }
-                // Return canonical parent + final component
-                if let Some(file_name) = joined.file_name() {
-                    return Ok(canon_parent.join(file_name));
-                }
-            }
-        }
-        
-        // If we can't canonicalize, just ensure no escape via components
-        Ok(joined)
+        // Use the unified normalize_under_root from protocol_core
+        crate::protocol_core::normalize_under_root(root, p)
     }
 
     pub async fn serve(bind: &str, root: &Path) -> Result<()> {
@@ -177,7 +115,7 @@ pub mod server {
             .await
             .with_context(|| format!("bind {}", bind))?;
         eprintln!(
-            "robosync async daemon listening on {} root={}",
+            "blit async daemon listening on {} root={}",
             bind,
             root.display()
         );
@@ -851,7 +789,7 @@ pub mod server {
                                 {
                                     let _ = std::fs::remove_file(&dst_path);
                                     let _ = std::fs::remove_dir(&dst_path);
-                                    let _ = robosync::win_fs::create_symlink(Path::new(target), &dst_path);
+                                    let _ = crate::win_fs::create_symlink(Path::new(target), &dst_path);
                                 }
                                 conn.expected_paths.insert(dst_path);
                                 conn.files_received = conn.files_received.saturating_add(1);
@@ -1202,6 +1140,8 @@ pub mod server {
                                         }
                                         if e.file_type().is_file() || e.file_type().is_symlink() {
                                             if !expected_set.contains(&keyify(&p)) {
+                                                #[cfg(windows)]
+                                                crate::win_fs::clear_readonly_recursive(&p);
                                                 let _ = std::fs::remove_file(&p);
                                             }
                                         }
@@ -1210,6 +1150,8 @@ pub mod server {
                                         .sort_by_key(|p| std::cmp::Reverse(p.components().count()));
                                     for d in all_dirs {
                                         if !expected_set.contains(&keyify(&d)) {
+                                            #[cfg(windows)]
+                                            crate::win_fs::clear_readonly_recursive(&d);
                                             let _ = std::fs::remove_dir(&d);
                                         }
                                     }
@@ -1244,12 +1186,20 @@ pub mod server {
                                         let p = e.path().to_path_buf();
                                         if e.file_type().is_dir() { dirs.push(p); continue; }
                                         if e.file_type().is_file() || e.file_type().is_symlink() {
+                                            #[cfg(windows)]
+                                            crate::win_fs::clear_readonly_recursive(&p);
                                             if let Err(e) = std::fs::remove_file(&p) { err = Some(format!("{}", e)); break; }
                                         }
                                     }
                                     dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
                                     if err.is_none() {
-                                        for d in dirs { let _ = std::fs::remove_dir(&d); }
+                                        for d in dirs { 
+                                            #[cfg(windows)]
+                                            crate::win_fs::clear_readonly_recursive(&d);
+                                            let _ = std::fs::remove_dir(&d); 
+                                        }
+                                        #[cfg(windows)]
+                                        crate::win_fs::clear_readonly_recursive(&base_path);
                                         let _ = std::fs::remove_dir(&base_path);
                                     }
                                 }
@@ -1278,8 +1228,7 @@ pub mod client {
     use super::*;
     use crate::url;
     use anyhow::{Context, Result};
-    use robosync::protocol::{MAGIC, VERSION};
-    use robosync::protocol::frame;
+    use crate::protocol::frame;
     use filetime::{set_file_mtime, FileTime};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -1288,9 +1237,6 @@ pub mod client {
     use tokio::net::TcpStream;
     use tokio::sync::Mutex;
     use tokio::time::{timeout, Duration};
-
-    // Use centralized constants from protocol module
-    use crate::protocol::timeouts::{WRITE_BASE_MS, PER_MB_MS};
 
     #[inline]
     async fn write_all_timed(stream: &mut TcpStream, buf: &[u8], ms: u64) -> Result<()> {
@@ -1365,11 +1311,7 @@ pub mod client {
         payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
         payload.extend_from_slice(path_bytes.as_bytes());
 
-        let mut hdr = Vec::with_capacity(4 + 2 + 1 + 4);
-        hdr.extend_from_slice(MAGIC);
-        hdr.extend_from_slice(&VERSION.to_le_bytes());
-        hdr.push(frame::LIST_REQ); // ListReq
-        hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let hdr = crate::protocol_core::build_frame_header(frame::LIST_REQ, payload.len() as u32);
 
         match timeout(Duration::from_millis(crate::protocol::timeouts::CONNECT_MS), async {
             stream.write_all(&hdr).await?;
@@ -1421,7 +1363,7 @@ pub mod client {
 
             let suggestion_path = format!("{}{}", remote_path_prefix, name);
             let suggestion = format!(
-                "robosync://{}:{}{}",
+                "blit://{}:{}{}",
                 remote.host, remote.port, suggestion_path
             );
 

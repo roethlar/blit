@@ -1,9 +1,9 @@
 [package]
-name = "robosync"
+name = "blit"
 version = "3.1.0"
 edition = "2021"
-authors = ["RoboSync Contributors"]
-description = "High-performance file synchronization with robocopy-style CLI"
+authors = ["Blit Contributors"]
+description = "High-performance file synchronization with fast mirror/copy/move"
 license = "MIT"
 
 [build-dependencies]
@@ -17,6 +17,7 @@ clap = { version = "4.5", features = ["derive"] }
 indicatif = "0.17"  # Progress bars
 ctrlc = "3.4"        # Signal handling
 rayon = "1.10"      # Parallel iterators
+num_cpus = "1.0"    # CPU count detection for optimal thread configuration
 tar = "0.4"         # For tar streaming
 walkdir = "2.5"     # Directory traversal
 parking_lot = "0.12" # Better mutexes
@@ -33,6 +34,8 @@ chrono = { version = "0.4" }
 filetime = "0.2"
 bincode = "1.3"
 tempfile = "3"
+sysinfo = "0.31"
+lazy_static = "1.4"
 ratatui = { version = "0.26", optional = true }
 crossterm = { version = "0.27", optional = true }
 unicode-width = { version = "0.1", optional = true }
@@ -60,5 +63,17 @@ opt-level = 3
 strip = true
 
 [features]
-default = []
+default = ["tui"]
 tui = ["ratatui", "crossterm", "unicode-width"]
+
+[[bin]]
+name = "blit"
+path = "src/main.rs"
+
+[[bin]]
+name = "blitd"
+path = "src/bin/blitd.rs"
+
+[[bin]]
+name = "blitty"
+path = "src/bin/blitty.rs"

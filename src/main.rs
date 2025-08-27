@@ -1,4 +1,4 @@
-//! RoboSync Rev3 - Simplified, high-performance file synchronization
+//! Blit Rev3 - Simplified, high-performance file synchronization
 //!
 //! Design goals:
 //! - Saturate 10GbE network (1+ GB/s throughput)
@@ -15,6 +15,7 @@ mod net_async;
 mod tar_stream;
 mod url;
 mod protocol;
+mod protocol_core;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -35,9 +36,9 @@ use crate::fs_enum::{
 use crate::logger::{Logger, NoopLogger, TextLogger};
 use crate::tar_stream::{tar_stream_transfer_list, TarConfig};
 use crate::net_async::server;
-use robosync::protocol::frame;
+use crate::protocol::frame;
 #[cfg(feature = "tui")]
-use robosync::tui;
+use blit::tui;
 use serde::Serialize;
 
 /// Command-line arguments
@@ -45,9 +46,9 @@ use serde::Serialize;
 #[command(
     author,
     version,
-    about = "RoboSync — Fast, async-first sync with mirror/copy/move and an optional daemon",
-    long_about = "RoboSync — async-first high-performance file sync.\n\
-Mirror/copy/move between local and robosync://host:port paths. Small files are TAR-bundled; large files use delta.\n\
+    about = "Blit — Fast, async-first sync with mirror/copy/move and an optional daemon",
+    long_about = "Blit — async-first high-performance file sync.\n\
+Mirror/copy/move between local and blit://host:port paths. Small files are TAR-bundled; large files use delta.\n\
 The async daemon is the default server; the classic server is available via --serve-legacy. For compatibility, --serve maps to the async daemon."
 )]
 struct Args {
@@ -194,11 +195,14 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum CliCommand {
-    /// Run the async daemon on 0.0.0.0:<port>
+    /// Run the async daemon server
     Daemon {
         /// Root directory to serve
+        #[clap(short = 'r', long, default_value = ".")]
         root: PathBuf,
+        
         /// Port to bind on 0.0.0.0
+        #[clap(short = 'p', long, default_value = "9031")]
         port: u16,
     },
     /// Mirror src to dest (copy + delete extras; include empty dirs)
@@ -257,6 +261,10 @@ fn main() -> Result<()> {
         match cmd {
             CliCommand::Daemon { root, port } => {
                 let bind = format!("0.0.0.0:{}", port);
+                println!("Starting Blit daemon:");
+                println!("  Root: {}", root.display());
+                println!("  Port: {}", port);
+                println!("  Bind: {}", bind);
                 return server_main_async(&bind, root);
             }
             CliCommand::Mirror { src, dest } => {
@@ -323,7 +331,7 @@ fn main() -> Result<()> {
                         Some(s) => crate::url::parse_remote_url(&PathBuf::from(s)).or(None),
                         None => None,
                     };
-                    let url2 = url.map(|r| robosync::url::RemoteDest{ host: r.host, port: r.port, path: r.path });
+                    let url2 = url.map(|r| blit::url::RemoteDest{ host: r.host, port: r.port, path: r.path });
                     return tui::start_shell(url2);
                 }
                 #[cfg(not(feature = "tui"))]
@@ -337,7 +345,7 @@ fn main() -> Result<()> {
     // On Windows, check for symlink creation privilege if --sl is used
     #[cfg(windows)]
     if args.sl {
-        if !robosync::win_fs::has_symlink_privilege() {
+        if !blit::win_fs::has_symlink_privilege() {
             eprintln!("ERROR: To create symbolic links on Windows, this program must be run as an administrator.");
             eprintln!(
                 "Please re-run from an elevated command prompt (e.g., 'Run as administrator')."
@@ -383,7 +391,7 @@ fn main() -> Result<()> {
         (Some(s), Some(d)) => (s, d),
         _ => {
             eprintln!("Interactive mode: enter source and destination paths.");
-            use std::io::{Read, Write};
+            use std::io::Write;
             eprint!("Source: "); std::io::stdout().flush().ok();
             let mut s = String::new(); std::io::stdin().read_line(&mut s).ok();
             eprint!("Destination: "); std::io::stdout().flush().ok();
@@ -414,7 +422,7 @@ fn main() -> Result<()> {
 
     if show_activity {
         print!(
-            "{} RoboSync {}...",
+            "{} Blit {}...",
             spinner_chars[spinner_index],
             env!("CARGO_PKG_VERSION")
         );
@@ -429,7 +437,7 @@ fn main() -> Result<()> {
 
     if args.verbose {
         println!(
-            "RoboSync {} - Linux/macOS Optimized",
+            "Blit {} - Linux/macOS Optimized",
             env!("CARGO_PKG_VERSION")
         );
         println!("Source: {:?}", src_path);
@@ -443,12 +451,23 @@ fn main() -> Result<()> {
         }
     }
 
-    // Set thread count for rayon
-    if args.threads > 0 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(args.threads)
-            .build_global()
-            .context("Failed to set thread count")?;
+    // Configure Rayon thread pool for optimal performance
+    // Use physical CPU count by default to avoid hyperthreading overhead
+    let thread_count = if args.threads > 0 {
+        args.threads
+    } else {
+        // Default to physical CPU count for better performance
+        num_cpus::get_physical()
+    };
+    
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build_global()
+        .context("Failed to configure thread pool")?;
+    
+    if args.verbose {
+        eprintln!("Configured thread pool with {} threads (physical CPUs: {})", 
+                 thread_count, num_cpus::get_physical());
     }
 
     // Check if source is a single file
@@ -1099,6 +1118,7 @@ fn compute_destination(src_file: &Path, src_root: &Path, dst_root: &Path) -> Pat
     }
 }
 
+
 /// Handle mirror mode deletion (delete extra files in destination)
 fn handle_mirror_deletion(
     source: &Path,
@@ -1202,6 +1222,10 @@ fn handle_mirror_deletion(
     // Delete files first
     for (_i, path) in files_to_delete.iter().enumerate() {
         // Simple deletion without progress display
+        
+        // Clear read-only recursively on Windows before attempting deletion
+        #[cfg(windows)]
+        blit::win_fs::clear_readonly_recursive(path);
 
         match std::fs::remove_file(path) {
             Ok(_) => {
@@ -1211,22 +1235,6 @@ fn handle_mirror_deletion(
                 }
             }
             Err(e) => {
-                // On Windows, read-only attributes can block deletion; attempt to clear and retry
-                #[cfg(windows)]
-                {
-                    if let Ok(md) = std::fs::metadata(path) {
-                        let mut perms = md.permissions();
-                        if perms.readonly() {
-                            perms.set_readonly(false);
-                            let _ = std::fs::set_permissions(path, perms);
-                            if std::fs::remove_file(path).is_ok() {
-                                deleted_files += 1;
-                                if verbose { println!("Deleted file (after clearing readonly): {}", path.display()); }
-                                continue;
-                            }
-                        }
-                    }
-                }
                 eprintln!("Failed to delete file {:?}: {}", path, e);
             }
         }
@@ -1239,6 +1247,10 @@ fn handle_mirror_deletion(
     for (_i, path) in dirs_to_delete.iter().enumerate() {
         // Simple deletion without progress display
 
+        // Clear read-only recursively on Windows before attempting deletion
+        #[cfg(windows)]
+        blit::win_fs::clear_readonly_recursive(path);
+        
         match std::fs::remove_dir(path) {
             Ok(_) => {
                 deleted_dirs += 1;
@@ -1247,22 +1259,6 @@ fn handle_mirror_deletion(
                 }
             }
             Err(e) => {
-                // On Windows, directories with readonly attribute may fail to remove; try clearing
-                #[cfg(windows)]
-                {
-                    if let Ok(md) = std::fs::metadata(path) {
-                        let mut perms = md.permissions();
-                        if perms.readonly() {
-                            perms.set_readonly(false);
-                            let _ = std::fs::set_permissions(path, perms);
-                            if std::fs::remove_dir(path).is_ok() {
-                                deleted_dirs += 1;
-                                if verbose { println!("Deleted directory (after clearing readonly): {}", path.display()); }
-                                continue;
-                            }
-                        }
-                    }
-                }
                 if verbose {
                     eprintln!(
                         "Failed to delete directory {:?}: {} (may not be empty)",
@@ -1284,7 +1280,7 @@ fn merge_stats(total: &mut CopyStats, other: CopyStats) {
     total.bytes_copied += other.bytes_copied;
     total.errors.extend(other.errors);
 }
-/// Remove leftover `.robosync_temp_*` directories from previous runs (best-effort)
+/// Remove leftover `.blit_temp_*` directories from previous runs (best-effort)
 // --- Daemon and client URL helpers ---
 
 fn server_main(bind: &str, root: &Path) -> Result<()> {

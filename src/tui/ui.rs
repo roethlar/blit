@@ -2,16 +2,14 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Clear},
     text::{Span, Line},
     Frame,
 };
 use std::path::{Path, PathBuf};
-use crate::url;
-use crate::protocol;
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use super::{app::{AppState, Focus, Pane, Mode}, theme::Theme};
+use super::{app::{AppState, Focus, Pane, Mode, UiMsg}, theme::Theme, remote};
+
+// Remote operations handled by tui::remote actor
 
 #[derive(Clone)]
 pub struct Entry { pub name: String, pub is_dir: bool, pub is_symlink: bool }
@@ -20,71 +18,484 @@ pub struct Entry { pub name: String, pub is_dir: bool, pub is_symlink: bool }
 pub enum PathSpec { Local(PathBuf), Remote{ host: String, port: u16, path: PathBuf } }
 
 pub fn draw(f: &mut Frame, app: &AppState) {
+    // Apply Dracula background to entire terminal
+    let background = Block::default().style(ratatui::style::Style::default().bg(Theme::BG));
+    f.render_widget(background, f.size());
+    
+    // Layout with header bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3), Constraint::Length(1)].as_ref())
+        .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(3), Constraint::Length(2)].as_ref())
         .split(f.size());
+    
+    // Professional header bar
+    draw_header(f, chunks[0], app);
+    
+    // Two-pane layout
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-        .split(chunks[0]);
-    draw_pane(f, cols[0], &app.left, app.focus == Focus::Left);
-    draw_pane(f, cols[1], &app.right, app.focus == Focus::Right);
+        .split(chunks[1]);
+    draw_pane(f, cols[0], &app.left, app.focus == Focus::Left, app.loading_pane == Some(Focus::Left));
+    draw_pane(f, cols[1], &app.right, app.focus == Focus::Right, app.loading_pane == Some(Focus::Right));
 
-    // Log area (last few lines)
+    // Log area (last few lines) with proper styling
     let mut lines: Vec<Line> = Vec::new();
     let max_lines = 3usize;
     let start = app.log.len().saturating_sub(max_lines);
     for l in app.log.iter().skip(start) {
-        lines.push(Line::from(Span::styled(l.clone(), Theme::status())));
+        lines.push(Line::from(Span::styled(l.clone(), ratatui::style::Style::default().fg(Theme::COMMENT))));
     }
-    let logp = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
-    f.render_widget(logp, chunks[1]);
+    // Pad with empty lines if needed
+    while lines.len() < max_lines {
+        lines.push(Line::from(""));
+    }
+    let logp = Paragraph::new(lines)
+        .block(Block::default()
+            .borders(Borders::NONE)
+            .style(ratatui::style::Style::default().bg(Theme::BG)));
+    f.render_widget(logp, chunks[2]);
 
-    // Status line
+    // Status line with mode info
     let spinner = if app.running {
-        let s = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'][app.spinner_idx % 10];
-        // advance spinner
-        // NOTE: we cannot mutate here; app.spinner_idx is advanced by caller if desired
-        s
+        if is_ascii_mode() {
+            ['|', '/', '-', '\\', '|', '/', '-', '\\', '|', '/'][app.spinner_idx % 10]
+        } else {
+            ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'][app.spinner_idx % 10]
+        }
     } else { ' ' };
-    let status = format!(
-        "{} mode:{} TAR:{} DELTA:{} EMPTY:{} CHKSUM:{} SRC:{} DST:{}  {}",
-        spinner,
-        mode_str(app.mode), onoff(app.tar_small), onoff(app.delta_large), onoff(app.include_empty), onoff(app.checksum),
-        path_short(app.src.as_ref()), path_short(app.dest.as_ref()), app.status
+    
+    // Build status with better formatting
+    let mode_icon = if is_ascii_mode() {
+        match app.mode {
+            Mode::Mirror => "[M]",
+            Mode::Copy => "[C]",
+            Mode::Move => "[>]",
+        }
+    } else {
+        match app.mode {
+            Mode::Mirror => "🔄",
+            Mode::Copy => "📋",
+            Mode::Move => "➡️",
+        }
+    };
+    
+    // First line: status and settings
+    let check = if is_ascii_mode() { "Y" } else { "✓" };
+    let cross = if is_ascii_mode() { "N" } else { "✗" };
+    let status_parts = vec![
+        format!("{} {}", mode_icon, mode_str(app.mode)),
+        if app.tar_small { format!("TAR:{}", check) } else { format!("TAR:{}", cross) },
+        if app.delta_large { format!("DELTA:{}", check) } else { format!("DELTA:{}", cross) },
+        if app.include_empty { format!("EMPTY:{}", check) } else { format!("EMPTY:{}", cross) },
+        if app.checksum { format!("CHKSUM:{}", check) } else { format!("CHKSUM:{}", cross) },
+    ];
+    
+    let src_dst = format!("SRC:{} → DST:{}", 
+        path_short(app.src.as_ref()), 
+        path_short(app.dest.as_ref())
     );
-    let p = Paragraph::new(Line::from(Span::raw(status))).block(Block::default().borders(Borders::NONE));
-    f.render_widget(p, chunks[2]);
-    // Help overlay
+    
+    let status_text = if app.running {
+        format!("{} {} │ {} │ {}", spinner, app.status, status_parts.join(" "), src_dst)
+    } else if !app.status.is_empty() {
+        format!("  {} │ {} │ {}", app.status, status_parts.join(" "), src_dst)
+    } else {
+        format!("  Ready │ {} │ {}", status_parts.join(" "), src_dst)
+    };
+    
+    // Second line: command keys with better visual separation
+    let keys = if get_show_help(app) {
+        " Press [h] to close help"
+    } else if app.ui_mode == super::app::UiMode::ServerInput {
+        " Type server address • [Enter] connect • [Esc] cancel"
+    } else if app.ui_mode == super::app::UiMode::NewFolderInput {
+        " Type folder name • [Enter] create • [Esc] cancel"
+    } else {
+        " [q]uit [Tab/f/Alt+←→]switch [↑↓]nav [s]rc [d]est [n]ew [m]ode [R]emote [g]o [x]cancel [h]elp"
+    };
+    
+    let status_lines = vec![
+        Line::from(Span::styled(status_text, ratatui::style::Style::default().fg(Theme::FG))),
+        Line::from(Span::styled(keys, ratatui::style::Style::default().fg(Theme::COMMENT))),
+    ];
+    
+    let p = Paragraph::new(status_lines)
+        .block(Block::default()
+            .borders(Borders::TOP)
+            .border_style(ratatui::style::Style::default().fg(Theme::COMMENT))
+            .style(ratatui::style::Style::default().bg(Theme::BG)));
+    f.render_widget(p, chunks[3]);
+    
+    // Toast notifications
+    if let Some((msg, _)) = &app.toast {
+        let toast_area = centered_rect(40, 5, f.size());
+        let toast_style = if msg.starts_with("Error:") || msg.starts_with("✗") {
+            ratatui::style::Style::default().fg(Theme::RED).bg(Theme::BG)
+        } else {
+            ratatui::style::Style::default().fg(Theme::GREEN).bg(Theme::BG)
+        };
+        let toast_widget = Paragraph::new(msg.as_str())
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(toast_style)
+                .style(toast_style));
+        f.render_widget(toast_widget, toast_area);
+    }
+    
+    // Help overlay with proper background
     if get_show_help(app) {
         let area = centered_rect(60, 40, f.size());
+        
+        // Clear the background area first with Clear widget
+        f.render_widget(Clear, area);
+        
         let lines = vec![
-            Line::from("Keys: q quit | Tab switch pane | ↑/↓/Enter navigate"),
-            Line::from("s set src | d set dest | m mode (mirror/copy/move)"),
-            Line::from("R toggle right remote | g run | x cancel | h help"),
+            Line::from(Span::styled("Navigation:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from("  ↑/↓/k/j    Navigate up/down"),
+            Line::from("  Enter      Enter directory"),
+            Line::from("  Tab/f      Switch pane (focus)"),
+            Line::from("  Alt+←/→    Switch to left/right pane"),
+            Line::from(""),
+            Line::from(Span::styled("File Operations:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from("  s          Set as source"),
+            Line::from("  d          Set as destination"),
+            Line::from("  n          Create new folder (in destination)"),
+            Line::from("  m          Change mode (mirror/copy/move)"),
+            Line::from("  g          Start transfer"),
+            Line::from("  x          Cancel transfer"),
+            Line::from(""),
+            Line::from(Span::styled("Options:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from("  t          Toggle TAR for small files"),
+            Line::from("  r          Toggle delta for large files"),
+            Line::from("  e          Toggle empty directories"),
+            Line::from("  c          Toggle checksums"),
+            Line::from(""),
+            Line::from(Span::styled("Remote:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from("  R          Connect to remote server"),
+            Line::from(""),
+            Line::from(Span::styled("General:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from("  h          Toggle this help"),
+            Line::from("  q          Quit"),
         ];
-        let w = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Help"));
-        f.render_widget(w, area);
+        
+        let help_widget = Paragraph::new(lines)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(ratatui::style::Style::default().fg(Theme::PINK))
+                .title(Span::styled(" Help ", ratatui::style::Style::default().fg(Theme::PINK).add_modifier(ratatui::style::Modifier::BOLD)))
+                .style(ratatui::style::Style::default().bg(Theme::BG).fg(Theme::FG)));
+        f.render_widget(help_widget, area);
+    }
+    
+    // Server input overlay with proper background
+    if app.ui_mode == super::app::UiMode::ServerInput {
+        let area = centered_rect(50, 12, f.size());
+        
+        // Clear the background area first with Clear widget
+        f.render_widget(Clear, area);
+        
+        // Build the input display with a cursor
+        let input_display = if app.input_buffer.is_empty() {
+            format!("{}█", app.input_buffer)
+        } else {
+            format!("{}█", app.input_buffer)
+        };
+        
+        let input_text = vec![
+            Line::from(""),
+            Line::from(Span::styled("Enter server address (host:port):", ratatui::style::Style::default().fg(Theme::CYAN))),
+            Line::from(""),
+            Line::from(Span::styled(input_display, ratatui::style::Style::default().fg(Theme::GREEN).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Enter", ratatui::style::Style::default().fg(Theme::PINK).add_modifier(ratatui::style::Modifier::BOLD)),
+                Span::raw(" to connect, "),
+                Span::styled("Esc", ratatui::style::Style::default().fg(Theme::PINK).add_modifier(ratatui::style::Modifier::BOLD)),
+                Span::raw(" to cancel"),
+            ]),
+        ];
+        
+        let input_block = Paragraph::new(input_text)
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(ratatui::style::Style::default().fg(Theme::CYAN))
+                .title(Span::styled(" Remote Server Connection ", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD)))
+                .style(ratatui::style::Style::default().bg(Theme::BG).fg(Theme::FG)));
+        f.render_widget(input_block, area);
+    }
+    
+    // New folder input overlay with proper background
+    if app.ui_mode == super::app::UiMode::NewFolderInput {
+        let area = centered_rect(50, 12, f.size());
+        
+        // Clear the background area first with Clear widget
+        f.render_widget(Clear, area);
+        
+        // Build the input display with a cursor
+        let input_display = format!("{}█", app.input_buffer);
+        
+        // Show where the folder will be created
+        let location = match &app.right {
+            Pane::Local { cwd, .. } => format!("in: {}", cwd.display()),
+            Pane::Remote { host, port, cwd, .. } => format!("in: {}:{}{}", host, port, cwd.display()),
+        };
+        
+        let input_text = vec![
+            Line::from(""),
+            Line::from(Span::styled("Enter new folder name:", ratatui::style::Style::default().fg(Theme::GREEN))),
+            Line::from(Span::styled(location, ratatui::style::Style::default().fg(Theme::COMMENT))),
+            Line::from(""),
+            Line::from(Span::styled(input_display, ratatui::style::Style::default().fg(Theme::YELLOW).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Enter", ratatui::style::Style::default().fg(Theme::PINK).add_modifier(ratatui::style::Modifier::BOLD)),
+                Span::raw(" to create, "),
+                Span::styled("Esc", ratatui::style::Style::default().fg(Theme::PINK).add_modifier(ratatui::style::Modifier::BOLD)),
+                Span::raw(" to cancel"),
+            ]),
+        ];
+        
+        let input_block = Paragraph::new(input_text)
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(ratatui::style::Style::default().fg(Theme::GREEN))
+                .title(Span::styled(" Create New Folder ", ratatui::style::Style::default().fg(Theme::GREEN).add_modifier(ratatui::style::Modifier::BOLD)))
+                .style(ratatui::style::Style::default().bg(Theme::BG).fg(Theme::FG)));
+        f.render_widget(input_block, area);
     }
 }
 
-fn draw_pane(f: &mut Frame, area: Rect, pane: &Pane, focused: bool) {
-    let (title, entries, selected) = match pane {
-        Pane::Local { cwd, entries, selected } => (format!("Local: {}", cwd.display()), entries, *selected),
-        Pane::Remote { host, port, cwd, entries, selected } => (format!("Remote: {}:{}/{}", host, port, cwd.display()), entries, *selected),
+pub fn is_ascii_mode() -> bool {
+    // Check if we should use ASCII mode (for non-UTF8 terminals)
+    std::env::var("BLIT_ASCII").is_ok() || std::env::var("TERM").map_or(false, |t| t.contains("dumb"))
+}
+
+fn make_breadcrumb(path: &Path, max_len: usize) -> String {
+    let path_str = path.display().to_string();
+    
+    // Special handling for Windows paths
+    #[cfg(windows)]
+    {
+        if path_str == "\\\\?\\drives" || path_str == "/drives" {
+            return "Drive Selection".to_string();
+        }
+        // Show drive letter prominently for Windows paths
+        if path_str.len() >= 3 && path_str.chars().nth(1) == Some(':') {
+            // This is a Windows path with drive letter
+            if path_str.len() <= max_len {
+                return path_str;
+            }
+        }
+    }
+    
+    if path_str.len() <= max_len {
+        path_str
+    } else {
+        // Show last parts of path that fit
+        let parts: Vec<&str> = path_str.split('/').filter(|s| !s.is_empty()).collect();
+        let mut result = String::new();
+        for part in parts.iter().rev() {
+            let candidate = if result.is_empty() {
+                part.to_string()
+            } else {
+                format!(".../{}/{}", part, result)
+            };
+            if candidate.len() <= max_len {
+                result = candidate;
+            } else {
+                if result.is_empty() {
+                    result = format!("...{}", &part[part.len().saturating_sub(max_len-3)..]);
+                } else {
+                    result = format!(".../{}", result);
+                }
+                break;
+            }
+        }
+        if result.is_empty() { "...".to_string() } else { result }
+    }
+}
+
+fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
+    let mode_str = match app.mode {
+        Mode::Mirror => "Mirror",
+        Mode::Copy => "Copy",
+        Mode::Move => "Move",
     };
-    let items: Vec<ListItem> = entries.iter().enumerate().map(|(i,e)| {
-        let style = if i == selected { Theme::selected() } else if e.is_dir { Theme::dir() } else if e.is_symlink { Theme::symlink() } else { Theme::file() };
-        ListItem::new(Span::styled(e.name.clone(), style))
-    }).collect();
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(Span::styled(title, Theme::header(focused))));
-    f.render_widget(list, area);
+    
+    let check = if is_ascii_mode() { "on" } else { "✓" };
+    let cross = if is_ascii_mode() { "off" } else { "✗" };
+    
+    let header_text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Blit Shell", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD)),
+            Span::raw(" — "),
+            Span::styled(mode_str, ratatui::style::Style::default().fg(Theme::PINK)),
+            Span::raw(" | "),
+            Span::raw("TAR:"),
+            Span::styled(if app.tar_small { check } else { cross }, 
+                if app.tar_small { ratatui::style::Style::default().fg(Theme::GREEN) } else { ratatui::style::Style::default().fg(Theme::COMMENT) }),
+            Span::raw(" Delta:"),
+            Span::styled(if app.delta_large { check } else { cross },
+                if app.delta_large { ratatui::style::Style::default().fg(Theme::GREEN) } else { ratatui::style::Style::default().fg(Theme::COMMENT) }),
+            Span::raw(" Empty:"),
+            Span::styled(if app.include_empty { check } else { cross },
+                if app.include_empty { ratatui::style::Style::default().fg(Theme::GREEN) } else { ratatui::style::Style::default().fg(Theme::COMMENT) }),
+            Span::raw(" Checksum:"),
+            Span::styled(if app.checksum { check } else { cross },
+                if app.checksum { ratatui::style::Style::default().fg(Theme::GREEN) } else { ratatui::style::Style::default().fg(Theme::COMMENT) }),
+        ]),
+    ];
+    
+    let header_widget = Paragraph::new(header_text)
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(ratatui::style::Style::default().fg(Theme::COMMENT))
+            .style(ratatui::style::Style::default().bg(Theme::BG)));
+    f.render_widget(header_widget, area);
+}
+
+fn draw_pane(f: &mut Frame, area: Rect, pane: &Pane, focused: bool, is_loading: bool) {
+    let (title, entries, selected) = match pane {
+        Pane::Local { cwd, entries, selected } => {
+            let icon = if is_ascii_mode() { "[L]" } else { "📁" };
+            let breadcrumb = make_breadcrumb(cwd, 40);
+            let title = format!(" {} Local: {} ", icon, breadcrumb);
+            (title, entries, *selected)
+        },
+        Pane::Remote { host, port, cwd, entries, selected } => {
+            let icon = if is_ascii_mode() { "[R]" } else { "🌐" };
+            let breadcrumb = make_breadcrumb(cwd, 30);
+            // Avoid duplicating :port if host already includes it
+            let host_port = if host.contains(':') { host.clone() } else { format!("{}:{}", host, port) };
+            let title = format!(" {} {} {} ", icon, host_port, breadcrumb);
+            (title, entries, *selected)
+        },
+    };
+    
+    // Build list items with icons
+    let items: Vec<ListItem> = if is_loading {
+        vec![ListItem::new(Span::styled(
+            if is_ascii_mode() { "Loading..." } else { "⏳ Loading..." },
+            ratatui::style::Style::default().fg(Theme::COMMENT)
+        ))]
+    } else {
+        entries.iter().enumerate().map(|(i, e)| {
+            let icon = if is_ascii_mode() {
+                if e.name == ".." {
+                    "[..] "
+                } else if e.is_dir {
+                    "[D] "
+                } else if e.is_symlink {
+                    "[L] "
+                } else {
+                    "    "
+                }
+            } else {
+                if e.name == ".." {
+                    "⬆ "
+                } else if e.is_dir {
+                    "📁 "
+                } else if e.is_symlink {
+                    "🔗 "
+                } else {
+                    "📄 "
+                }
+            };
+            
+            let name_with_icon = format!("{}{}", icon, e.name);
+            
+            let style = if i == selected { 
+                Theme::selected() 
+            } else if e.is_dir { 
+                Theme::dir() 
+            } else if e.is_symlink { 
+                Theme::symlink() 
+            } else { 
+                Theme::file() 
+            };
+            
+            ListItem::new(Span::styled(name_with_icon, style))
+        }).collect()
+    };
+    
+    // Apply Dracula theme to the block with better border styling
+    let (border_style, title_style) = if focused {
+        (
+            ratatui::style::Style::default()
+                .fg(Theme::PINK)
+                .bg(Theme::BG)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+            ratatui::style::Style::default()
+                .fg(Theme::PINK)
+                .bg(Theme::BG)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        )
+    } else {
+        (
+            ratatui::style::Style::default()
+                .fg(Theme::COMMENT)
+                .bg(Theme::BG),
+            ratatui::style::Style::default()
+                .fg(Theme::COMMENT)
+                .bg(Theme::BG)
+        )
+    };
+    
+    // Create a stateful list to properly handle selection
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(selected));
+    
+    let list = List::new(items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(Span::styled(title, title_style))
+            .style(ratatui::style::Style::default().bg(Theme::BG)))
+        .highlight_style(if focused {
+            ratatui::style::Style::default()
+                .bg(Theme::PINK)
+                .fg(Theme::BG)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            ratatui::style::Style::default()
+                .bg(Theme::COMMENT)
+                .fg(Theme::FG)
+        })
+        .highlight_symbol(if focused { "▶ " } else { "  " });
+    
+    f.render_stateful_widget(list, area, &mut list_state);
 }
 
 pub fn read_local_dir(cwd: &Path) -> Vec<Entry> {
+    // Special case for Windows drive listing
+    #[cfg(windows)]
+    {
+        let cwd_str = cwd.to_string_lossy();
+        if cwd_str == "\\\\?\\drives" || cwd_str == "/drives" || cwd.as_os_str().is_empty() {
+            return get_windows_drives();
+        }
+    }
+    
     let mut out = Vec::new();
-    out.push(Entry { name: "..".to_string(), is_dir: true, is_symlink: false });
+    
+    // Only add .. if not at drive root on Windows
+    #[cfg(windows)]
+    {
+        let cwd_str = cwd.to_string_lossy();
+        if !cwd_str.ends_with(":\\") && cwd != Path::new("/drives") {
+            out.push(Entry { name: "..".to_string(), is_dir: true, is_symlink: false });
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        out.push(Entry { name: "..".to_string(), is_dir: true, is_symlink: false });
+    }
     
     // TUI pagination: Cap at 1000 entries to keep UI responsive
     const MAX_LIST_ENTRIES: usize = 1000;
@@ -125,79 +536,14 @@ pub fn read_local_dir(cwd: &Path) -> Vec<Entry> {
     out
 }
 
-pub fn read_remote_dir(host: &str, port: u16, path: &Path) -> Vec<Entry> {
-    // Use a short timeout to prevent blocking the UI
-    let mut out = Vec::new();
-    out.push(Entry { name: "..".to_string(), is_dir: true, is_symlink: false });
-    
-    // Build a runtime with timeout to prevent blocking
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
-    if let Ok(rt) = rt {
-        // Use a 500ms timeout to keep UI responsive
-        let res = rt.block_on(async move {
-            tokio::time::timeout(std::time::Duration::from_millis(500), async move {
-            let addr = format!("{}:{}", host, port);
-            let mut stream = TcpStream::connect(&addr).await.ok()?;
-            // Build header + payload
-            let p = path.to_string_lossy();
-            let mut payload = Vec::with_capacity(2 + p.len());
-            payload.extend_from_slice(&(p.len() as u16).to_le_bytes());
-            payload.extend_from_slice(p.as_bytes());
-            let mut hdr = Vec::with_capacity(11);
-            hdr.extend_from_slice(protocol::MAGIC);
-            hdr.extend_from_slice(&protocol::VERSION.to_le_bytes());
-            hdr.push(protocol::frame::LIST_REQ);
-            hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            let _ = stream.write_all(&hdr).await.ok()?;
-            let _ = stream.write_all(&payload).await.ok()?;
-            // Read response header
-            let mut h = [0u8; 11];
-            let _ = stream.read_exact(&mut h).await.ok()?;
-            if &h[0..4] != protocol::MAGIC { return Some(vec![]); }
-            let _ver = u16::from_le_bytes([h[4], h[5]]);
-            let typ = h[6];
-            let len = u32::from_le_bytes([h[7],h[8],h[9],h[10]]) as usize;
-            let mut resp = vec![0u8; len];
-            let _ = stream.read_exact(&mut resp).await.ok()?;
-            if typ != protocol::frame::LIST_RESP { return Some(vec![]); }
-            let mut v = Vec::new();
-            v.push(Entry { name: "..".to_string(), is_dir: true, is_symlink: false });
-            let mut off = 0usize;
-            if resp.len() < 4 { return Some(v); }
-            let mut u32b = [0u8;4]; u32b.copy_from_slice(&resp[off..off+4]);
-            let count = u32::from_le_bytes(u32b) as usize; off+=4;
-            for _ in 0..count {
-                if off >= resp.len() { break; }
-                let kind = resp[off]; off+=1;
-                if off+2 > resp.len() { break; }
-                let mut u16b = [0u8;2]; u16b.copy_from_slice(&resp[off..off+2]);
-                let nlen = u16::from_le_bytes(u16b) as usize; off+=2;
-                if off+nlen > resp.len() { break; }
-                let name = std::str::from_utf8(&resp[off..off+nlen]).unwrap_or("").to_string(); off+=nlen;
-                // kind: 0=file, 1=dir, 2=truncation marker
-                if kind == 2 {
-                    // Special truncation marker - show as informational entry
-                    v.push(Entry { name, is_dir: false, is_symlink: false });
-                } else {
-                    v.push(Entry { name, is_dir: kind==1, is_symlink: false });
-                }
-            }
-            Some(v)
-            }).await.ok()
-        });
-        
-        if let Some(Some(mut v)) = res {
-            if !v.is_empty() {
-                // No need to re-insert ".." as it's already at index 0 in v
-                return v;
-            }
-        } else {
-            // Connection timed out or failed - show error in list
-            out.push(Entry { name: "[Connection failed or timed out]".to_string(), is_dir: false, is_symlink: false });
-        }
-    }
-    out
+/// Request remote directory listing asynchronously
+pub fn request_remote_dir(app: &mut super::app::AppState, pane: super::app::Focus, host: String, port: u16, path: PathBuf) {
+    let _ = app.tx_ui.send(super::app::UiMsg::Loading { pane });
+    remote::request_remote_dir(&app.tx_ui, pane, host, port, path);
 }
+
+/// Async version of remote directory reading
+// Remote read functions moved to tui::remote
 
 pub fn move_up(app: &mut super::app::AppState) {
     let pane = if app.focus == Focus::Left { &mut app.left } else { &mut app.right };
@@ -217,31 +563,113 @@ pub fn move_down(app: &mut super::app::AppState) {
     }
 }
 
+
+pub fn move_page_up(app: &mut super::app::AppState) {
+    let page = 10usize;
+    let pane = if app.focus == Focus::Left { &mut app.left } else { &mut app.right };
+    match pane {
+        Pane::Local { selected, .. } | Pane::Remote { selected, .. } => {
+            *selected = selected.saturating_sub(page);
+        }
+    }
+}
+
+pub fn move_page_down(app: &mut super::app::AppState) {
+    let page = 10usize;
+    let pane = if app.focus == Focus::Left { &mut app.left } else { &mut app.right };
+    match pane {
+        Pane::Local { entries, selected, .. } | Pane::Remote { entries, selected, .. } => {
+            let max = entries.len().saturating_sub(1);
+            let mut idx = selected.saturating_add(page);
+            if idx > max { idx = max; }
+            *selected = idx;
+        }
+    }
+}
+
+pub fn move_home(app: &mut super::app::AppState) {
+    let pane = if app.focus == Focus::Left { &mut app.left } else { &mut app.right };
+    match pane {
+        Pane::Local { selected, .. } | Pane::Remote { selected, .. } => { *selected = 0; }
+    }
+}
+
+pub fn move_end(app: &mut super::app::AppState) {
+    let pane = if app.focus == Focus::Left { &mut app.left } else { &mut app.right };
+    match pane {
+        Pane::Local { entries, selected, .. } | Pane::Remote { entries, selected, .. } => {
+            if !entries.is_empty() { *selected = entries.len() - 1; }
+        }
+    }
+}
+
 pub fn enter(app: &mut super::app::AppState) {
-    let (entries, selected, cwd, is_remote, host, port) = match app.focus {
-        Focus::Left => match &mut app.left {
-            Pane::Local { entries, selected, cwd } => (entries, selected, cwd, false, String::new(), 0u16),
-            _ => unreachable!(),
-        },
-        Focus::Right => match &mut app.right {
-            Pane::Local { entries, selected, cwd } => (entries, selected, cwd, false, String::new(), 0u16),
-            Pane::Remote { entries, selected, cwd, host, port } => (entries, selected, cwd, true, host.clone(), *port),
-        },
-    };
-    if *selected >= entries.len() { return; }
-    let name = entries[*selected].name.clone();
-    if name == ".." {
-        if let Some(parent) = cwd.parent() { *cwd = parent.to_path_buf(); }
-    } else if entries[*selected].is_dir {
-        *cwd = cwd.join(name);
+    let focused_pane = if app.focus == Focus::Left { &mut app.left } else { &mut app.right };
+    
+    match focused_pane {
+        Pane::Local { entries, selected, cwd } => {
+            if *selected >= entries.len() { return; }
+            let name = entries[*selected].name.clone();
+            
+            // Handle Windows drive navigation safely
+            #[cfg(windows)]
+            if name.ends_with(":") || name.ends_with(":\\") {
+                // User selected a drive letter - extract safely
+                if let Some(first_char) = name.chars().next() {
+                    *cwd = PathBuf::from(format!("{}:\\", first_char));
+                    *entries = read_local_dir(cwd);
+                    *selected = 0;
+                }
+                return;
+            }
+            
+            if name == ".." {
+                if let Some(parent) = cwd.parent() {
+                    *cwd = parent.to_path_buf();
+                } else {
+                    // At root, show drive list on Windows
+                    #[cfg(windows)]
+                    {
+                        // Use a special marker path
+                        *cwd = PathBuf::from("\\\\?\\drives");
+                        *entries = get_windows_drives();
+                        *selected = 0;
+                        return;
+                    }
+                }
+            } else if entries[*selected].is_dir {
+                *cwd = cwd.join(name);
+            }
+            
+            *entries = read_local_dir(cwd);
+            if *selected >= entries.len() { *selected = entries.len().saturating_sub(1); }
+        }
+        Pane::Remote { entries, selected, cwd, host, port } => {
+            if *selected >= entries.len() { return; }
+            let name = entries[*selected].name.clone();
+            
+            if name == ".." {
+                if let Some(parent) = cwd.parent() { *cwd = parent.to_path_buf(); }
+            } else if entries[*selected].is_dir {
+                *cwd = cwd.join(name);
+            }
+                        if *selected >= entries.len() { *selected = entries.len().saturating_sub(1); }
+        }
     }
-    // refresh entries
-    if is_remote {
-        *entries = read_remote_dir(&host, port, cwd);
+
+    // After navigation, refresh remote pane asynchronously if applicable
+    if let super::app::Focus::Left = app.focus {
+        if let Pane::Remote { host, port, cwd, .. } = &app.left {
+            let h = host.clone(); let p = *port; let c = cwd.clone();
+            request_remote_dir(app, super::app::Focus::Left, h, p, c);
+        }
     } else {
-        *entries = read_local_dir(cwd);
+        if let Pane::Remote { host, port, cwd, .. } = &app.right {
+            let h = host.clone(); let p = *port; let c = cwd.clone();
+            request_remote_dir(app, super::app::Focus::Right, h, p, c);
+        }
     }
-    if *selected >= entries.len() { *selected = entries.len().saturating_sub(1); }
+
 }
 
 pub fn current_path(app: &AppState) -> PathSpec {
@@ -278,30 +706,116 @@ pub fn current_path(app: &AppState) -> PathSpec {
     }
 }
 
-pub fn toggle_remote_right(app: &mut super::app::AppState) {
-    match &mut app.right {
-        Pane::Local { .. } => {
-            // prompt for host:port and root? minimal: use localhost:9031 and "/"
-            let host = "127.0.0.1".to_string();
-            let port = 9031u16;
-            let cwd = PathBuf::from("/");
-            let entries = read_remote_dir(&host, port, &cwd);
-            app.right = Pane::Remote { host, port, cwd, entries, selected: 0 };
+pub fn process_server_input(app: &mut super::app::AppState) {
+    // Parse the input buffer for host:port
+    let input = app.input_buffer.trim();
+
+    // Parse host and port
+    let (host, port) = if let Some(colon_pos) = input.rfind(':') {
+        let host_part = &input[..colon_pos];
+        let port_part = &input[colon_pos + 1..];
+
+        if let Ok(p) = port_part.parse::<u16>() {
+            (host_part.to_string(), p)
+        } else {
+            app.status = format!("Invalid port: {}", port_part);
+            return;
         }
+    } else {
+        // No port specified, use default
+        (input.to_string(), 9031)
+    };
+
+    // Initialize remote pane and trigger async load
+    let cwd = PathBuf::from("/");
+    app.right = Pane::Remote { host: host.clone(), port, cwd: cwd.clone(), entries: vec![], selected: 0 };
+    app.status = format!("Connecting to {}:{}...", host, port);
+    request_remote_dir(app, super::app::Focus::Right, host, port, cwd);
+    app.input_buffer.clear();
+}
+
+pub fn create_new_folder(app: &mut super::app::AppState) {
+    let folder_name = app.input_buffer.trim();
+    if folder_name.is_empty() {
+        app.status = "Folder name cannot be empty".to_string();
+        app.input_buffer.clear();
+        return;
+    }
+    // Determine target pane (right pane is the destination)
+    match &app.right {
+        Pane::Local { cwd, .. } => {
+            let new_folder_path = cwd.join(folder_name);
+            match std::fs::create_dir(&new_folder_path) {
+                Ok(_) => {
+                    app.status = format!("Created folder: {}", folder_name);
+                    if let Pane::Local { cwd, ref mut entries, .. } = &mut app.right {
+                        *entries = read_local_dir(cwd);
+                    }
+                }
+                Err(e) => {
+                    app.status = format!("Failed to create folder: {}", e);
+                }
+            }
+        }
+        Pane::Remote { host, port, cwd, .. } => {
+            let remote_path = cwd.join(folder_name);
+            let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("blit"));
+            let remote_url = format!("blit://{}:{}{}", host, port, remote_path.display());
+            if let Ok(temp_dir) = std::env::temp_dir().canonicalize() {
+                let temp_path = temp_dir.join(format!("blit_mkdir_{}", std::process::id()));
+                if std::fs::create_dir(&temp_path).is_ok() {
+                    let mut cmd = std::process::Command::new(&exe);
+                    let _ = cmd
+                        .arg("copy")
+                        .arg("--empty-dirs")
+                        .arg(temp_path.to_string_lossy().as_ref())
+                        .arg(&remote_url)
+                        .output();
+                    let _ = std::fs::remove_dir(&temp_path);
+                    app.status = format!("Created remote folder: {}", folder_name);
+                    let mut req: Option<(super::app::Focus, String, u16, PathBuf)> = None;
+                    if let Pane::Remote { host, port, cwd, .. } = &app.right {
+                        let pane_focus = if app.focus == super::app::Focus::Left { super::app::Focus::Left } else { super::app::Focus::Right };
+                        req = Some((pane_focus, host.clone(), *port, cwd.clone()));
+                    }
+                    if let Some((pane_focus, h, p, c)) = req {
+                        request_remote_dir(app, pane_focus, h, p, c);
+                    }
+                } else {
+                    app.status = "Failed to create temporary directory".to_string();
+                }
+            } else {
+                app.status = "Failed to get temp directory".to_string();
+            }
+        }
+    }
+    app.input_buffer.clear();
+}
+
+pub fn toggle_remote_right(app: &mut super::app::AppState) {
+    // This function is now only called when toggling OFF remote
+    // The R key in app.rs directly sets InputMode::ServerInput
+    match &mut app.right {
         Pane::Remote { .. } => {
             let cwd = std::env::current_dir().unwrap_or(PathBuf::from("/"));
             app.right = Pane::Local { cwd: cwd.clone(), entries: read_local_dir(&cwd), selected: 0 };
+        }
+        Pane::Local { .. } => {
+            // Do nothing - server input is handled by the input mode
         }
     }
 }
 
 pub fn toggle_help(app: &mut super::app::AppState) {
-    // store as a status toggle in AppState via status prefix hack
-    let flag = "[HELP]";
-    if app.status.starts_with(flag) { app.status = app.status.trim_start_matches(flag).trim_start().to_string(); } else { app.status = format!("{} {}", flag, app.status); }
+    app.help_visible = !app.help_visible;
+    if app.help_visible {
+        app.ui_mode = super::app::UiMode::Help;
+    } else {
+        app.ui_mode = super::app::UiMode::Normal;
+    }
 }
 
-fn get_show_help(app: &AppState) -> bool { app.status.starts_with("[HELP]") }
+fn get_show_help(app: &AppState) -> bool { app.help_visible }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
@@ -322,12 +836,15 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn mode_str(m: Mode) -> &'static str { match m { Mode::Mirror => "mirror", Mode::Copy => "copy", Mode::Move => "move" } }
-fn onoff(b: bool) -> &'static str { if b { "on" } else { "off" } }
 fn path_short(p: Option<&PathSpec>) -> String {
     match p {
         None => "-".to_string(),
         Some(PathSpec::Local(pb)) => pb.display().to_string(),
-        Some(PathSpec::Remote{host,port,path}) => format!("{}:{}/{}", host, port, path.display()),
+        Some(PathSpec::Remote{host,port,path}) => {
+            let mut pstr = path.display().to_string().replace('\\', "/");
+            if !pstr.starts_with('/') { pstr = format!("/{}", pstr); }
+            format!("{}:{}{}", host, port, pstr)
+        },
     }
 }
 
@@ -336,14 +853,73 @@ pub fn pathspec_to_string(p: &PathSpec) -> String {
         PathSpec::Local(pb) => pb.display().to_string(),
         PathSpec::Remote{host,port,path} => {
             let mut s = String::new();
-            s.push_str("robosync://");
+            s.push_str("blit://");
             s.push_str(host);
             s.push(':');
             s.push_str(&port.to_string());
-            let mut pstr = path.display().to_string();
+            let mut pstr = path.display().to_string().replace("\\", "/");
             if !pstr.starts_with('/') { pstr = format!("/{}", pstr); }
             s.push_str(&pstr);
             s
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn get_windows_drives() -> Vec<Entry> {
+    let mut drives = Vec::new();
+    
+    // Add a back option to return to parent
+    drives.push(Entry { name: "..".to_string(), is_dir: true, is_symlink: false });
+    
+    // Check all drive letters A-Z
+    for letter in b'A'..=b'Z' {
+        let drive_path = format!("{}:\\", letter as char);
+        if std::path::Path::new(&drive_path).exists() {
+            drives.push(Entry {
+                name: format!("{}:", letter as char),
+                is_dir: true,
+                is_symlink: false,
+            });
+        }
+    }
+    
+    // Also check for network drives that might be mapped
+    // These would already be included above if mapped to a letter
+    
+    drives
+}
+
+#[cfg(not(windows))]
+pub fn get_windows_drives() -> Vec<Entry> {
+    // Not applicable on non-Windows systems
+    vec![]
+}
+
+pub fn refresh_panes(app: &mut super::app::AppState) {
+    // Refresh left pane
+    match &mut app.left {
+        Pane::Local { cwd, entries, .. } => {
+            *entries = read_local_dir(cwd);
+        }
+        Pane::Remote { host, port, cwd, .. } => {
+            let h = host.clone();
+            let p = *port;
+            let c = cwd.clone();
+            request_remote_dir(app, Focus::Left, h, p, c);
+        }
+    }
+    
+    // Refresh right pane  
+    match &mut app.right {
+        Pane::Local { cwd, entries, .. } => {
+            *entries = read_local_dir(cwd);
+        }
+        Pane::Remote { host, port, cwd, .. } => {
+            let h = host.clone();
+            let p = *port;
+            let c = cwd.clone();
+            request_remote_dir(app, Focus::Right, h, p, c);
         }
     }
 }

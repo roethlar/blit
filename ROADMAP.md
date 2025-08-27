@@ -9,6 +9,17 @@ Deliver a fast, reliable sync tool that:
 - Provides efficient small-file handling, robust mirror semantics, and predictable performance over 1/10GbE.
 - Offers a simple CLI and an optional daemon for push/pull.
 
+
+
+## Rename Notice (2025-08-27)
+
+The project has been renamed going forward:
+- CLI: blit
+- Daemon: blitd
+- TUI: blitty
+- URL scheme: blit://
+
+This roadmap retains historical "RoboSync" references to avoid rewriting history; new releases and code use the Blit naming.
 ## 3.1: Performance & Stability Parity
 
 Goal: Core feature parity across Linux/macOS and Windows, with production-ready performance.

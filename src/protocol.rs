@@ -1,4 +1,4 @@
-//! Shared protocol constants for RoboSync framed transport
+//! Shared protocol constants for Blit framed transport
 
 // Protocol header constants
 pub const MAGIC: &[u8; 4] = b"RSNC";
@@ -7,6 +7,9 @@ pub const VERSION: u16 = 1;
 // Maximum frame payload size (64MB) - prevents DoS via memory exhaustion
 // Using 64MB to accommodate large file chunks while preventing abuse
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+
+// Maximum entries in LIST_RESP to prevent UI freezing
+pub const MAX_LIST_ENTRIES: usize = 1000;
 
 // Frame type IDs (keep numeric stable for compat with classic path)
 pub mod frame {
@@ -40,24 +43,37 @@ pub mod frame {
     pub const DELTA_DONE: u8 = 28;
     pub const FILE_RAW_START: u8 = 29;
     pub const SET_ATTR: u8 = 30;
+    
+    // VERIFY batching protocol:
+    // Client sends: VERIFY_REQ (path1), VERIFY_REQ (path2), ..., VERIFY_DONE
+    // Server responds: VERIFY_HASH (status|algo|path1|hash1), VERIFY_HASH (status|algo|path2|hash2), ..., DONE
+    // Status byte: 0=OK, 1=NOT_FOUND, 2=ERROR
     pub const VERIFY_REQ: u8 = 31;
     pub const VERIFY_HASH: u8 = 32;
     pub const VERIFY_DONE: u8 = 33;  // Signals end of batch verification
+    
     // Management frames
+    // LIST protocol:
+    // Client sends: LIST_REQ with path
+    // Server responds: LIST_RESP with entry count and entries
+    // Server limits to 1000 entries max, sets kind=2 for truncation marker
     pub const LIST_REQ: u8 = 40;
     pub const LIST_RESP: u8 = 41;
     pub const REMOVE_TREE_REQ: u8 = 42;
     pub const REMOVE_TREE_RESP: u8 = 43;
 }
 
-// Compression flags for START frame (bits 4-5 in flags byte)
+// Compression flags - RESERVED/IGNORED as of v3.1
+// Compression was removed entirely to achieve 10GbE saturation
+// These constants are kept only for wire protocol compatibility with older clients
+// New implementations should ignore these bits
 pub mod compress_flags {
-    pub const NONE: u8 = 0x00;
-    pub const COMP_ZSTD: u8 = 0b00010000;  // Bit 4 set
-    pub const COMP_LZ4: u8 = 0b00100000;   // Bit 5 set
-    // Legacy values for TAR_START payload (single byte)
-    pub const TAR_ZSTD: u8 = 0x01;
-    pub const TAR_LZ4: u8 = 0x02;
+    pub const NONE: u8 = 0x00;          // No compression (always used in v3.1+)
+    pub const COMP_ZSTD: u8 = 0b00010000;  // Reserved (ignored)
+    pub const COMP_LZ4: u8 = 0b00100000;   // Reserved (ignored)
+    // Legacy TAR compression indicators - no longer used
+    pub const TAR_ZSTD: u8 = 0x01;      // Reserved (ignored)
+    pub const TAR_LZ4: u8 = 0x02;       // Reserved (ignored)
 }
 
 // Centralized timeout constants for consistent behavior across async/legacy paths

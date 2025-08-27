@@ -44,8 +44,11 @@ robosync move /src /dst -v
 Daemon and remote paths:
 
 ```bash
-# Start async daemon (default server)
-robosync daemon /srv/root 9031
+# Start async daemon (default server) with flags
+robosync daemon --root /srv/root --port 9031
+
+# Or use defaults (current directory on port 9031)
+robosync daemon
 
 # Legacy classic server (temporary fallback)
 robosync --serve-legacy --bind 0.0.0.0:9031 --root /srv/root
@@ -120,7 +123,7 @@ Common options:
 
 Daemon options:
 - `--serve-legacy`: run the classic (non-async) server as a temporary fallback.
-- `--bind` and `--root`: only for legacy server; the `daemon` subcommand takes positional `ROOT` and `PORT`.
+- `--bind` and `--root`: only for legacy server; the `daemon` subcommand uses `--root` and `--port` flags with sensible defaults.
 
 Performance tuning:
 - `--net-workers <N>`: number of parallel large-file workers for async push (default: 4; 1–32).
@@ -129,7 +132,7 @@ Performance tuning:
 
 ## TUI Shell (Preview)
 
-- Feature-gated behind `--features tui`.
+- Enabled by default (no feature flags required).
 - Dracula theme, dual-pane (local/local by default).
 - Toggle right pane remote with `R` (connects to `127.0.0.1:9031`); navigation with arrows/Enter, pick src/dest with `s`/`d`.
 - Run transfer with `g` (mirror/copy/move based on current mode). Shows a spinner and last few lines of output; press `x` to cancel a running transfer. Remote→remote transfers are not supported.
@@ -232,7 +235,7 @@ Wants=network-online.target
 [Service]
 User=robosync
 Group=robosync
-ExecStart=/usr/local/bin/robosync daemon /srv/robosync_root 9031
+ExecStart=/usr/local/bin/robosync daemon --root /srv/robosync_root --port 9031
 Restart=on-failure
 RestartSec=2s
 AmbientCapabilities=CAP_NET_BIND_SERVICE

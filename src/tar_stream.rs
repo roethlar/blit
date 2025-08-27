@@ -99,8 +99,27 @@ pub fn tar_stream_transfer(
     // Ensure destination exists
     fs::create_dir_all(dest)?;
 
-    // Create channel for streaming
-    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(config.channel_buffer);
+    // Count files to determine optimal channel buffer size
+    let file_count = WalkDir::new(source)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count();
+    
+    // Dynamic channel sizing: scale based on file count
+    // 16 chunks for <100 files, 32 for <1000, 64 for <10000, 128 for more
+    let dynamic_buffer_size = match file_count {
+        0..=100 => 16,
+        101..=1000 => 32,
+        1001..=10000 => 64,
+        _ => 128.min(config.channel_buffer * 2), // Cap at 2x configured or 128
+    };
+    
+    // Use the smaller of dynamic and configured size to save memory
+    let channel_buffer = dynamic_buffer_size.min(config.channel_buffer);
+
+    // Create channel for streaming with dynamic size
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(channel_buffer);
 
     // Progress bar
     let progress = if show_progress {
@@ -203,8 +222,18 @@ pub fn tar_stream_transfer_list(
     // Ensure destination exists
     fs::create_dir_all(dest)?;
 
-    // Create channel for streaming
-    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(config.channel_buffer);
+    // Dynamic channel sizing based on explicit file list
+    let file_count = files.len();
+    let dynamic_buffer_size = match file_count {
+        0..=100 => 16,
+        101..=1000 => 32,
+        1001..=10000 => 64,
+        _ => 128.min(config.channel_buffer * 2),
+    };
+    let channel_buffer = dynamic_buffer_size.min(config.channel_buffer);
+
+    // Create channel for streaming with dynamic size
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(channel_buffer);
 
     // Progress bar
     let progress = if show_progress {

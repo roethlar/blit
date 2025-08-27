@@ -18,7 +18,7 @@ pub struct CopyJob {
     pub start_offset: u64,
 }
 
-/// File filter options (robocopy compatibility)
+/// File filter options (robocopy-style compatibility)
 pub struct FileFilter {
     pub exclude_files: Vec<String>,
     pub exclude_dirs: Vec<String>,

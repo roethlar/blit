@@ -21,6 +21,7 @@ test_*.ps1
 # AI assistant files
 .claude/
 .grok/
+.crush/
 chat_transcript.md
 DEVLOG.md
 TODO.md
@@ -41,3 +42,6 @@ agent_bus.ndjson
 # Platform-specific
 .DS_Store
 Thumbs.db
+
+# Smoke test artifacts
+scripts/

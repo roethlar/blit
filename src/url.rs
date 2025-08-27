@@ -1,4 +1,4 @@
-//! URL parsing for robosync:// protocol
+//! URL parsing for blit:// protocol
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +15,7 @@ pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
     let lower = s_trim.to_ascii_lowercase();
     let scheme_end = lower.find(':')?;
     let scheme_with_colon = &lower[..=scheme_end];
-    if scheme_with_colon != "robosync:" {
+    if scheme_with_colon != "blit:" {
         return None;
     }
     let mut rest = &s_trim[scheme_end + 1..];

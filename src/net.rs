@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 // Centralized protocol constants - Claude's enhanced approach
 use crate::protocol::{MAGIC, VERSION, MAX_FRAME_SIZE, frame};
-// Use library modules from the robosync lib crate
+use crate::protocol_core;
+use crate::fs_enum;
+// Use library modules from the blit lib crate
 // Unused imports removed for 3.1 cleanup
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -16,6 +18,7 @@ use std::time::{Duration, Instant};
 thread_local! {
     static MTIME_STORE: std::cell::RefCell<std::collections::HashMap<String, i64>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
+
 
 fn apply_preserved_mtime(path: &Path) -> Result<()> {
     use filetime::{set_file_mtime, FileTime};
@@ -44,30 +47,18 @@ fn preallocate_file_linux(_file: &std::fs::File, _size: u64) {}
 // MAGIC, VERSION, and MAX_FRAME_SIZE now imported from protocol module
 
 
-fn write_u16(buf: &mut Vec<u8>, v: u16) {
-    buf.extend_from_slice(&v.to_le_bytes());
-}
-fn write_u32(buf: &mut Vec<u8>, v: u32) {
-    buf.extend_from_slice(&v.to_le_bytes());
-}
 
 fn write_frame(stream: &mut TcpStream, t: u8, payload: &[u8]) -> Result<()> {
-    let mut hdr = Vec::with_capacity(4 + 2 + 1 + 4);
-    hdr.extend_from_slice(MAGIC);
-    write_u16(&mut hdr, VERSION);
-    hdr.push(t);
-    write_u32(&mut hdr, payload.len() as u32);
+    let hdr = protocol_core::build_frame_header(t, payload.len() as u32);
     stream.write_all(&hdr)?;
     stream.write_all(payload)?;
     Ok(())
 }
 
 fn build_frame(t: u8, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + 2 + 1 + 4 + payload.len());
-    buf.extend_from_slice(MAGIC);
-    buf.extend_from_slice(&VERSION.to_le_bytes());
-    buf.push(t);
-    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    let hdr = protocol_core::build_frame_header(t, payload.len() as u32);
+    let mut buf = Vec::with_capacity(hdr.len() + payload.len());
+    buf.extend_from_slice(&hdr);
     buf.extend_from_slice(payload);
     buf
 }
@@ -237,18 +228,9 @@ fn read_exact(stream: &mut TcpStream, n: usize) -> Result<Vec<u8>> {
 fn read_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
     let mut hdr = [0u8; 11];
     stream.read_exact(&mut hdr)?;
-    if &hdr[0..4] != MAGIC {
-        anyhow::bail!("bad magic");
-    }
-    let ver = u16::from_le_bytes([hdr[4], hdr[5]]);
-    if ver != VERSION {
-        anyhow::bail!("protocol version mismatch: got {}, need {}", ver, VERSION);
-    }
-    let typ = hdr[6];
-    let len = u32::from_le_bytes([hdr[7], hdr[8], hdr[9], hdr[10]]) as usize;
-    if len > MAX_FRAME_SIZE {
-        anyhow::bail!("frame too large: {}", len);
-    }
+    let (typ, len_u32) = protocol_core::parse_frame_header(&hdr)?;
+    let len = len_u32 as usize;
+    protocol_core::validate_frame_size(len)?;
     let payload = read_exact(stream, len)?;
     Ok((typ, payload))
 }
@@ -622,7 +604,7 @@ fn process_tar_entry(
                 fs::create_dir_all(parent).ok();
             }
             let t = target.into_owned();
-            let created = robosync::win_fs::create_symlink(&t, &dst);
+            let created = crate::win_fs::create_symlink(&t, &dst);
             if created.is_ok() {
                 received.insert(dst);
                 return Ok((0, 0));
@@ -676,7 +658,7 @@ fn process_tar_entry(
 pub fn serve(bind: &str, root: &Path) -> Result<()> {
     let listener = TcpListener::bind(bind).with_context(|| format!("bind {}", bind))?;
     eprintln!(
-        "robosync daemon listening on {} root={}",
+        "blit daemon listening on {} root={}",
         bind,
         root.display()
     );
@@ -1107,7 +1089,7 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                 {
                     let _ = std::fs::remove_file(&dst_path);
                     let _ = std::fs::remove_dir(&dst_path);
-                    let _ = robosync::win_fs::create_symlink(Path::new(target), &dst_path);
+                    let _ = crate::win_fs::create_symlink(Path::new(target), &dst_path);
                 }
                 received_paths.insert(dst_path.clone());
                 expected_paths.insert(dst_path);
@@ -1461,66 +1443,9 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+// Use the unified normalize_under_root from protocol_core
 fn normalize_under_root(root: &Path, p: &Path) -> Result<PathBuf> {
-    // Ensure the destination stays under root (no traversal)
-    use std::path::Component;
-    for comp in p.components() {
-        if matches!(comp, Component::ParentDir) {
-            anyhow::bail!("destination contains parent component");
-        }
-    }
-    let joined = if p.is_absolute() {
-        root.join(p.strip_prefix("/").unwrap_or(p))
-    } else {
-        root.join(p)
-    };
-    let canon_root = std::fs::canonicalize(root).unwrap_or(root.to_path_buf());
-    
-    // Try to canonicalize the full path first
-    if let Ok(canon) = std::fs::canonicalize(&joined) {
-        if !canon.starts_with(&canon_root) {
-            anyhow::bail!("destination escapes root");
-        }
-        return Ok(canon);
-    }
-    
-    // For new files, canonicalize parent and verify it's under root
-    if let Some(parent) = joined.parent() {
-        let canon_parent = std::fs::canonicalize(parent).unwrap_or(parent.to_path_buf());
-        if !canon_parent.starts_with(&canon_root) {
-            anyhow::bail!("destination parent escapes root");
-        }
-        // Return canonical parent + final component
-        if let Some(file_name) = joined.file_name() {
-            return Ok(canon_parent.join(file_name));
-        }
-    }
-    
-    // Fall back to joined path if parent canonicalization also fails
-    Ok(joined)
-}
-
-#[cfg(windows)]
-fn normalize_under_root(root: &Path, p: &Path) -> Result<PathBuf> {
-    // Windows-safe normalization: strip any drive/UNC prefix and root components; reject ParentDir
-    use std::path::Component::{CurDir, Normal, ParentDir, Prefix, RootDir};
-    let mut joined = PathBuf::from(root);
-    for comp in p.components() {
-        match comp {
-            ParentDir => anyhow::bail!("destination contains parent component"),
-            Normal(s) => {
-                // Windows ADS defense: reject ':' in path components
-                if s.to_string_lossy().contains(':') {
-                    anyhow::bail!("path component contains colon (potential ADS attack)");
-                }
-                joined.push(s)
-            },
-            CurDir => {}
-            Prefix(_) | RootDir => {}
-        }
-    }
-    Ok(joined)
+    protocol_core::normalize_under_root(root, p)
 }
 
 fn mirror_delete_under(base: &Path, received: &HashSet<PathBuf>) -> Result<(u64, u64)> {
@@ -1539,6 +1464,8 @@ fn mirror_delete_under(base: &Path, received: &HashSet<PathBuf>) -> Result<(u64,
         }
         if entry.file_type().is_file() {
             if !received.contains(&p) {
+                #[cfg(windows)]
+                crate::win_fs::clear_readonly_recursive(&p);
                 match std::fs::remove_file(&p) {
                     Ok(_) => files_deleted += 1,
                     Err(e) => eprintln!("delete file failed {}: {}", p.display(), e),
@@ -1556,6 +1483,8 @@ fn mirror_delete_under(base: &Path, received: &HashSet<PathBuf>) -> Result<(u64,
         if received.contains(&d) {
             continue;
         }
+        #[cfg(windows)]
+        crate::win_fs::clear_readonly_recursive(&d);
         match std::fs::remove_dir(&d) {
             Ok(()) => dirs_deleted += 1,
             Err(e) => {
@@ -2362,7 +2291,7 @@ pub fn client_start(
     // (large files handled via data pool above)
     let mut buf = vec![0u8; 1024 * 1024];
     let mut last_bytes = *sent_bytes.lock().map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
-    for fe in &[] as &[robosync::fs_enum::FileEntry] {
+    for fe in &[] as &[fs_enum::FileEntry] {
         let rel = fe.path.strip_prefix(src_root).unwrap_or(&fe.path);
         let dest_rel = rel.to_string_lossy();
         let mut pl = Vec::with_capacity(2 + dest_rel.len() + 8 + 8);
@@ -2732,6 +2661,8 @@ pub fn client_pull(
             }
             if e.file_type().is_file() || e.file_type().is_symlink() {
                 if !expected.contains(&p) {
+                    #[cfg(windows)]
+                    crate::win_fs::clear_readonly_recursive(&p);
                     let _ = std::fs::remove_file(&p);
                 }
             }
@@ -2744,6 +2675,8 @@ pub fn client_pull(
             if expected.contains(&d) {
                 continue;
             }
+            #[cfg(windows)]
+            crate::win_fs::clear_readonly_recursive(&d);
             let _ = std::fs::remove_dir(&d);
         }
     }
