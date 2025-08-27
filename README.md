@@ -1,15 +1,15 @@
-# RoboSync 3.1.0
+# Blit 3.1.0 (formerly RoboSync)
 
 Fast local and remote sync with an async-first daemon, rsync-style delta, and robocopy-style ergonomics. Linux and macOS supported; Windows builds are experimental (see Platform Support).
 
 3.1 highlights:
 - Async daemon is the default server, started with the `daemon` subcommand.
-- Direction-agnostic verbs: `mirror`, `copy`, `move` with URL inference (`robosync://host:port/path`).
+- Direction-agnostic verbs: `mirror`, `copy`, `move` with URL inference (`blit://host:port/path`).
 - Async small-file TAR bundling to reduce frame overhead and boost throughput.
 - Accurate file/byte counters including tar-bundled files.
 - TUI shell (feature-gated) with Dracula theme preview.
 
-RoboSync v3 uses a compact daemon protocol with a manifest handshake so only changed files transfer, server-side mirror deletions, symlink preservation, empty-directory mirroring, and both push and pull modes.
+Blit v3 uses a compact daemon protocol with a manifest handshake so only changed files transfer, server-side mirror deletions, symlink preservation, empty-directory mirroring, and both push and pull modes.
 
 ## Key Features
 
@@ -25,66 +25,66 @@ Build:
 
 ```bash
 cargo build --release
-# Binary: target/release/robosync
+# Binary: target/release/blit
 ```
 
 Local copy (direction-agnostic verbs):
 
 ```bash
 # Mirror: copy + delete extras (includes empty dirs)
-robosync mirror /src /dst -v
+blit mirror /src /dst -v
 
 # Copy: copy only, never delete
-robosync copy /src /dst -v
+blit copy /src /dst -v
 
 # Move: mirror, then remove source after confirmation
-robosync move /src /dst -v
+blit move /src /dst -v
 ```
 
 Daemon and remote paths:
 
 ```bash
 # Start async daemon (default server) with flags
-robosync daemon --root /srv/root --port 9031
+blit daemon --root /srv/root --port 9031
 
 # Or use defaults (current directory on port 9031)
-robosync daemon
+blit daemon
 
 # Legacy classic server (temporary fallback)
-robosync --serve-legacy --bind 0.0.0.0:9031 --root /srv/root
+blit --serve-legacy --bind 0.0.0.0:9031 --root /srv/root
 
-# Mirror local → remote (direction inferred by robosync://)
-robosync mirror /data robosync://server:9031/backup -v
+# Mirror local → remote (direction inferred by blit://)
+blit mirror /data blit://server:9031/backup -v
 
 # Mirror remote → local
-robosync mirror robosync://server:9031/data /backup -v
+blit mirror blit://server:9031/data /backup -v
 ```
 
 Verify examples:
 
 ```bash
 # Verify two local trees (size+mtime)
-robosync verify /src /dst --limit 20
+blit verify /src /dst --limit 20
 
 # Verify with checksums (slower, stronger)
-robosync verify /src /dst --checksum --json > verify.json
+blit verify /src /dst --checksum --json > verify.json
 
 # Verify local vs remote and write CSV
-robosync verify /src robosync://server:9031/dst --csv verify.csv --limit 50
+blit verify /src blit://server:9031/dst --csv verify.csv --limit 50
 ```
 
 Common recipes:
 
 ```bash
 # Mirror local data to a server path
-robosync mirror /data robosync://server:9031/backup -v
+blit mirror /data blit://server:9031/backup -v
 
 # High-throughput LAN push
-robosync mirror /big robosync://server:9031/big --net-workers 8 --net-chunk-mb 8 --ludicrous-speed -v
+blit mirror /big blit://server:9031/big --net-workers 8 --net-chunk-mb 8 --ludicrous-speed -v
 
 # Pull and verify quickly (size+mtime)
-robosync mirror robosync://server:9031/dataset /local/dataset -v && \
-  robosync verify robosync://server:9031/dataset /local/dataset --limit 20
+blit mirror blit://server:9031/dataset /local/dataset -v && \
+  blit verify blit://server:9031/dataset /local/dataset --limit 20
 ```
 
 Notes:
@@ -97,16 +97,16 @@ Notes:
 Subcommands:
 
 ```text
-robosync daemon <ROOT> <PORT>
-robosync mirror <SRC> <DEST>
-robosync copy   <SRC> <DEST>
-robosync move   <SRC> <DEST>
-robosync verify <SRC> <DEST> [--checksum] [--json] [--csv <file>] [--limit N]
-robosync shell [robosync://host:port[/path]]   # feature: tui
+blit daemon <ROOT> <PORT>
+blit mirror <SRC> <DEST>
+blit copy   <SRC> <DEST>
+blit move   <SRC> <DEST>
+blit verify <SRC> <DEST> [--checksum] [--json] [--csv <file>] [--limit N]
+blit shell [blit://host:port[/path]]   # feature: tui
 ```
 
 Direction inference:
-- If either side uses `robosync://host:port/path`, that side is remote.
+- If either side uses `blit://host:port/path`, that side is remote.
 - Remote→remote is not supported in this release.
 
 Common options:
@@ -140,7 +140,7 @@ Performance tuning:
 ## Best Practices
 
 - Mirror vs copy: use `mirror` for one-way backups (adds/deletes to match src), `copy` when you never want deletions.
-- Direction inference: any `robosync://host:port/path` side is remote. Remote→remote is not supported.
+- Direction inference: any `blit://host:port/path` side is remote. Remote→remote is not supported.
 - Excludes: use repeated `--xf/--xd` patterns for large trees to avoid unnecessary scans.
 - Verify: after first big sync, prefer size+mtime verify; use `--checksum` for spot checks or sensitive data.
 - Performance on LAN:
@@ -179,7 +179,7 @@ cargo clippy
 
 OS-specific build scripts (default to release; isolate by target):
 
-Artifacts layout with scripts: `target/<triple>/{release|debug}/robosync[.exe]`
+Artifacts layout with scripts: `target/<triple>/{release|debug}/blit[.exe]`
 
 ```bash
 # macOS (Bash)
@@ -213,29 +213,29 @@ make windows-msvc   # Windows (MSVC) build
 
 ## Systemd Service (Daemon)
 
-On Linux distributions that use systemd, you can run the RoboSync daemon as a service:
+On Linux distributions that use systemd, you can run the Blit daemon as a service:
 
 1) Create a dedicated user and directories (recommended):
 
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin robosync || true
-sudo mkdir -p /srv/robosync_root
-sudo chown -R robosync:robosync /srv/robosync_root
-sudo install -m 0755 target/release/robosync /usr/local/bin/robosync
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin blit || true
+sudo mkdir -p /srv/blit_root
+sudo chown -R blit:blit /srv/blit_root
+sudo install -m 0755 target/release/blit /usr/local/bin/blit
 ```
 
-2) Create the unit file at `/etc/systemd/system/robosync.service`:
+2) Create the unit file at `/etc/systemd/system/blit.service`:
 
 ```ini
 [Unit]
-Description=RoboSync Daemon (file sync server)
+Description=Blit Daemon (file sync server)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=robosync
-Group=robosync
-ExecStart=/usr/local/bin/robosync daemon --root /srv/robosync_root --port 9031
+User=blit
+Group=blit
+ExecStart=/usr/local/bin/blit daemon --root /srv/blit_root --port 9031
 Restart=on-failure
 RestartSec=2s
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -243,7 +243,7 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
-WorkingDirectory=/srv/robosync_root
+WorkingDirectory=/srv/blit_root
 
 [Install]
 WantedBy=multi-user.target
@@ -253,8 +253,8 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now robosync.service
-sudo systemctl status robosync.service --no-pager
+sudo systemctl enable --now blit.service
+sudo systemctl status blit.service --no-pager
 ```
 
 Firewall note: open TCP port 9031 on the server.
@@ -274,9 +274,9 @@ See ROADMAP.md for upcoming high-impact features and milestones.
 
 If you see this when moving a binary between machines:
 
-  robosync: CPU ISA level is lower than required
+  blit: CPU ISA level is lower than required
 
-it means the binary was built with newer CPU features (e.g., x86-64-v3: AVX2/BMI2) than the target machine supports. This is not a bug in RoboSync; it’s how native-optimized builds behave.
+it means the binary was built with newer CPU features (e.g., x86-64-v3: AVX2/BMI2) than the target machine supports. This is not a bug in Blit; it's how native-optimized builds behave.
 
 Portable build options (choose one):
 
@@ -302,7 +302,7 @@ GitHub Actions builds artifacts for Linux (GNU), Linux (MUSL static), macOS, and
 
 - Workflow: .github/workflows/ci.yml
 - Artifacts (per job):
-  - Linux (GNU): target/linux/release/robosync
-  - Linux (MUSL x86_64): target/musl/x86_64-unknown-linux-musl/release/robosync
-  - macOS: target/macos/release/robosync
-  - Windows (MSVC): target/windows/x86_64-pc-windows-msvc/release/robosync.exe
+  - Linux (GNU): target/linux/release/blit
+  - Linux (MUSL x86_64): target/musl/x86_64-unknown-linux-musl/release/blit
+  - macOS: target/macos/release/blit
+  - Windows (MSVC): target/windows/x86_64-pc-windows-msvc/release/blit.exe
