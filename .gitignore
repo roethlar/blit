@@ -44,4 +44,5 @@ agent_bus.ndjson
 Thumbs.db
 
 # Smoke test artifacts
-scripts/
+scripts/smoke_tmp/
+scripts/smoketests/

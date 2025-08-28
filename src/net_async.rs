@@ -26,7 +26,9 @@ pub mod server {
     use crate::protocol::timeouts::{write_deadline_ms, read_deadline_ms, FRAME_HEADER_MS};
 
     #[inline]
-    async fn read_exact_timed(stream: &mut TcpStream, buf: &mut [u8], ms: u64) -> Result<()> {
+    async fn read_exact_timed<S>(stream: &mut S, buf: &mut [u8], ms: u64) -> Result<()>
+    where S: tokio::io::AsyncRead + Unpin
+    {
         use tokio::io::AsyncReadExt;
         match timeout(Duration::from_millis(ms), async { stream.read_exact(buf).await }).await {
             Ok(Ok(_)) => Ok(()),
@@ -45,12 +47,14 @@ pub mod server {
         }
     }
 
-    pub(crate) async fn write_frame_timed(
-        stream: &mut TcpStream,
+    pub(crate) async fn write_frame_timed<S>(
+        stream: &mut S,
         t: u8,
         payload: &[u8],
         ms: u64,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where S: tokio::io::AsyncWrite + Unpin
+    {
         match timeout(Duration::from_millis(ms), async {
             let hdr = crate::protocol_core::build_frame_header(t, payload.len() as u32);
             stream.write_all(&hdr).await?;
@@ -66,12 +70,16 @@ pub mod server {
         }
     }
 
-    pub(crate) async fn write_frame(stream: &mut TcpStream, t: u8, payload: &[u8]) -> Result<()> {
+    pub(crate) async fn write_frame<S>(stream: &mut S, t: u8, payload: &[u8]) -> Result<()>
+    where S: tokio::io::AsyncWrite + Unpin
+    {
         let ms = write_deadline_ms(payload.len());
         write_frame_timed(stream, t, payload, ms).await
     }
 
-    pub async fn read_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
+    pub async fn read_frame<S>(stream: &mut S) -> Result<(u8, Vec<u8>)>
+    where S: tokio::io::AsyncRead + Unpin
+    {
         // Read header with base timeout
         let mut hdr = [0u8; 11];
         match timeout(Duration::from_millis(FRAME_HEADER_MS), async {
@@ -98,7 +106,9 @@ pub mod server {
         Ok((typ, payload))
     }
 
-    pub(crate) async fn read_frame_timed(stream: &mut TcpStream, ms: u64) -> Result<(u8, Vec<u8>)> {
+    pub(crate) async fn read_frame_timed<S>(stream: &mut S, ms: u64) -> Result<(u8, Vec<u8>)>
+    where S: tokio::io::AsyncRead + Unpin
+    {
         match timeout(Duration::from_millis(ms), read_frame(stream)).await {
             Ok(res) => res,
             Err(_) => anyhow::bail!("frame IO timeout ({} ms)", ms),
@@ -1374,14 +1384,61 @@ pub mod server {
                                 write_frame(&mut stream, frame::NEED_LIST, &out).await?;
                             }
                             fids::TAR_START => {
-                                // Accept a TAR stream and unpack within base
-                                // For TLS path, reuse the same looped readers as plaintext
-                                let mut builder = tar::Archive::new(tokio_util::compat::TokioAsyncReadCompatExt::compat(&mut stream));
-                                let mut expected = std::collections::HashSet::new();
-                                for e in builder.entries()? {
-                                    let _ = e; // unpacking handled elsewhere in classic path; placeholder
+                                // Streaming tar unpack without temp files (mirror plaintext path)
+                                let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+                                let (res_tx, res_rx) = tokio::sync::oneshot::channel::<(u64,u64)>();
+                                struct ChanReader {
+                                    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+                                    buf: Vec<u8>,
+                                    pos: usize,
+                                    done: bool,
                                 }
-                                write_frame(&mut stream, frame::OK, b"OK").await?;
+                                impl std::io::Read for ChanReader {
+                                    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                                        if self.done { return Ok(0); }
+                                        if self.pos >= self.buf.len() {
+                                            match self.rx.blocking_recv() {
+                                                Some(chunk) => { self.buf = chunk; self.pos = 0; }
+                                                None => { self.done = true; return Ok(0); }
+                                            }
+                                        }
+                                        let n = out.len().min(self.buf.len() - self.pos);
+                                        if n > 0 { out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]); self.pos += n; }
+                                        Ok(n)
+                                    }
+                                }
+                                let base_dir = base.clone();
+                                let unpacker = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                                    let reader = ChanReader { rx, buf: Vec::new(), pos: 0, done: false };
+                                    let mut ar = tar::Archive::new(reader);
+                                    ar.set_overwrite(true);
+                                    let mut files: u64 = 0;
+                                    let mut bytes: u64 = 0;
+                                    let entries = ar.entries().context("tar entries")?;
+                                    for e in entries {
+                                        let mut entry = e.context("tar entry")?;
+                                        let et = entry.header().entry_type();
+                                        if et.is_file() {
+                                            if let Ok(sz) = entry.header().size() { bytes = bytes.saturating_add(sz); files = files.saturating_add(1); }
+                                        }
+                                        entry.unpack_in(&base_dir).context("unpack entry")?;
+                                    }
+                                    let _ = res_tx.send((files, bytes));
+                                    Ok(())
+                                });
+                                loop {
+                                    let (ti, pli) = read_frame_timed(&mut stream, 750).await?;
+                                    if ti == frame::TAR_DATA {
+                                        if tx.send(pli).await.is_err() { anyhow::bail!("tar unpacker closed"); }
+                                        continue;
+                                    }
+                                    if ti == frame::TAR_END { break; }
+                                    anyhow::bail!("unexpected frame during tar: {}", ti);
+                                }
+                                drop(tx);
+                                let _ = unpacker.await;
+                                let _ = res_rx.await;
+                                write_frame(&mut stream, frame::OK, b"TAR_OK").await?;
                             }
                             fids::DONE => {
                                 write_frame(&mut stream, frame::OK, b"OK").await?;
@@ -1421,6 +1478,7 @@ pub mod client {
     use tokio::net::TcpStream;
     use tokio::sync::Mutex;
     use tokio::time::{timeout, Duration};
+    use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 
     #[inline]
     async fn write_all_timed(stream: &mut TcpStream, buf: &[u8], ms: u64) -> Result<()> {
@@ -1438,6 +1496,65 @@ pub mod client {
             .with_context(|| format!("connect {}", addr))?;
         let _ = stream.set_nodelay(true);
         Ok(stream)
+    }
+
+    enum StreamAny {
+        Plain(TcpStream),
+        Tls(ClientTlsStream<TcpStream>),
+    }
+
+    impl StreamAny {
+        async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+            use tokio::io::AsyncWriteExt;
+            match self {
+                StreamAny::Plain(s) => s.write_all(buf).await,
+                StreamAny::Tls(s) => s.write_all(buf).await,
+            }
+        }
+        async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+            use tokio::io::AsyncReadExt;
+            match self {
+                StreamAny::Plain(s) => { let _ = s.read_exact(buf).await?; Ok(()) }
+                StreamAny::Tls(s) => { let _ = s.read_exact(buf).await?; Ok(()) }
+            }
+        }
+    }
+
+    async fn connect_secure(host: &str, port: u16, secure: bool) -> Result<StreamAny> {
+        let addr = format!("{}:{}", host, port);
+        let tcp = TcpStream::connect(&addr)
+            .await
+            .with_context(|| format!("connect {}", addr))?;
+        let _ = tcp.set_nodelay(true);
+        if !secure {
+            return Ok(StreamAny::Plain(tcp));
+        }
+        let cfg = crate::tls::build_client_config_tofu(host, port);
+        let cx = TlsConnector::from(std::sync::Arc::new(cfg));
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| anyhow::anyhow!("Invalid server name for TLS: {}", host))?;
+        let tls = cx.connect(server_name, tcp).await
+            .map_err(|e| anyhow::anyhow!("TLS handshake failed (server may be running in unsafe mode): {}", e))?;
+        Ok(StreamAny::Tls(tls))
+    }
+
+    async fn write_frame_any(stream: &mut StreamAny, t: u8, payload: &[u8]) -> Result<()> {
+        let hdr = crate::protocol_core::build_frame_header(t, payload.len() as u32);
+        stream.write_all(&hdr).await?;
+        if !payload.is_empty() { stream.write_all(payload).await?; }
+        Ok(())
+    }
+
+    async fn read_frame_any(stream: &mut StreamAny) -> Result<(u8, Vec<u8>)> {
+        use crate::protocol_core::{parse_frame_header, validate_frame_size};
+        let mut hdr = [0u8; 11];
+        stream.read_exact(&mut hdr).await?;
+        let (typ, len_u32) = parse_frame_header(&hdr)?;
+        let len = len_u32 as usize;
+        validate_frame_size(len)?;
+        let mut payload = vec![0u8; len];
+        if len > 0 { stream.read_exact(&mut payload).await?; }
+        Ok((typ, payload))
     }
 
     struct TarChanWriter {
@@ -1482,7 +1599,7 @@ pub mod client {
 
         let mut stream = match timeout(
             Duration::from_millis(crate::protocol::timeouts::CONNECT_MS),
-            connect(&remote.host, remote.port),
+            connect_secure(&remote.host, remote.port, true),
         )
         .await
         {
@@ -1507,7 +1624,7 @@ pub mod client {
             _ => return Ok(()),
         }
 
-        let (typ, resp_payload) = server::read_frame(&mut stream).await?;
+        let (typ, resp_payload) = read_frame_any(&mut stream).await?;
 
         if typ != frame::LIST_RESP {
             // ListResp
@@ -1564,15 +1681,15 @@ pub mod client {
     }
 
     pub async fn remove_tree(host: &str, port: u16, path: &std::path::Path) -> Result<()> {
-        let mut stream = connect(host, port).await?;
+        let mut stream = connect_secure(host, port, true).await?;
         // START with root "/" and no flags
         let root = "/";
         let mut payload = Vec::with_capacity(2 + root.len() + 1);
         payload.extend_from_slice(&(root.len() as u16).to_le_bytes());
         payload.extend_from_slice(root.as_bytes());
         payload.push(0);
-        server::write_frame(&mut stream, frame::START, &payload).await?;
-        let (typ, _resp) = server::read_frame(&mut stream).await?;
+        write_frame_any(&mut stream, frame::START, &payload).await?;
+        let (typ, _resp) = read_frame_any(&mut stream).await?;
         if typ != frame::OK { anyhow::bail!("daemon error starting remove"); }
 
         // Send RemoveTreeReq
@@ -1580,8 +1697,8 @@ pub mod client {
         let mut pl = Vec::with_capacity(2 + rel.len());
         pl.extend_from_slice(&(rel.len() as u16).to_le_bytes());
         pl.extend_from_slice(rel.as_bytes());
-        server::write_frame(&mut stream, frame::REMOVE_TREE_REQ, &pl).await?;
-        let (t, resp) = server::read_frame(&mut stream).await?;
+        write_frame_any(&mut stream, frame::REMOVE_TREE_REQ, &pl).await?;
+        let (t, resp) = read_frame_any(&mut stream).await?;
         if t != frame::REMOVE_TREE_RESP { anyhow::bail!("bad response to remove"); }
         if resp.is_empty() || resp[0] != 0 {
             anyhow::bail!("remove failed: {}", String::from_utf8_lossy(&resp[1..]));
@@ -1596,7 +1713,8 @@ pub mod client {
         src_root: &Path,
         args: &crate::Args,
     ) -> Result<()> {
-        let mut stream = connect(host, port).await?;
+        let secure = !args.never_tell_me_the_odds;
+        let mut stream = connect_secure(host, port, secure).await?;
 
         // START payload: dest_len u16 | dest_bytes | flags u8
         let dest_s = dest.to_string_lossy();
@@ -1616,8 +1734,8 @@ pub mod client {
         }
         payload.push(flags);
 
-        server::write_frame(&mut stream, frame::START, &payload).await?;
-        let (typ, resp) = server::read_frame(&mut stream).await?;
+        write_frame_any(&mut stream, frame::START, &payload).await?;
+        let (typ, resp) = read_frame_any(&mut stream).await?;
         if typ != frame::OK {
             // OK
             anyhow::bail!("daemon error: {}", String::from_utf8_lossy(&resp));
@@ -1625,7 +1743,7 @@ pub mod client {
 
         // Send manifest by walking with symlink awareness
         use walkdir::WalkDir;
-        server::write_frame(&mut stream, frame::MANIFEST_START, &[]).await?; // ManifestStart
+        write_frame_any(&mut stream, frame::MANIFEST_START, &[]).await?; // ManifestStart
         use std::time::UNIX_EPOCH;
         for ent in WalkDir::new(src_root)
             .follow_links(false)
@@ -1644,7 +1762,7 @@ pub mod client {
                 pl.push(2u8);
                 pl.extend_from_slice(&(rels.len() as u16).to_le_bytes());
                 pl.extend_from_slice(rels.as_bytes());
-                server::write_frame(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
+                write_frame_any(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
                 continue;
             }
             if ft.is_symlink() {
@@ -1656,7 +1774,7 @@ pub mod client {
                     pl.extend_from_slice(rels.as_bytes());
                     pl.extend_from_slice(&(t.len() as u16).to_le_bytes());
                     pl.extend_from_slice(t.as_bytes());
-                    server::write_frame(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
+                    write_frame_any(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
                 }
                 continue;
             }
@@ -1675,14 +1793,14 @@ pub mod client {
                     pl.extend_from_slice(rels.as_bytes());
                     pl.extend_from_slice(&size.to_le_bytes());
                     pl.extend_from_slice(&mtime.to_le_bytes());
-                    server::write_frame(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
+                    write_frame_any(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
                 }
             }
         }
-        server::write_frame(&mut stream, frame::MANIFEST_END, &[]).await?; // ManifestEnd
+        write_frame_any(&mut stream, frame::MANIFEST_END, &[]).await?; // ManifestEnd
 
         // Read need list
-        let (tneed, plneed) = server::read_frame(&mut stream).await?;
+        let (tneed, plneed) = read_frame_any(&mut stream).await?;
         if tneed != frame::NEED_LIST {
             // NeedList
             anyhow::bail!("server did not reply with NeedList");
@@ -1738,7 +1856,7 @@ pub mod client {
             files_needed.into_iter().partition(|e| e.size < 1_000_000);
 
         if !small_files.is_empty() {
-            server::write_frame(&mut stream, frame::TAR_START, &[]).await?; // TarStart
+            write_frame_any(&mut stream, frame::TAR_START, &[]).await?; // TarStart
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
             let tar_task_src_root = src_root.to_path_buf();
             let tar_task = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1760,12 +1878,12 @@ pub mod client {
             });
 
             while let Some(chunk) = rx.recv().await {
-                server::write_frame(&mut stream, frame::TAR_DATA, &chunk).await?; // TarData
+                write_frame_any(&mut stream, frame::TAR_DATA, &chunk).await?; // TarData
             }
 
             tar_task.await??;
-            server::write_frame(&mut stream, frame::TAR_END, &[]).await?; // TarEnd
-            let (t_ok, _) = server::read_frame(&mut stream).await?;
+            write_frame_any(&mut stream, frame::TAR_END, &[]).await?; // TarEnd
+            let (t_ok, _) = read_frame_any(&mut stream).await?;
             if t_ok != frame::OK {
                 anyhow::bail!("server TAR error");
             }
@@ -1799,15 +1917,16 @@ pub mod client {
             let chunk_bytes = chunk_bytes;
 
             let handle = tokio::spawn(async move {
-                let mut s = connect(&host, port).await?;
+                let secure = true;
+                let mut s = connect_secure(&host, port, secure).await?;
                 // Start worker connection
                 let dest_s = dest.to_string_lossy();
                 let mut pl = Vec::with_capacity(2 + dest_s.len() + 1);
                 pl.extend_from_slice(&(dest_s.len() as u16).to_le_bytes());
                 pl.extend_from_slice(dest_s.as_bytes());
                 pl.push(0); // Flags (inherit speed profile server-side)
-                server::write_frame(&mut s, frame::START, &pl).await?;
-                let (typ, resp) = server::read_frame(&mut s).await?;
+                write_frame_any(&mut s, frame::START, &pl).await?;
+                let (typ, resp) = read_frame_any(&mut s).await?;
                 if typ != frame::OK {
                     anyhow::bail!("worker daemon error: {}", String::from_utf8_lossy(&resp));
                 }
@@ -1838,7 +1957,7 @@ pub mod client {
                             pl0.extend_from_slice(&mtime.to_le_bytes());
                             pl0.extend_from_slice(&granule.to_le_bytes());
                             pl0.extend_from_slice(&sample.to_le_bytes());
-                            server::write_frame(&mut s, frame::DELTA_START, &pl0).await?;
+                            write_frame_any(&mut s, frame::DELTA_START, &pl0).await?;
                             // send samples for each granule: start, mid, end
                             let granule64 = granule as u64;
                             let mut bf = std::fs::File::open(&fe.path)?;
@@ -1853,7 +1972,7 @@ pub mod client {
                                 pls.extend_from_slice(&off0.to_le_bytes());
                                 pls.extend_from_slice(&(h0.as_bytes().len() as u16).to_le_bytes());
                                 pls.extend_from_slice(h0.as_bytes());
-                                server::write_frame(&mut s, frame::DELTA_SAMPLE, &pls).await?;
+                                write_frame_any(&mut s, frame::DELTA_SAMPLE, &pls).await?;
                                 let mid = off0.saturating_add((granule64 / 2).min(fe.size - off0));
                                 bf.seek(SeekFrom::Start(mid))?;
                                 let n1 = bf.read(&mut buf0)?;
@@ -1862,7 +1981,7 @@ pub mod client {
                                 pls1.extend_from_slice(&mid.to_le_bytes());
                                 pls1.extend_from_slice(&(h1.as_bytes().len() as u16).to_le_bytes());
                                 pls1.extend_from_slice(h1.as_bytes());
-                                server::write_frame(&mut s, frame::DELTA_SAMPLE, &pls1).await?;
+                                write_frame_any(&mut s, frame::DELTA_SAMPLE, &pls1).await?;
                                 let end_off = if fe.size > off0 { (off0 + granule64).min(fe.size).saturating_sub(sample as u64) } else { off0 };
                                 bf.seek(SeekFrom::Start(end_off))?;
                                 let n2 = bf.read(&mut buf0)?;
@@ -1871,19 +1990,19 @@ pub mod client {
                                 pls2.extend_from_slice(&end_off.to_le_bytes());
                                 pls2.extend_from_slice(&(h2.as_bytes().len() as u16).to_le_bytes());
                                 pls2.extend_from_slice(h2.as_bytes());
-                                server::write_frame(&mut s, frame::DELTA_SAMPLE, &pls2).await?;
+                                write_frame_any(&mut s, frame::DELTA_SAMPLE, &pls2).await?;
                                 off0 = off0.saturating_add(granule64);
                             }
-                            server::write_frame(&mut s, frame::DELTA_END, &[]).await?;
+                            write_frame_any(&mut s, frame::DELTA_END, &[]).await?;
                             // read need ranges
-                            let (t_need, pl_need) = server::read_frame(&mut s).await?;
+                            let (t_need, pl_need) = read_frame_any(&mut s).await?;
                             let mut need_ranges: Vec<(u64, u64)> = Vec::new();
                             if t_need == frame::NEED_RANGES_START {
                                 if pl_need.len() >= 4 {
                                     let _cnt = u32::from_le_bytes(pl_need[0..4].try_into()
                                         .context("Invalid count bytes in NEEDRANGES")?) as usize;
                                     loop {
-                                        let (ti, pli) = server::read_frame(&mut s).await?;
+                                        let (ti, pli) = read_frame_any(&mut s).await?;
                                         if ti == frame::NEED_RANGE {
                                             if pli.len() >= 16 {
                                                 let off = u64::from_le_bytes(pli[0..8].try_into()
@@ -1909,13 +2028,13 @@ pub mod client {
                                         let mut p = Vec::with_capacity(8 + n);
                                         p.extend_from_slice(&off.to_le_bytes());
                                         p.extend_from_slice(&b[..n]);
-                                        server::write_frame(&mut s, frame::DELTA_DATA, &p).await?;
+                                        write_frame_any(&mut s, frame::DELTA_DATA, &p).await?;
                                         off += n as u64;
                                         left -= n as u64;
                                     }
                                 }
-                                server::write_frame(&mut s, frame::DELTA_DONE, &[]).await?;
-                                let (_tok, _plk) = server::read_frame(&mut s).await?;
+                                write_frame_any(&mut s, frame::DELTA_DONE, &[]).await?;
+                                let (_tok, _plk) = read_frame_any(&mut s).await?;
                                 used_delta = true;
                             }
                         }
@@ -1926,7 +2045,7 @@ pub mod client {
                             pl_raw.extend_from_slice(rels.as_bytes());
                             pl_raw.extend_from_slice(&fe.size.to_le_bytes());
                             pl_raw.extend_from_slice(&mtime.to_le_bytes());
-                            server::write_frame(&mut s, frame::FILE_RAW_START, &pl_raw).await?;
+                            write_frame_any(&mut s, frame::FILE_RAW_START, &pl_raw).await?;
                             let mut f = tokio::fs::File::open(&fe.path).await?;
                             use tokio::io::AsyncReadExt;
                             let mut buf = vec![0u8; chunk_bytes];
@@ -1936,7 +2055,10 @@ pub mod client {
                                 let n = f.read(&mut buf[..to_read]).await?;
                                 if n == 0 { break; }
                                 let ms = crate::protocol::timeouts::WRITE_BASE_MS + ((n as u64 + 1_048_575)/1_048_576) * crate::protocol::timeouts::PER_MB_MS;
-                                write_all_timed(&mut s, &buf[..n], ms).await?;
+                                match &mut s {
+                                    StreamAny::Plain(raw) => write_all_timed(raw, &buf[..n], ms).await?,
+                                    StreamAny::Tls(tls) => { use tokio::io::AsyncWriteExt; timeout(Duration::from_millis(ms), tls.write_all(&buf[..n])).await??; }
+                                }
                                 remaining -= n as u64;
                             }
                         }
@@ -1944,8 +2066,8 @@ pub mod client {
                         break;
                     }
                 }
-                server::write_frame(&mut s, frame::DONE, &[]).await?; // Done
-                let (t_ok, _) = server::read_frame(&mut s).await?;
+                write_frame_any(&mut s, frame::DONE, &[]).await?; // Done
+                let (t_ok, _) = read_frame_any(&mut s).await?;
                 if t_ok != frame::OK {
                     anyhow::bail!("worker DONE error");
                 }
@@ -1958,8 +2080,8 @@ pub mod client {
             handle.await??;
         }
 
-        server::write_frame(&mut stream, frame::DONE, &[]).await?; // Final Done
-        let (t_ok, _) = server::read_frame(&mut stream).await?;
+        write_frame_any(&mut stream, frame::DONE, &[]).await?; // Final Done
+        let (t_ok, _) = read_frame_any(&mut stream).await?;
         if t_ok != frame::OK {
             anyhow::bail!("server did not ack final DONE");
         }
@@ -2054,7 +2176,7 @@ pub mod client {
                     });
 
                     loop {
-                        let (ti, pli) = server::read_frame(&mut stream).await?;
+                        let (ti, pli) = read_frame_any(&mut stream).await?;
                         if ti == 9u8 {
                             // TarData
                             if tx.send(pli).await.is_err() {
@@ -2069,7 +2191,7 @@ pub mod client {
                     }
                     drop(tx);
                     unpacker.await??;
-                    server::write_frame(&mut stream, 2, b"OK").await?;
+                    write_frame_any(&mut stream, 2, b"OK").await?;
                 }
                 4u8 => {
                     // FileStart
@@ -2145,7 +2267,7 @@ pub mod client {
                 }
                 frame::DONE => {
                     // Done
-                    server::write_frame(&mut stream, frame::OK, b"OK").await?;
+                    write_frame_any(&mut stream, frame::OK, b"OK").await?;
                     break;
                 }
                 _ => {}
