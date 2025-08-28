@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::path::{PathBuf};
 use std::sync::mpsc::{Sender, Receiver, channel};
 
-use crate::url::{RemoteDest};
+use blit::url::{RemoteDest};
 use super::ui;
 
 /// Terminal guard that ensures proper cleanup on drop
@@ -103,7 +103,7 @@ impl AppState {
             left: Pane::Local { cwd: left_cwd, entries: left_entries, selected: 0 },
             right,
             focus: Focus::Left,
-            mode: Mode::Mirror,
+            mode: Mode::Copy,
             tar_small: true,
             delta_large: true,
             include_empty: true,
@@ -231,8 +231,16 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
                     let code = k.code;
                     let modifiers = k.modifiers;
+                    
+                    // Handle Ctrl+C for emergency exit from any mode
+                    if let KeyCode::Char('c') = code {
+                        if modifiers.contains(KeyModifiers::CONTROL) {
+                            eprintln!("Emergency exit (Ctrl+C)");
+                            break;
+                        }
+                    }
                     if app.ui_mode == UiMode::ServerInput {
-                        // Handle server input mode
+                        // Handle server input mode - only accept text input keys
                         match code {
                             KeyCode::Enter => {
                                 ui::process_server_input(&mut app);
@@ -248,7 +256,32 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                             KeyCode::Char(c) => {
                                 app.input_buffer.push(c);
                             }
-                            _ => {}
+                            // IGNORE navigation keys in input mode
+                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                                // Ignore navigation keys during text input
+                            }
+                            _ => {
+                                // Ignore all other keys in input mode
+                            }
+                        }
+                    } else if app.ui_mode == UiMode::ConfirmTransfer {
+                        // SAFETY: Confirmation dialog mode - only Y/N/Esc allowed
+                        eprintln!("DEBUG: In ConfirmTransfer mode, got key: {:?}", code);
+                        match code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                eprintln!("DEBUG: Y pressed, executing transfer");
+                                app.ui_mode = UiMode::Normal;
+                                if !app.running { start_transfer(&mut app); }
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                eprintln!("DEBUG: N/Esc pressed, cancelling transfer");
+                                app.ui_mode = UiMode::Normal;
+                                app.status = "Transfer cancelled".to_string();
+                            }
+                            _ => {
+                                eprintln!("DEBUG: ConfirmTransfer ignored key: {:?}", code);
+                                // SAFETY: Ignore all other keys in confirmation mode
+                            }
                         }
                     } else if app.ui_mode == UiMode::NewFolderInput {
                         // Handle new folder input mode
@@ -268,21 +301,6 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                                 app.input_buffer.push(c);
                             }
                             _ => {}
-                        }
-                    } else if app.ui_mode == UiMode::ConfirmTransfer {
-                        // SAFETY: Confirmation dialog mode - only Y/N/Esc allowed
-                        match (code, modifiers) {
-                            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
-                                app.ui_mode = UiMode::Normal;
-                                if !app.running { start_transfer(&mut app); }
-                            }
-                            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
-                                app.ui_mode = UiMode::Normal;
-                                app.status = "Transfer cancelled".to_string();
-                            }
-                            _ => {
-                                // SAFETY: Ignore all other keys in confirmation mode
-                            }
                         }
                     } else {
                         // Normal mode
@@ -312,19 +330,22 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                             (KeyCode::Enter, _) => {
                                 ui::enter(&mut app);
                             }
-                            // Cancel/back: go up one directory
-                            (KeyCode::Esc, _) => { ui::go_up(&mut app); }
+                            // Cancel/back: abort transfer if running, otherwise go up one directory
+                            (KeyCode::Esc, _) => { if app.running { cancel_transfer(&mut app); } else { ui::go_up(&mut app); } }
                             // Swap panes
                             (KeyCode::Backspace, _) => { ui::swap_panes(&mut app); }
                             // Connection dialog
-                            (KeyCode::F(2), _) => { app.ui_mode = UiMode::ServerInput; app.input_buffer.clear(); }
+                            (KeyCode::F(2), _) => { 
+                                app.ui_mode = UiMode::ServerInput; 
+                                app.input_buffer.clear(); 
+                            }
                             // Options overlay
                             // TODO: Add Options overlay
                             // (KeyCode::Char('o'), _) | (KeyCode::Char('O'), _) => { app.ui_mode = UiMode::Options; }
                             // Help
                             (KeyCode::Char('h'), _) | (KeyCode::F(1), _) => { ui::toggle_help(&mut app); }
-                            // SAFETY: Use F3 to initiate transfer confirmation - requires explicit confirmation
-                            (KeyCode::F(3), _) => {
+                            // Ctrl+G initiates transfer confirmation - requires explicit Y/N confirmation
+                            (KeyCode::Char('g'), m) if m.contains(KeyModifiers::CONTROL) => {
                                 if app.src.is_some() && app.dest.is_some() && !app.running {
                                     app.ui_mode = UiMode::ConfirmTransfer;
                                     app.status = "Press Y to confirm transfer, or Esc to cancel".to_string();
@@ -349,13 +370,18 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
 }
 
 fn start_transfer(app: &mut AppState) {
+   // Validate src/dest
+   let (src, dest) = match (&app.src, &app.dest) {
+       (Some(s), Some(d)) => (s.clone(), d.clone()),
+       _ => { app.status = "Select src (s) and dest (d) first".to_string(); return; }
+   };
     // Validate src/dest
     let (src, dest) = match (&app.src, &app.dest) {
         (Some(s), Some(d)) => (s.clone(), d.clone()),
-        _ => { app.status = "Select src (s) and dest (d) first".to_string(); return; }
+        _ => { app.status = "Press Space to set Source/Target, then Enter".to_string(); return; }
     };
     // Build command
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("blit"));
+    let exe = crate::resolve_blit_path();
     let sub = match app.mode { Mode::Mirror => "mirror", Mode::Copy => "copy", Mode::Move => "move" };
     let srcs = ui::pathspec_to_string(&src);
     let dests = ui::pathspec_to_string(&dest);

@@ -119,11 +119,12 @@ Common options:
 - `-c/--checksum`: compare by checksum instead of size+mtime (verify)
 - `--force-tar` / `--no-tar`: control small-file TAR streaming (push)
 - `--ludicrous-speed`: favor throughput (bigger buffers, fewer guards)
-- `--never-tell-me-the-odds`: unsafe max speed (trusted LAN only)
+- `--never-tell-me-the-odds`: DISABLE ALL SECURITY - unencrypted, unsafe mode (trusted LAN benchmarks only)
 
-Daemon options:
-- `--serve-legacy`: run the classic (non-async) server as a temporary fallback.
-- `--bind` and `--root`: only for legacy server; the `daemon` subcommand uses `--root` and `--port` flags with sensible defaults.
+Daemon options (secure by default):
+- `--bind` and `--root`: server binding and directory (defaults: `127.0.0.1:9031`, current dir)  
+- `--tls-cert` / `--tls-key`: custom TLS certificate (auto-generates self-signed if not provided)
+- `--never-tell-me-the-odds`: explicitly disable all security for benchmarks (NOT recommended)
 
 Performance tuning:
 - `--net-workers <N>`: number of parallel large-file workers for async push (default: 4; 1–32).

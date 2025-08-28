@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.0 — 2025-08-27 (Blit)
+- Project rename: RoboSync → Blit.
+- New binary names: `blit` (CLI), `blitd` (daemon), `blitty` (TUI).
+- New URL scheme: `blit://host:port/path` (replaces `robosync://`).
+- TUI env var: `BLIT_ASCII` (replaces `ROBOSYNC_ASCII`).
+
+Notes:
+- This is the first release under the Blit name. Previous releases remain tagged as RoboSync (e.g., 3.1.x).
+- Breaking change for scripts/integrations: update binary names and URLs.
+
+
 ## Rename Notice (2025-08-27)
 The project has been renamed to Blit. Source/binaries now use: blit, blitd, blitty, and blit://. This changelog retains historical "RoboSync" entries; future entries will use the new names.
 

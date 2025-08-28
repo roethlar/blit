@@ -1,4 +1,3 @@
-#![cfg(feature = "tui")]
 
 pub mod app;
 pub mod ui;
@@ -11,4 +10,3 @@ use crate::url;
 pub fn start_shell(remote: Option<url::RemoteDest>) -> anyhow::Result<()> {
     app::run(remote)
 }
-

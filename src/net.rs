@@ -3,6 +3,8 @@ use anyhow::{anyhow, Context, Result};
 use crate::protocol::{MAGIC, VERSION, MAX_FRAME_SIZE, frame};
 use crate::protocol_core;
 use crate::fs_enum;
+#[cfg(windows)]
+use crate::win_fs;
 // Use library modules from the blit lib crate
 // Unused imports removed for 3.1 cleanup
 use std::collections::{HashMap, HashSet};
@@ -578,10 +580,18 @@ fn process_tar_entry(
     let mut entry = res?;
     let et = entry.header().entry_type();
     let mut file_count = 0u64;
+   let mut total_bytes = 0u64;
+   
+   if et.is_block_special() || et.is_character_special() || et.is_fifo() {
+       // Skip special device/FIFO entries for safety
+       return Ok((0, 0));
+   }
+   
+   // On Windows, create symlinks explicitly to avoid tar crate failures when privileges are missing
     let mut total_bytes = 0u64;
     
-    if et.is_block_special() || et.is_character_special() || et.is_fifo() {
-        // Skip special device/FIFO entries for safety
+    if et.is_block_special() || et.is_character_special() || et.is_fifo() || et.is_hard_link() {
+        // Skip special device/FIFO/hard link entries for safety
         return Ok((0, 0));
     }
     
@@ -604,7 +614,7 @@ fn process_tar_entry(
                 fs::create_dir_all(parent).ok();
             }
             let t = target.into_owned();
-            let created = crate::win_fs::create_symlink(&t, &dst);
+            let created = win_fs::create_symlink(&t, &dst);
             if created.is_ok() {
                 received.insert(dst);
                 return Ok((0, 0));
@@ -1089,7 +1099,7 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                 {
                     let _ = std::fs::remove_file(&dst_path);
                     let _ = std::fs::remove_dir(&dst_path);
-                    let _ = crate::win_fs::create_symlink(Path::new(target), &dst_path);
+                    let _ = win_fs::create_symlink(Path::new(target), &dst_path);
                 }
                 received_paths.insert(dst_path.clone());
                 expected_paths.insert(dst_path);
@@ -1465,7 +1475,7 @@ fn mirror_delete_under(base: &Path, received: &HashSet<PathBuf>) -> Result<(u64,
         if entry.file_type().is_file() {
             if !received.contains(&p) {
                 #[cfg(windows)]
-                crate::win_fs::clear_readonly_recursive(&p);
+                win_fs::clear_readonly_recursive(&p);
                 match std::fs::remove_file(&p) {
                     Ok(_) => files_deleted += 1,
                     Err(e) => eprintln!("delete file failed {}: {}", p.display(), e),
@@ -1484,7 +1494,7 @@ fn mirror_delete_under(base: &Path, received: &HashSet<PathBuf>) -> Result<(u64,
             continue;
         }
         #[cfg(windows)]
-        crate::win_fs::clear_readonly_recursive(&d);
+        win_fs::clear_readonly_recursive(&d);
         match std::fs::remove_dir(&d) {
             Ok(()) => dirs_deleted += 1,
             Err(e) => {
@@ -2662,7 +2672,7 @@ pub fn client_pull(
             if e.file_type().is_file() || e.file_type().is_symlink() {
                 if !expected.contains(&p) {
                     #[cfg(windows)]
-                    crate::win_fs::clear_readonly_recursive(&p);
+                    win_fs::clear_readonly_recursive(&p);
                     let _ = std::fs::remove_file(&p);
                 }
             }
@@ -2676,7 +2686,7 @@ pub fn client_pull(
                 continue;
             }
             #[cfg(windows)]
-            crate::win_fs::clear_readonly_recursive(&d);
+            win_fs::clear_readonly_recursive(&d);
             let _ = std::fs::remove_dir(&d);
         }
     }

@@ -7,6 +7,7 @@ pub struct RemoteDest {
     pub host: String,
     pub port: u16,
     pub path: PathBuf,
+    pub tls: bool,  // true for blits://, false for blit://
 }
 
 pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
@@ -15,9 +16,11 @@ pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
     let lower = s_trim.to_ascii_lowercase();
     let scheme_end = lower.find(':')?;
     let scheme_with_colon = &lower[..=scheme_end];
-    if scheme_with_colon != "blit:" {
-        return None;
-    }
+    let tls = match scheme_with_colon {
+        "blit:" => false,
+        "blits:" => true,  // blits:// for TLS connections
+        _ => return None,
+    };
     let mut rest = &s_trim[scheme_end + 1..];
     if let Some(r) = rest.strip_prefix("//") {
         rest = r;
@@ -27,7 +30,10 @@ pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
         return None;
     }
     let (host, port) = match hp.split_once(':') {
-        Some((h, pr)) => (h.to_string(), pr.parse().unwrap_or(9031)),
+        Some((h, pr)) => match pr.parse::<u16>() {
+            Ok(p) if p > 0 => (h.to_string(), p),
+            _ => return None,
+        },
         None => (hp.to_string(), 9031),
     };
     Some(RemoteDest {
@@ -38,5 +44,6 @@ pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
         } else {
             PathBuf::from(format!("/{}", p))
         },
+        tls,
     })
 }

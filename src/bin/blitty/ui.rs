@@ -110,7 +110,7 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     } else if app.ui_mode == super::app::UiMode::ConfirmTransfer {
         " ⚠️  CONFIRM DESTRUCTIVE TRANSFER: [Y]es execute • [N]o cancel • [Esc] cancel"
     } else {
-        " [Tab]switch [↑↓]nav [Space]select [Enter]go [Esc]back [Backspace]swap [F2]connect [F3]transfer [h]elp [q]uit"
+        " [Tab]switch [↑↓]nav [Space]select [Enter]go [Esc]back [Backspace]swap [F2]connect [Ctrl+G]transfer [h]elp [q]uit"
     };
     
     let status_lines = vec![
@@ -150,27 +150,31 @@ pub fn draw(f: &mut Frame, app: &AppState) {
         f.render_widget(Clear, area);
         
         let lines = vec![
-            Line::from(Span::styled("🔒 SAFE CONTROLS (Simplified Interface)", ratatui::style::Style::default().fg(Theme::GREEN).add_modifier(ratatui::style::Modifier::BOLD))),
-            Line::from(""),
             Line::from(Span::styled("Navigation:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
-            Line::from("  ↑/↓        Navigate up/down"),
-            Line::from("  Enter      Enter directory (SAFE - no execution)"),
-            Line::from("  Esc        Go back/up one directory"),
-            Line::from("  Tab        Switch between left/right panes"),
+            Line::from("  ↑/↓/k/j    Navigate up/down"),
+            Line::from("  Enter      Enter directory"),
+            Line::from("  Tab/f      Switch pane (focus)"),
+            Line::from("  Alt+←/→    Switch to left/right pane"),
             Line::from(""),
-            Line::from(Span::styled("Selection & Transfer:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
-            Line::from("  Space      Select current item as source/destination"),
-            Line::from("  Backspace  Swap source/destination panes"),
-            Line::from("  F3         Initiate transfer (requires confirmation)"),
+            Line::from(Span::styled("File Operations:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from("  Space      Select item for current pane"),
+            Line::from("  Backspace  Swap panes (Source/Target)"),
+            Line::from("  Enter      Enter directory"),
+            Line::from("  Ctrl+G     Start transfer"),
+            Line::from("  Esc        Abort transfer / go back"),
             Line::from(""),
-            Line::from(Span::styled("Connection:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
-            Line::from("  F2         Connect to remote server"),
+            Line::from(Span::styled("Options:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from("  t          Toggle TAR for small files"),
+            Line::from("  r          Toggle delta for large files"),
+            Line::from("  e          Toggle empty directories"),
+            Line::from("  c          Toggle checksums"),
+            Line::from(""),
+            Line::from(Span::styled("Remote:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from("  R          Connect to remote server"),
             Line::from(""),
             Line::from(Span::styled("General:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
             Line::from("  h          Toggle this help"),
-            Line::from("  q          Quit application"),
-            Line::from(""),
-            Line::from(Span::styled("⚠️  SAFETY: All destructive operations require explicit confirmation!", ratatui::style::Style::default().fg(Theme::YELLOW).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from("  q          Quit"),
         ];
         
         let help_widget = Paragraph::new(lines)
@@ -271,73 +275,6 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                 .style(ratatui::style::Style::default().bg(Theme::BG).fg(Theme::FG)));
         f.render_widget(input_block, area);
     }
-    
-    // SAFETY: Confirmation dialog for destructive transfers
-    if app.ui_mode == super::app::UiMode::ConfirmTransfer {
-        let area = centered_rect(60, 20, f.size());
-        
-        // Clear the background area first with Clear widget
-        f.render_widget(Clear, area);
-        
-        // Build confirmation dialog content
-        let src_desc = match &app.src {
-            Some(ui::PathSpec::Local(path)) => format!("Local: {}", path.display()),
-            Some(ui::PathSpec::Remote { host, port, path }) => format!("Remote: {}:{}{}", host, port, path.display()),
-            None => "No source selected".to_string(),
-        };
-        
-        let dest_desc = match &app.dest {
-            Some(ui::PathSpec::Local(path)) => format!("Local: {}", path.display()),
-            Some(ui::PathSpec::Remote { host, port, path }) => format!("Remote: {}:{}{}", host, port, path.display()),
-            None => "No destination selected".to_string(),
-        };
-        
-        let mode_desc = match app.mode {
-            super::app::Mode::Mirror => "MIRROR (destructive - will delete files not in source)",
-            super::app::Mode::Copy => "COPY (safe - only copies files)",
-            super::app::Mode::Move => "MOVE (destructive - will delete source files)",
-        };
-        
-        let dialog_text = vec![
-            Line::from(""),
-            Line::from(Span::styled("⚠️  CONFIRM DESTRUCTIVE OPERATION", ratatui::style::Style::default().fg(Theme::RED).add_modifier(ratatui::style::Modifier::BOLD))),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Mode: ", ratatui::style::Style::default().fg(Theme::FG)),
-                Span::styled(mode_desc, ratatui::style::Style::default().fg(Theme::YELLOW).add_modifier(ratatui::style::Modifier::BOLD)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("From: ", ratatui::style::Style::default().fg(Theme::FG)),
-                Span::styled(&src_desc, ratatui::style::Style::default().fg(Theme::CYAN)),
-            ]),
-            Line::from(vec![
-                Span::styled("To:   ", ratatui::style::Style::default().fg(Theme::FG)),
-                Span::styled(&dest_desc, ratatui::style::Style::default().fg(Theme::CYAN)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled("This operation may permanently modify or delete files!", ratatui::style::Style::default().fg(Theme::RED))),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Press ", ratatui::style::Style::default().fg(Theme::FG)),
-                Span::styled("Y", ratatui::style::Style::default().fg(Theme::GREEN).add_modifier(ratatui::style::Modifier::BOLD)),
-                Span::styled(" to proceed, ", ratatui::style::Style::default().fg(Theme::FG)),
-                Span::styled("N", ratatui::style::Style::default().fg(Theme::RED).add_modifier(ratatui::style::Modifier::BOLD)),
-                Span::styled(" or ", ratatui::style::Style::default().fg(Theme::FG)),
-                Span::styled("Esc", ratatui::style::Style::default().fg(Theme::RED).add_modifier(ratatui::style::Modifier::BOLD)),
-                Span::styled(" to cancel", ratatui::style::Style::default().fg(Theme::FG)),
-            ]),
-        ];
-        
-        let confirm_widget = Paragraph::new(dialog_text)
-            .alignment(ratatui::layout::Alignment::Center)
-            .block(Block::default()
-                .borders(Borders::ALL)
-                .border_style(ratatui::style::Style::default().fg(Theme::RED))
-                .title(Span::styled(" ⚠️  CONFIRM TRANSFER ", ratatui::style::Style::default().fg(Theme::RED).add_modifier(ratatui::style::Modifier::BOLD)))
-                .style(ratatui::style::Style::default().bg(Theme::BG).fg(Theme::FG)));
-        f.render_widget(confirm_widget, area);
-    }
 }
 
 pub fn is_ascii_mode() -> bool {
@@ -400,12 +337,26 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
     let check = if is_ascii_mode() { "on" } else { "✓" };
     let cross = if is_ascii_mode() { "off" } else { "✗" };
     
+    // Prominent source/destination display for header
+    let src_display = match &app.src {
+        Some(PathSpec::Local(path)) => format!("📂 {}", make_breadcrumb(path, 25)),
+        Some(PathSpec::Remote { host, port, path }) => format!("🌐 {}:{}{}", host, port, make_breadcrumb(path, 20)),
+        None => "❌ No source selected".to_string(),
+    };
+    
+    let dest_display = match &app.dest {
+        Some(PathSpec::Local(path)) => format!("📁 {}", make_breadcrumb(path, 25)),
+        Some(PathSpec::Remote { host, port, path }) => format!("🌐 {}:{}{}", host, port, make_breadcrumb(path, 20)),
+        None => "❌ No destination selected".to_string(),
+    };
+
     let header_text = vec![
-        Line::from(""),
         Line::from(vec![
-            Span::styled("Blit Shell", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD)),
-            Span::raw(" — "),
-            Span::styled(mode_str, ratatui::style::Style::default().fg(Theme::PINK)),
+            Span::styled("SOURCE: ", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD)),
+            Span::styled(&src_display, ratatui::style::Style::default().fg(if app.src.is_some() { Theme::GREEN } else { Theme::RED })),
+            Span::raw("  "),
+            Span::styled("MODE: ", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD)),
+            Span::styled(mode_str, ratatui::style::Style::default().fg(Theme::PINK).add_modifier(ratatui::style::Modifier::BOLD)),
             Span::raw(" | "),
             Span::raw("TAR:"),
             Span::styled(if app.tar_small { check } else { cross }, 
@@ -419,6 +370,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
             Span::raw(" Checksum:"),
             Span::styled(if app.checksum { check } else { cross },
                 if app.checksum { ratatui::style::Style::default().fg(Theme::GREEN) } else { ratatui::style::Style::default().fg(Theme::COMMENT) }),
+        ]),
+        Line::from(vec![
+            Span::styled("TARGET: ", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD)),
+            Span::styled(&dest_display, ratatui::style::Style::default().fg(if app.dest.is_some() { Theme::GREEN } else { Theme::RED })),
         ]),
     ];
     
@@ -754,7 +709,14 @@ pub fn current_path(app: &AppState) -> PathSpec {
                 }
                 PathSpec::Local(p)
             }
-            _ => unreachable!(),
+            Pane::Remote { host, port, cwd, entries, selected } => {
+                let mut p = cwd.clone();
+                if *selected < entries.len() {
+                    let name = &entries[*selected].name;
+                    if name != ".." { p = p.join(name); }
+                }
+                PathSpec::Remote{ host: host.clone(), port: *port, path: p }
+            }
         },
         Focus::Right => match &app.right {
             Pane::Local { cwd, entries, selected } => {
@@ -830,7 +792,7 @@ pub fn create_new_folder(app: &mut super::app::AppState) {
         }
         Pane::Remote { host, port, cwd, .. } => {
             let remote_path = cwd.join(folder_name);
-            let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("blit"));
+            let exe = crate::resolve_blit_path();
             let remote_url = format!("blit://{}:{}{}", host, port, remote_path.display());
             if let Ok(temp_dir) = std::env::temp_dir().canonicalize() {
                 let temp_path = temp_dir.join(format!("blit_mkdir_{}", std::process::id()));

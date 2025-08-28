@@ -1,4 +1,4 @@
-name: RoboSync CI
+name: Blit CI
 
 on:
   push:
@@ -42,8 +42,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: robosync-linux-gnu
-          path: target/linux/release/robosync
+          name: blit-linux-gnu
+          path: target/**/release/blit
 
   musl:
     name: Linux (MUSL static)
@@ -72,8 +72,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: robosync-linux-musl-x86_64
-          path: target/musl/x86_64-unknown-linux-musl/release/robosync
+          name: blit-linux-musl-x86_64
+          path: target/**/release/blit
 
   macos:
     name: macOS
@@ -97,8 +97,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: robosync-macos
-          path: target/macos/release/robosync
+          name: blit-macos
+          path: target/**/release/blit
 
   windows_msvc:
     name: Windows (MSVC)
@@ -118,8 +118,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: robosync-windows-msvc-x86_64
-          path: target/windows/x86_64-pc-windows-msvc/release/robosync.exe
+          name: blit-windows-msvc-x86_64
+          path: target/**/release/blit.exe
 
   linux_async_smoke:
     name: Linux Async Smoke

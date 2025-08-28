@@ -6,8 +6,8 @@ use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::protocol;
-use crate::protocol_core;
+use blit::protocol;
+use blit::protocol_core;
 
 use super::app::{UiMsg, Focus};
 use super::ui::Entry;
@@ -36,21 +36,21 @@ pub fn request_remote_dir(tx_ui: &Sender<UiMsg>, pane: Focus, host: String, port
         }
     });
 }
-
 /// Async LIST request.
 async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec<Entry>> {
     use tokio::time::{timeout, Duration};
 
     let addr = format!("{}:{}", host, port);
-    let mut stream = timeout(Duration::from_millis(500), TcpStream::connect(&addr)).await
+    let mut stream = timeout(Duration::from_millis(2000), TcpStream::connect(&addr)).await
         .map_err(|_| anyhow::anyhow!("Connection timeout"))?
         .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
 
     // Build LIST_REQ payload
-    let p = path.to_string_lossy();
-    let mut payload = Vec::with_capacity(2 + p.len());
-    payload.extend_from_slice(&(p.len() as u16).to_le_bytes());
-    payload.extend_from_slice(p.as_bytes());
+    let path_str = path.to_string_lossy();
+    let path_bytes = path_str.as_bytes();
+    let mut payload = Vec::with_capacity(2 + path_bytes.len());
+    payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+    payload.extend_from_slice(path_bytes);
 
     // Build and send frame header via centralized helper
     let hdr = protocol_core::build_frame_header(protocol::frame::LIST_REQ, payload.len() as u32);
@@ -60,8 +60,9 @@ async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec
 
     // Read and validate response header
     let mut resp_hdr = [0u8; 11];
-    timeout(Duration::from_millis(300), stream.read_exact(&mut resp_hdr)).await
-        .map_err(|_| anyhow::anyhow!("Response timeout"))??;
+    timeout(Duration::from_millis(1000), stream.read_exact(&mut resp_hdr)).await
+        .map_err(|_| anyhow::anyhow!("Response timeout"))?
+        .map_err(|e| anyhow::anyhow!("Read error: {}", e))?;
     let (frame_type, payload_len_u32) = protocol_core::parse_frame_header(&resp_hdr)?;
     let payload_len = payload_len_u32 as usize;
     protocol_core::validate_frame_size(payload_len)?;
@@ -80,7 +81,7 @@ async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec
 
     // Read LIST_RESP payload
     let mut payload = vec![0u8; payload_len];
-    timeout(Duration::from_millis(300), stream.read_exact(&mut payload)).await
+    timeout(Duration::from_millis(1000), stream.read_exact(&mut payload)).await
         .map_err(|_| anyhow::anyhow!("Payload read timeout"))??;
 
     // Parse entries

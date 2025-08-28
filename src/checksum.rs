@@ -115,7 +115,12 @@ pub fn strong_checksum(data: &[u8], checksum_type: ChecksumType) -> Result<Vec<u
             // Use blake3 as a fast alternative to xxhash
             Ok(blake3::hash(data).as_bytes()[..8].to_vec())
         }
-        ChecksumType::Md5 => Ok(md5::compute(data).to_vec()),
+        ChecksumType::Md5 => {
+            // SECURITY WARNING: MD5 is cryptographically broken
+            eprintln!("⚠️  WARNING: MD5 is cryptographically broken and should not be used");
+            eprintln!("   Consider using Blake3 (default) or SHA-256 for security");
+            Ok(md5::compute(data).to_vec())
+        },
     }
 }
 

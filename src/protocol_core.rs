@@ -4,6 +4,8 @@
 //! by both net.rs (sync) and net_async.rs (async) to reduce code duplication.
 
 use anyhow::{anyhow, bail, Result};
+#[cfg(windows)]
+use crate::win_fs;
 use std::path::{Path, PathBuf, Component};
 
 /// Normalize a path to be safely under a root directory.
@@ -124,7 +126,7 @@ pub fn parse_frame_header(header: &[u8; 11]) -> Result<(u8, u32)> {
 /// Delegates to the canonical implementation in win_fs module
 #[cfg(windows)]
 pub fn clear_readonly_recursive(path: &Path) {
-    crate::win_fs::clear_readonly_recursive(path);
+    win_fs::clear_readonly_recursive(path);
 }
 
 /// Create directory with parent creation

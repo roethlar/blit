@@ -13,8 +13,10 @@ pub mod protocol;
 pub mod protocol_core;
 pub mod url;
 pub mod cli;
+pub mod net_async;  // For blitd daemon server
+pub mod tls;        // TLS encryption and TOFU verification
 
-/// Minimal argument surface used by library client helpers.
+/// Library argument surface for network client helpers.
 /// This decouples library code from the binary's Clap struct.
 #[derive(Clone, Debug, Default)]
 pub struct Args {
@@ -23,9 +25,16 @@ pub struct Args {
     pub empty_dirs: bool,
     pub ludicrous_speed: bool,
     pub progress: bool,
+    pub verbose: bool,
+    pub exclude_files: Vec<String>,
+    pub exclude_dirs: Vec<String>,
+    pub net_workers: usize,
+    pub net_chunk_mb: usize,
+    pub checksum: bool,
+    pub force_tar: bool,
+    pub no_tar: bool,
+    pub never_tell_me_the_odds: bool,
 }
 #[cfg(windows)]
 pub mod win_fs;
 
-#[cfg(feature = "tui")]
-pub mod tui;

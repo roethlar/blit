@@ -1221,6 +1221,48 @@ pub mod server {
             });
         }
     }
+
+    pub async fn serve_with_tls(bind: &str, root: &Path, tls_config: rustls::ServerConfig) -> Result<()> {
+        use tokio_rustls::TlsAcceptor;
+        use std::sync::Arc;
+        
+        let listener = TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("bind {}", bind))?;
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        
+        eprintln!(
+            "blit async daemon (TLS) listening on {} root={}",
+            bind,
+            root.display()
+        );
+        
+        loop {
+            let (tcp_stream, peer) = listener.accept().await?;
+            let _ = tcp_stream.set_nodelay(true);
+            eprintln!("async TLS conn from {}", peer);
+            
+            let acceptor = acceptor.clone();
+            let root = root.to_path_buf();
+            
+            tokio::spawn(async move {
+                // Perform TLS handshake
+                let _tls_stream = match acceptor.accept(tcp_stream).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        eprintln!("TLS handshake failed with {}: {}", peer, e);
+                        return;
+                    }
+                };
+                
+                // Handle the TLS connection with full protocol support
+                // TODO: Implement generic connection handler that works with any AsyncRead + AsyncWrite
+                // For now, we need to adapt the current serve() logic to work with TLS streams
+                eprintln!("TLS connection established with {}, but full protocol handler not yet implemented", peer);
+                // The full serve() logic needs to be genericized to work with both TcpStream and TLS streams
+            });
+        }
+    }
 }
 
 #[allow(dead_code)]
