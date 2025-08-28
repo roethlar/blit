@@ -138,9 +138,11 @@ impl BufferSizer {
     /// Get buffer size for parallel operations (smaller to avoid memory pressure)
     pub fn calculate_parallel_buffer_size(&self, thread_count: usize, is_network: bool) -> usize {
         let single_buffer = self.calculate_buffer_size(100 * 1024 * 1024, is_network);
-
+        // Avoid division by zero by treating 0 threads as 1
+        let threads = thread_count.max(1);
+        
         // Divide by thread count but maintain minimum
-        (single_buffer / thread_count).max(256 * 1024) // 256KB minimum
+        (single_buffer / threads).max(256 * 1024) // 256KB minimum
     }
 }
 
@@ -178,5 +180,12 @@ mod tests {
         let local_buf = sizer.calculate_buffer_size(100 * 1024 * 1024, false);
         assert!(local_buf >= 64 * 1024); // At least 64KB
         assert!(local_buf <= 8 * 1024 * 1024); // At most 8MB
+    }
+
+    #[test]
+    fn parallel_buffer_size_handles_zero_threads() {
+        let sizer = BufferSizer::new();
+        let expected = sizer.calculate_buffer_size(100 * 1024 * 1024, false);
+        assert_eq!(sizer.calculate_parallel_buffer_size(0, false), expected);
     }
 }
