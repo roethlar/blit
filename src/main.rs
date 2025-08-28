@@ -159,31 +159,31 @@ struct Args {
     #[arg(long = "log-file")]
     log_file: Option<PathBuf>,
 
-    /// Copy symbolic links as links (preserve), instead of following targets (robocopy /SL)
-    #[arg(long = "sl", help = "Copy symbolic links as links (preserve)")]
+    /// Copy symbolic links as links (do not follow targets)
+    #[arg(long = "sl", help = "Copy symbolic links as links (do not follow targets)")]
     sl: bool,
 
-    /// Copy junctions as junctions (preserve), instead of following targets (robocopy /SJ) [Windows only]
+    /// Copy junctions as junctions (do not follow targets) [Windows only]
     #[cfg(windows)]
-    #[arg(long = "sj", help = "Copy junctions as junctions (preserve) [Windows]")]
+    #[arg(long = "sj", help = "Copy junctions as junctions (do not follow targets) [Windows]")]
     sj: bool,
 
-    /// Exclude symbolic links and junction points (robocopy /XJ)
+    /// Exclude all symbolic links and junction points
     #[arg(long = "xj", help = "Exclude all symbolic links and junctions")]
     xj: bool,
 
-    /// Exclude symbolic links for directories and junction points (robocopy /XJD)
-    #[arg(long = "xjd", help = "Exclude directory symlinks and junctions")]
+    /// Exclude symlinks that point to directories (and junctions)
+    #[arg(long = "xjd", help = "Exclude symlinks that point to directories (and junctions)")]
     xjd: bool,
 
-    /// Exclude symbolic links for files (robocopy /XJF)
-    #[arg(long = "xjf", help = "Exclude file symlinks")]
+    /// Exclude symlinks that point to files
+    #[arg(long = "xjf", help = "Exclude symlinks that point to files")]
     xjf: bool,
 
-    /// Max throughput preset: disables verify and resume, reduces logging, increases buffers/concurrency
+    /// Max throughput preset: increases buffers/workers and disables verify/resume
     #[arg(
         long = "ludicrous-speed",
-        help = "Max throughput preset (no verify/resume; bigger buffers)"
+        help = "Max throughput preset (bigger buffers/workers; no verify/resume)"
     )]
     ludicrous_speed: bool,
 
@@ -499,13 +499,13 @@ fn main() -> Result<()> {
         }
     }
 
-    // Determine link policy: with --mir, default to dereference unless explicitly preserving
+    // Determine link policy: default to dereference unless explicitly preserving
     #[cfg(windows)]
     let preserve_links = args.sl || args.sj;
     #[cfg(not(windows))]
     let preserve_links = args.sl;
 
-    let initial_entries = if delete_extra && !preserve_links {
+    let initial_entries = if !preserve_links {
         crate::fs_enum::enumerate_directory_deref_filtered(&src_path, &filter)
     } else {
         enumerate_directory_filtered(&src_path, &filter)
@@ -907,7 +907,7 @@ fn run_local(src_path: &Path, dest_path: &Path, mirror: bool, include_empty: boo
         include_empty_dirs: include_empty,
     };
     let preserve_links = args.sl;
-    let initial_entries = if mirror && !preserve_links {
+    let initial_entries = if !preserve_links {
         crate::fs_enum::enumerate_directory_deref_filtered(src_path, &filter)
     } else {
         enumerate_directory_filtered(src_path, &filter)

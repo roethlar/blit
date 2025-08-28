@@ -174,6 +174,8 @@ pub fn draw(f: &mut Frame, app: &AppState) {
             Line::from("  r          Toggle delta for large files"),
             Line::from("  e          Toggle empty directories"),
             Line::from("  c          Toggle checksums"),
+            Line::from("  O          Open Options modal"),
+            Line::from("  Ctrl+←/→   Switch tabs in Options"),
             Line::from(""),
             Line::from(Span::styled("Remote:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
             Line::from("  F2         Connect to remote server"),
@@ -260,21 +262,23 @@ pub fn draw(f: &mut Frame, app: &AppState) {
         let mut items: Vec<(String, String, usize)> = Vec::new(); // (label, value, logical index)
         match app.options_tab {
             0 => { // Basics
+                // Mode selection
+                let mode_label = match app.mode { Mode::Copy => "Copy", Mode::Mirror => "Mirror", Mode::Move => "Move" };
+                items.push((format!("Mode: {} (Left/Right/Enter to cycle)", mode_label), "".into(), 50));
                 items.push(("Verbose output".into(), on(app.options.verbose).into(), 0));
                 items.push(("Show progress".into(), on(app.options.progress).into(), 1));
                 items.push(("Include empty directories".into(), on(app.options.include_empty).into(), 2));
                 items.push(("Update only (no delete)".into(), on(app.options.update).into(), 3));
                 items.push(("Ludicrous speed (safe-fast)".into(), on(app.options.ludicrous_speed).into(), 7));
+                items.push(("  Boosts workers/chunk sizes; disables verify and resume".into(), "".into(), usize::MAX));
+                items.push(("  TLS stays enabled; use Unsafe Mode to disable".into(), "".into(), usize::MAX));
                 // keep cursor bounds enforced in event handler
             }
             1 => { // Safety
                 items.push(("Compare by checksum".into(), on(app.options.checksum).into(), 4));
                 items.push(("Skip post-verify".into(), on(app.options.no_verify).into(), 5));
                 items.push(("Disable resume (not recommended)".into(), on(app.options.no_restart).into(), 6));
-                if app.show_advanced {
-                    items.push(("UNSAFE MODE (--never-tell-me-the-odds)".into(), on(app.options.never_tell_me_the_odds).into(), 900));
-                    items.push(("WARNING: disables TLS & safety checks".into(), "".into(), usize::MAX));
-                }
+                // Unsafe mode is CLI-only. If active, banner appears in header.
                 // keep cursor bounds enforced in event handler
             }
             2 => { // Performance
@@ -287,19 +291,27 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                 // keep cursor bounds enforced in event handler
             }
             3 => { // Filters
-                items.push((format!("Exclude files (xf): {} (Enter=add, Del=remove last)", app.options.exclude_files.len()), "".into(), 220));
-                items.push((format!("Exclude dirs (xd): {} (Enter=add, Del=remove last)", app.options.exclude_dirs.len()), "".into(), 221));
+                items.push((format!("Exclude files (xf): {} (Enter=add, Del=remove selected)", app.options.exclude_files.len()), "".into(), 220));
+                for (i, pat) in app.options.exclude_files.iter().enumerate() {
+                    items.push((format!("  - {}", pat), "".into(), 240 + i));
+                }
+                items.push((format!("Exclude dirs (xd): {} (Enter=add, Del=remove selected)", app.options.exclude_dirs.len()), "".into(), 221));
+                for (i, pat) in app.options.exclude_dirs.iter().enumerate() {
+                    items.push((format!("  - {}", pat), "".into(), 260 + i));
+                }
                 // keep cursor bounds enforced in event handler
             }
             4 => { // Links
-                items.push(("Preserve symlinks (SL)".into(), on(app.options.sl).into(), 200));
+                // Blit-native phrasing for clarity
+                items.push(("Copy symlinks as links (do not follow)".into(), on(app.options.sl).into(), 200));
                 #[cfg(windows)]
                 {
-                    items.push(("Preserve junctions (SJ)".into(), on(app.options.sj).into(), 201));
+                    items.push(("Copy junctions as junctions (Windows)".into(), on(app.options.sj).into(), 201));
+                    items.push(("Windows symlink privileges required (Dev Mode/admin)".into(), "".into(), usize::MAX));
                 }
-                items.push(("Exclude all links (XJ)".into(), on(app.options.xj).into(), 202));
-                items.push(("Exclude dir symlinks (XJD)".into(), on(app.options.xjd).into(), 203));
-                items.push(("Exclude file symlinks (XJF)".into(), on(app.options.xjf).into(), 204));
+                items.push(("Exclude all symlinks".into(), on(app.options.xj).into(), 202));
+                items.push(("Exclude directory symlinks".into(), on(app.options.xjd).into(), 203));
+                items.push(("Exclude file symlinks".into(), on(app.options.xjf).into(), 204));
                 // keep cursor bounds enforced in event handler
             }
             5 => { // Logging
@@ -529,7 +541,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
         None => "❌ No destination selected".to_string(),
     };
 
-    let header_text = vec![
+    let mut header_text = vec![
         Line::from(vec![
             Span::styled("SOURCE: ", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD)),
             Span::styled(&src_display, ratatui::style::Style::default().fg(if app.src.is_some() { Theme::GREEN } else { Theme::RED })),
@@ -555,6 +567,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
             Span::styled(&dest_display, ratatui::style::Style::default().fg(if app.dest.is_some() { Theme::GREEN } else { Theme::RED })),
         ]),
     ];
+    if app.options.never_tell_me_the_odds {
+        header_text.push(Line::from(Span::styled(
+            "UNSAFE MODE ACTIVE — TLS and safety checks DISABLED",
+            ratatui::style::Style::default().fg(Theme::RED).add_modifier(ratatui::style::Modifier::BOLD)
+        )));
+    }
     
     let header_widget = Paragraph::new(header_text)
         .alignment(ratatui::layout::Alignment::Center)

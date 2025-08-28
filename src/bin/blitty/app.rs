@@ -178,6 +178,16 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
     let mut app = AppState::new(remote);
     // Load persisted options (best-effort)
     app.options = options::load_options().unwrap_or_else(|_| options::OptionsState::with_safe_defaults());
+    // Unsafe mode is CLI-only; do not expose in UI. Read from env set by blitty.rs.
+    if std::env::var("BLIT_UNSAFE").ok().as_deref() == Some("1") {
+        app.options.never_tell_me_the_odds = true;
+    }
+    // Sync initial mode from persisted options if present
+    match app.options.mode.as_str() {
+        "mirror" => app.mode = Mode::Mirror,
+        "move" => app.mode = Mode::Move,
+        _ => app.mode = Mode::Copy,
+    }
 
     // initial remote load if needed (async helper)
     let mut init_remote: Option<(String, u16, std::path::PathBuf)> = None;
@@ -375,6 +385,16 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                             KeyCode::Enter | KeyCode::Char(' ') => {
                                 let logical = super::ui::current_options_logical_index();
                                 match logical {
+                                    50 => {
+                                        // Cycle mode Copy -> Mirror -> Move -> Copy
+                                        app.mode = match app.mode { 
+                                            Mode::Copy => Mode::Mirror, 
+                                            Mode::Mirror => Mode::Move, 
+                                            Mode::Move => Mode::Copy 
+                                        };
+                                        // Persist to options snapshot
+                                        app.options.mode = match app.mode { Mode::Copy => "copy", Mode::Mirror => "mirror", Mode::Move => "move" }.into();
+                                    }
                                     220 => { app.input_buffer.clear(); app.input_kind = Some(InputKind::AddExcludeFile); app.ui_mode = UiMode::TextInput; }
                                     221 => { app.input_buffer.clear(); app.input_kind = Some(InputKind::AddExcludeDir); app.ui_mode = UiMode::TextInput; }
                                     230 => { app.input_buffer.clear(); app.input_kind = Some(InputKind::SetLogFile); app.ui_mode = UiMode::TextInput; }
@@ -392,12 +412,27 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                                             app.ui_mode = UiMode::Normal;
                                         }
                                     }
-                                    900 => { if app.show_advanced { app.options.never_tell_me_the_odds = !app.options.never_tell_me_the_odds; } }
                                     _ => { options::toggle_option(&mut app.options, logical); }
                                 }
                             }
-                            KeyCode::Left => { let logical = super::ui::current_options_logical_index(); options::adjust_option(&mut app.options, logical, -1); }
-                            KeyCode::Right => { let logical = super::ui::current_options_logical_index(); options::adjust_option(&mut app.options, logical, 1); }
+                            KeyCode::Left => { 
+                                let logical = super::ui::current_options_logical_index(); 
+                                if logical == 50 {
+                                    app.mode = match app.mode { Mode::Copy => Mode::Move, Mode::Mirror => Mode::Copy, Mode::Move => Mode::Mirror };
+                                    app.options.mode = match app.mode { Mode::Copy => "copy", Mode::Mirror => "mirror", Mode::Move => "move" }.into();
+                                } else {
+                                    options::adjust_option(&mut app.options, logical, -1);
+                                }
+                            }
+                            KeyCode::Right => { 
+                                let logical = super::ui::current_options_logical_index(); 
+                                if logical == 50 {
+                                    app.mode = match app.mode { Mode::Copy => Mode::Mirror, Mode::Mirror => Mode::Move, Mode::Move => Mode::Copy };
+                                    app.options.mode = match app.mode { Mode::Copy => "copy", Mode::Mirror => "mirror", Mode::Move => "move" }.into();
+                                } else {
+                                    options::adjust_option(&mut app.options, logical, 1); 
+                                }
+                            }
                             KeyCode::Backspace => {
                                 match super::ui::current_options_logical_index() {
                                     100 => app.options.threads = 0,
@@ -407,12 +442,21 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                                 }
                             }
                             KeyCode::Delete => {
-                                // Remove last filter on Filters tab based on cursor selection
+                                // Remove selected filter on Filters tab, or clear log file on Logging tab
                                 if app.options_tab == 3 {
-                                    // Use selection to decide list
                                     match super::ui::current_options_logical_index() {
                                         220 => { let _ = app.options.exclude_files.pop(); }
                                         221 => { let _ = app.options.exclude_dirs.pop(); }
+                                        v if (240..300).contains(&v) => {
+                                            // 240.. = files, 260.. = dirs
+                                            if v >= 260 {
+                                                let idx = v - 260;
+                                                if idx < app.options.exclude_dirs.len() { let _ = app.options.exclude_dirs.remove(idx); }
+                                            } else if v >= 240 {
+                                                let idx = v - 240;
+                                                if idx < app.options.exclude_files.len() { let _ = app.options.exclude_files.remove(idx); }
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 } else if app.options_tab == 5 && super::ui::current_options_logical_index() == 230 {

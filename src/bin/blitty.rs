@@ -35,5 +35,9 @@ fn main() -> anyhow::Result<()> {
         Some(s) => blit::url::parse_remote_url(&PathBuf::from(s)),
         None => None,
     };
+    // Stash unsafe flag via environment for the app runtime
+    if opts.never_tell_me_the_odds {
+        std::env::set_var("BLIT_UNSAFE", "1");
+    }
     app::run(remote)
 }

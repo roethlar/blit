@@ -36,4 +36,11 @@ pub struct TuiOpts {
     /// Optional initial remote (blit://host:port[/path])
     #[arg(long)]
     pub remote: Option<String>,
+
+    /// UNSAFE: Disable TLS and all security (trusted LAN only). Not shown in UI.
+    #[arg(
+        long = "never-tell-me-the-odds",
+        help = "DISABLE ALL SECURITY - unencrypted, unsafe mode for trusted LAN benchmarks only"
+    )]
+    pub never_tell_me_the_odds: bool,
 }

@@ -3,6 +3,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OptionsState {
     pub verbose: bool,
     pub progress: bool,
@@ -37,6 +38,8 @@ pub struct OptionsState {
     pub ludicrous_speed: bool,       // exposed
     pub never_tell_me_the_odds: bool // hidden, advanced only
     ,
+    // Preferred transfer mode (copy|mirror|move). Stored for TUI convenience.
+    pub mode: String,
     pub recent_hosts: Vec<RecentHost>,
 }
 
@@ -48,6 +51,7 @@ impl OptionsState {
         s.threads = 0;
         s.net_workers = 0;
         s.net_chunk_mb = 0;
+        s.mode = "copy".to_string();
         s.recent_hosts = Vec::new();
         s
     }
@@ -136,6 +140,13 @@ pub fn toggle_option(opts: &mut OptionsState, idx: usize) {
         5 => opts.no_verify = !opts.no_verify,
         6 => opts.no_restart = !opts.no_restart,
         7 => opts.ludicrous_speed = !opts.ludicrous_speed,
+        // Links / symlink handling
+        200 => { opts.sl = !opts.sl; },
+        #[cfg(windows)]
+        201 => { opts.sj = !opts.sj; },
+        202 => { opts.xj = !opts.xj; },
+        203 => { opts.xjd = !opts.xjd; },
+        204 => { opts.xjf = !opts.xjf; },
         _ => {}
     }
 }

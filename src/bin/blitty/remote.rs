@@ -5,6 +5,8 @@ use std::sync::mpsc::Sender;
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use std::sync::Arc;
 
 use blit::protocol;
 use blit::protocol_core;
@@ -39,11 +41,25 @@ pub fn request_remote_dir(tx_ui: &Sender<UiMsg>, pane: Focus, host: String, port
 /// Async LIST request.
 async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec<Entry>> {
     use tokio::time::{timeout, Duration};
-
     let addr = format!("{}:{}", host, port);
-    let mut stream = timeout(Duration::from_millis(2000), TcpStream::connect(&addr)).await
-        .map_err(|_| anyhow::anyhow!("Connection timeout"))?
-        .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
+    // Use TLS by default unless BLIT_UNSAFE is set
+    let use_unsafe = std::env::var("BLIT_UNSAFE").ok().as_deref() == Some("1");
+    // Establish connection
+    // First, connect TCP
+    let tcp = timeout(Duration::from_millis(2000), TcpStream::connect(&addr)).await
+        .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+    let mut stream_any: StreamAny = if use_unsafe {
+        StreamAny::Plain(tcp)
+    } else {
+        // Secure by default: TLS with TOFU
+        let mut cfg = blit::tls::build_client_config_tofu(host, port);
+        let cx = TlsConnector::from(Arc::new(cfg));
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| anyhow::anyhow!("Invalid server name for TLS: {}", host))?;
+        let tls = timeout(Duration::from_millis(2000), cx.connect(server_name, tcp)).await
+            .map_err(|_| anyhow::anyhow!("TLS handshake timeout"))??;
+        StreamAny::Tls(tls)
+    };
 
     // Build LIST_REQ payload
     let path_str = path.to_string_lossy();
@@ -54,13 +70,12 @@ async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec
 
     // Build and send frame header via centralized helper
     let hdr = protocol_core::build_frame_header(protocol::frame::LIST_REQ, payload.len() as u32);
-    stream.write_all(&hdr).await?;
-    stream.write_all(&payload).await?;
-    stream.flush().await?;
+    stream_any.write_all(&hdr).await?;
+    stream_any.write_all(&payload).await?;
 
     // Read and validate response header
     let mut resp_hdr = [0u8; 11];
-    timeout(Duration::from_millis(1000), stream.read_exact(&mut resp_hdr)).await
+    timeout(Duration::from_millis(1000), stream_any.read_exact(&mut resp_hdr)).await
         .map_err(|_| anyhow::anyhow!("Response timeout"))?
         .map_err(|e| anyhow::anyhow!("Read error: {}", e))?;
     let (frame_type, payload_len_u32) = protocol_core::parse_frame_header(&resp_hdr)?;
@@ -81,7 +96,7 @@ async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec
 
     // Read LIST_RESP payload
     let mut payload = vec![0u8; payload_len];
-    timeout(Duration::from_millis(1000), stream.read_exact(&mut payload)).await
+    timeout(Duration::from_millis(1000), stream_any.read_exact(&mut payload)).await
         .map_err(|_| anyhow::anyhow!("Payload read timeout"))??;
 
     // Parse entries: u32 count, then repeated (u8 kind, u16 name_len, name)
@@ -108,4 +123,25 @@ async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec
     }
 
     Ok(entries)
+}
+
+enum StreamAny {
+    Plain(TcpStream),
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+impl StreamAny {
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        match self {
+            StreamAny::Plain(s) => s.write_all(buf).await,
+            StreamAny::Tls(s) => s.write_all(buf).await,
+        }
+    }
+    async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt;
+        match self {
+            StreamAny::Plain(s) => s.read_exact(buf).await,
+            StreamAny::Tls(s) => s.read_exact(buf).await,
+        }
+    }
 }
