@@ -108,7 +108,13 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     } else if app.ui_mode == super::app::UiMode::NewFolderInput {
         " Type folder name • [Enter] create • [Esc] cancel"
     } else if app.ui_mode == super::app::UiMode::ConfirmTransfer {
-        " ⚠️  CONFIRM DESTRUCTIVE TRANSFER: [Y]es execute • [N]o cancel • [Esc] cancel"
+        " ⚠️  Confirm: [Y]es execute • [N]/[Esc] cancel"
+    } else if app.ui_mode == super::app::UiMode::ConfirmTyped {
+        " Type confirmation text and press Enter • [Esc] cancel"
+    } else if app.ui_mode == super::app::UiMode::TextInput {
+        " Type value • [Enter] save • [Esc] cancel"
+    } else if app.ui_mode == super::app::UiMode::Options {
+        " [↑/↓] move  [Space/Enter] toggle  [Esc] close"
     } else {
         " [Tab]switch [↑↓]nav [Space]select [Enter]go [Esc]back [Backspace]swap [F2]connect [Ctrl+G]transfer [h]elp [q]uit"
     };
@@ -170,7 +176,9 @@ pub fn draw(f: &mut Frame, app: &AppState) {
             Line::from("  c          Toggle checksums"),
             Line::from(""),
             Line::from(Span::styled("Remote:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
-            Line::from("  R          Connect to remote server"),
+            Line::from("  F2         Connect to remote server"),
+            Line::from(Span::styled("Options:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
+            Line::from("  O          Open Options"),
             Line::from(""),
             Line::from(Span::styled("General:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))),
             Line::from("  h          Toggle this help"),
@@ -227,6 +235,172 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                 .style(ratatui::style::Style::default().bg(Theme::BG).fg(Theme::FG)));
         f.render_widget(input_block, area);
     }
+
+    // HACK: Communicate the logical index of the selected option row to the key handler
+    unsafe { CURRENT_LOGICAL_INDEX = usize::MAX; }
+    // Options overlay (tabs: Basics, Safety, Performance, Filters, Links, Logging, Network)
+    if app.ui_mode == super::app::UiMode::Options {
+        let area = centered_rect(60, 60, f.size());
+        f.render_widget(Clear, area);
+
+        let on = |b: bool| if b { if is_ascii_mode() { "on" } else { "✓" } } else { if is_ascii_mode() { "off" } else { "✗" } };
+
+        // Tabs header
+        let tabs = ["Basics", "Safety", "Performance", "Filters", "Links", "Logging", "Network"];
+        let mut header = String::new();
+        for (i, t) in tabs.iter().enumerate() {
+            if i == app.options_tab { header.push_str(&format!("[{}] ", t)); } else { header.push_str(&format!(" {}  ", t)); }
+        }
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(header, ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))));
+        lines.push(Line::from(""));
+
+        // Build items for current tab; set cursor range by writing into app.options_cursor limit via OPTIONS_COUNT
+        let mut items: Vec<(String, String, usize)> = Vec::new(); // (label, value, logical index)
+        match app.options_tab {
+            0 => { // Basics
+                items.push(("Verbose output".into(), on(app.options.verbose).into(), 0));
+                items.push(("Show progress".into(), on(app.options.progress).into(), 1));
+                items.push(("Include empty directories".into(), on(app.options.include_empty).into(), 2));
+                items.push(("Update only (no delete)".into(), on(app.options.update).into(), 3));
+                items.push(("Ludicrous speed (safe-fast)".into(), on(app.options.ludicrous_speed).into(), 7));
+                // keep cursor bounds enforced in event handler
+            }
+            1 => { // Safety
+                items.push(("Compare by checksum".into(), on(app.options.checksum).into(), 4));
+                items.push(("Skip post-verify".into(), on(app.options.no_verify).into(), 5));
+                items.push(("Disable resume (not recommended)".into(), on(app.options.no_restart).into(), 6));
+                if app.show_advanced {
+                    items.push(("UNSAFE MODE (--never-tell-me-the-odds)".into(), on(app.options.never_tell_me_the_odds).into(), 900));
+                    items.push(("WARNING: disables TLS & safety checks".into(), "".into(), usize::MAX));
+                }
+                // keep cursor bounds enforced in event handler
+            }
+            2 => { // Performance
+                let thr = if app.options.threads == 0 { "auto".to_string() } else { app.options.threads.to_string() };
+                let nws = if app.options.net_workers == 0 { "auto".to_string() } else { app.options.net_workers.to_string() };
+                let ncm = if app.options.net_chunk_mb == 0 { "auto".to_string() } else { app.options.net_chunk_mb.to_string() };
+                items.push((format!("Threads (-t): {} (Left/Right adjust, Backspace auto)", thr), "".into(), 100));
+                items.push((format!("Net workers: {} (Left/Right adjust, Backspace auto)", nws), "".into(), 101));
+                items.push((format!("Net chunk MB: {} (Left/Right adjust, Backspace auto)", ncm), "".into(), 102));
+                // keep cursor bounds enforced in event handler
+            }
+            3 => { // Filters
+                items.push((format!("Exclude files (xf): {} (Enter=add, Del=remove last)", app.options.exclude_files.len()), "".into(), 220));
+                items.push((format!("Exclude dirs (xd): {} (Enter=add, Del=remove last)", app.options.exclude_dirs.len()), "".into(), 221));
+                // keep cursor bounds enforced in event handler
+            }
+            4 => { // Links
+                items.push(("Preserve symlinks (SL)".into(), on(app.options.sl).into(), 200));
+                #[cfg(windows)]
+                {
+                    items.push(("Preserve junctions (SJ)".into(), on(app.options.sj).into(), 201));
+                }
+                items.push(("Exclude all links (XJ)".into(), on(app.options.xj).into(), 202));
+                items.push(("Exclude dir symlinks (XJD)".into(), on(app.options.xjd).into(), 203));
+                items.push(("Exclude file symlinks (XJF)".into(), on(app.options.xjf).into(), 204));
+                // keep cursor bounds enforced in event handler
+            }
+            5 => { // Logging
+                let path = app.options.log_file.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".into());
+                items.push((format!("Log file: {} (Enter=set, Del=clear)", path), "".into(), 230));
+                // keep cursor bounds enforced in event handler
+            }
+            6 => { // Network
+                items.push(("TLS: enabled (TOFU)".into(), "".into(), usize::MAX));
+                items.push((format!("Recent hosts: {}", app.options.recent_hosts.len()), "".into(), usize::MAX));
+                for (i, h) in app.options.recent_hosts.iter().take(5).enumerate() {
+                    items.push((format!("- {}:{} (Enter=connect)", h.host, h.port), "".into(), 300 + i));
+                }
+                // keep cursor bounds enforced in event handler
+            }
+            _ => {}
+        }
+
+        for (idx, (label, val, logical)) in items.iter().enumerate() {
+            let marker = if idx == app.options_cursor { if is_ascii_mode() { ">" } else { "➤" } } else { " " };
+            let mut segs = vec![
+                Span::raw(format!(" {} ", marker)),
+                Span::styled(label, ratatui::style::Style::default().fg(Theme::FG)),
+            ];
+            if !val.is_empty() {
+                segs.push(Span::raw("  "));
+                segs.push(Span::styled(val, ratatui::style::Style::default().fg(Theme::PINK).add_modifier(ratatui::style::Modifier::BOLD)));
+            }
+            // Update the global cursor index to match logical index so handler can toggle/adjust
+            if idx == app.options_cursor { unsafe { CURRENT_LOGICAL_INDEX = *logical; } }
+            lines.push(Line::from(segs));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Ctrl+←/→ switch tab • Esc save & close", ratatui::style::Style::default().fg(Theme::COMMENT))));
+
+        let p = Paragraph::new(lines)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(ratatui::style::Style::default().fg(Theme::CYAN))
+                .title(Span::styled(" Options ", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD)))
+                .style(ratatui::style::Style::default().bg(Theme::BG).fg(Theme::FG)));
+        f.render_widget(p, area);
+    }
+
+    // Text input overlay for Options edits
+    if app.ui_mode == super::app::UiMode::TextInput {
+        let area = centered_rect(60, 12, f.size());
+        f.render_widget(Clear, area);
+        let title = match app.input_kind {
+            Some(super::app::InputKind::AddExcludeFile) => "Add exclude file pattern (glob)",
+            Some(super::app::InputKind::AddExcludeDir) => "Add exclude dir pattern (glob)",
+            Some(super::app::InputKind::SetLogFile) => "Set log file path",
+            None => "Input",
+        };
+        let display = if app.input_buffer.is_empty() { "█".to_string() } else { format!("{}█", app.input_buffer) };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(title, ratatui::style::Style::default().fg(Theme::CYAN))),
+            Line::from(""),
+            Line::from(display),
+            Line::from(""),
+            Line::from(Span::styled("Enter to save • Esc to cancel", ratatui::style::Style::default().fg(Theme::COMMENT))),
+        ];
+        let p = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).border_style(ratatui::style::Style::default().fg(Theme::CYAN))
+                .title(Span::styled(" Input ", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD)))
+                .style(ratatui::style::Style::default().bg(Theme::BG).fg(Theme::FG)));
+        f.render_widget(p, area);
+    }
+
+    // Confirm typed overlay with command preview
+    if app.ui_mode == super::app::UiMode::ConfirmTyped || app.ui_mode == super::app::UiMode::ConfirmTransfer {
+        let area = centered_rect(70, 40, f.size());
+        f.render_widget(Clear, area);
+
+        // Build preview command in readable multi-line format
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled("Ready to run:", ratatui::style::Style::default().fg(Theme::CYAN).add_modifier(ratatui::style::Modifier::BOLD))));
+        if let Some(argv) = &app.pending_args {
+            let exe = crate::resolve_blit_path().display().to_string();
+            lines.push(Line::from(Span::styled(exe, ratatui::style::Style::default().fg(Theme::FG))));
+            for a in argv {
+                let arg = if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() };
+                lines.push(Line::from(format!("  {}", arg)));
+            }
+        }
+        lines.push(Line::from(""));
+        if let Some(req) = &app.confirm_required_input {
+            lines.push(Line::from(Span::styled(format!("Type '{}' to confirm:", req), ratatui::style::Style::default().fg(Theme::PINK))));
+            let display = format!("{}█", app.confirm_input);
+            lines.push(Line::from(display));
+        } else {
+            lines.push(Line::from(Span::styled("Press Y to execute, N/Esc to cancel", ratatui::style::Style::default().fg(Theme::COMMENT))));
+        }
+
+        let p = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).border_style(ratatui::style::Style::default().fg(Theme::PINK))
+                .title(Span::styled(" Confirmation ", ratatui::style::Style::default().fg(Theme::PINK).add_modifier(ratatui::style::Modifier::BOLD)))
+                .style(ratatui::style::Style::default().bg(Theme::BG).fg(Theme::FG)));
+        f.render_widget(p, area);
+    }
     
     // New folder input overlay with proper background
     if app.ui_mode == super::app::UiMode::NewFolderInput {
@@ -276,6 +450,11 @@ pub fn draw(f: &mut Frame, app: &AppState) {
         f.render_widget(input_block, area);
     }
 }
+
+// HACK: A minimal bridge to pass the logical index for options toggling/adjustment
+// In a later refactor, move options rendering and event handling into a single module.
+static mut CURRENT_LOGICAL_INDEX: usize = usize::MAX;
+pub fn current_options_logical_index() -> usize { unsafe { CURRENT_LOGICAL_INDEX } }
 
 pub fn is_ascii_mode() -> bool {
     // Check if we should use ASCII mode (for non-UTF8 terminals)
@@ -763,6 +942,9 @@ pub fn process_server_input(app: &mut super::app::AppState) {
     let cwd = PathBuf::from("/");
     app.right = Pane::Remote { host: host.clone(), port, cwd: cwd.clone(), entries: vec![], selected: 0 };
     app.status = format!("Connecting to {}:{}...", host, port);
+    // Save recent host and trigger async directory listing
+    super::options::add_recent_host(&mut app.options, &host, port);
+    let _ = super::options::save_options(&app.options);
     request_remote_dir(app, super::app::Focus::Right, host, port, cwd);
     app.input_buffer.clear();
 }

@@ -131,14 +131,16 @@ pub mod server {
                     // Expect START or LIST_REQ, reply accordingly
                         let (typ, pl) = read_frame_timed(&mut stream, 500).await?;
                         if typ == frame::LIST_REQ { // ListReq
-                        // payload: path_len u16 | path bytes (relative to root)
+                        // payload: path_len u16 | absolute path bytes (under root)
                         if pl.len() < 2 { anyhow::bail!("bad LIST_REQ payload"); }
                         let nlen = u16::from_le_bytes([pl[0], pl[1]]) as usize;
                         if pl.len() < 2 + nlen { anyhow::bail!("bad LIST_REQ path len"); }
                         let pstr = std::str::from_utf8(&pl[2..2 + nlen]).unwrap_or("");
-                        let (parent, base) = if let Some(pos) = pstr.rfind('/') { (&pstr[..pos], &pstr[pos + 1..]) } else { ("", pstr) };
-                        let parent_path = PathBuf::from(parent);
-                        let base_dir = normalize_under_root(&root, &parent_path)?;
+                        // Resolve requested path under root; if it's a file, list its parent; if missing, list root
+                        let mut target = normalize_under_root(&root, Path::new(pstr))?;
+                        if !target.exists() || target.is_file() {
+                            target = target.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone());
+                        }
                         let mut out: Vec<u8> = Vec::new();
                         let mut items: Vec<(u8, String)> = Vec::new();
                         
@@ -146,7 +148,7 @@ pub mod server {
                         const MAX_LIST_ENTRIES: usize = 1000;
                         let mut entry_count = 0;
                         
-                        if let Ok(rd) = std::fs::read_dir(&base_dir) {
+                        if let Ok(rd) = std::fs::read_dir(&target) {
                             for e in rd.flatten() {
                                 if entry_count >= MAX_LIST_ENTRIES {
                                     // Add a special marker entry to indicate truncation
@@ -154,7 +156,6 @@ pub mod server {
                                     break;
                                 }
                                 let name = e.file_name().to_string_lossy().to_string();
-                                if !name.starts_with(base) { continue; }
                                 let kind = match e.file_type() { Ok(ft) if ft.is_dir() => 1u8, _ => 0u8 };
                                 items.push((kind, name));
                                 entry_count += 1;

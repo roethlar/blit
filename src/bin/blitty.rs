@@ -7,6 +7,7 @@ use blit::cli::TuiOpts;
 #[path = "blitty/ui.rs"] mod ui;
 #[path = "blitty/theme.rs"] mod theme;
 #[path = "blitty/remote.rs"] mod remote;
+#[path = "blitty/options.rs"] mod options;
 
 fn resolve_blit_path() -> std::path::PathBuf {
     // Allow override via env

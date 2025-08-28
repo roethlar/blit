@@ -15,6 +15,7 @@ use std::sync::mpsc::{Sender, Receiver, channel};
 
 use blit::url::{RemoteDest};
 use super::ui;
+use super::options;
 
 /// Terminal guard that ensures proper cleanup on drop
 struct TerminalGuard;
@@ -50,9 +51,12 @@ pub enum UiMode {
     Help,
     ServerInput,
     NewFolderInput,
+    Options,
     Busy,
     ConfirmMove,
-    ConfirmTransfer,  // SAFETY: Require explicit confirmation for transfers
+    ConfirmTransfer,  // SAFETY: Require explicit confirmation for transfers (Y/N)
+    ConfirmTyped,     // SAFETY: Require typing a keyword (e.g., "delete" or "move")
+    TextInput,        // Generic text entry for Options editing
 }
 
 #[derive(Clone)]
@@ -86,6 +90,14 @@ pub struct AppState {
     pub tx_ui: Sender<UiMsg>,
     pub rx_ui: Receiver<UiMsg>,
     pub loading_pane: Option<Focus>,
+    pub options: options::OptionsState,
+    pub options_cursor: usize,
+    pub options_tab: usize,
+    pub pending_args: Option<Vec<String>>,      // Prepared blit argv for execution
+    pub confirm_required_input: Option<String>, // Keyword required to confirm (delete/move)
+    pub confirm_input: String,                  // User-typed confirmation buffer
+    pub input_kind: Option<InputKind>,          // What TextInput is editing
+    pub show_advanced: bool,                    // Reveal advanced/unsafe toggles in Options
 }
 
 impl AppState {
@@ -124,8 +136,23 @@ impl AppState {
             tx_ui,
             rx_ui,
             loading_pane: None,
+            options: options::OptionsState::default(),
+            options_cursor: 0,
+            options_tab: 0,
+            pending_args: None,
+            confirm_required_input: None,
+            confirm_input: String::new(),
+            input_kind: None,
+            show_advanced: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputKind {
+    AddExcludeFile,
+    AddExcludeDir,
+    SetLogFile,
 }
 
 pub fn run(remote: Option<RemoteDest>) -> Result<()> {
@@ -149,6 +176,8 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut app = AppState::new(remote);
+    // Load persisted options (best-effort)
+    app.options = options::load_options().unwrap_or_else(|_| options::OptionsState::with_safe_defaults());
 
     // initial remote load if needed (async helper)
     let mut init_remote: Option<(String, u16, std::path::PathBuf)> = None;
@@ -228,7 +257,7 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
 
         if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                Event::Key(k) => {
                     let code = k.code;
                     let modifiers = k.modifiers;
                     
@@ -283,6 +312,27 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                                 // SAFETY: Ignore all other keys in confirmation mode
                             }
                         }
+                    } else if app.ui_mode == UiMode::ConfirmTyped {
+                        match code {
+                            KeyCode::Enter => {
+                                if let Some(req) = &app.confirm_required_input {
+                                    if app.confirm_input.trim().eq_ignore_ascii_case(req) {
+                                        app.ui_mode = UiMode::Normal;
+                                        if !app.running { start_transfer(&mut app); }
+                                    } else {
+                                        app.status = format!("Confirmation text must be '{}'; cancelled", req);
+                                        app.ui_mode = UiMode::Normal;
+                                    }
+                                } else {
+                                    app.ui_mode = UiMode::Normal;
+                                }
+                                app.confirm_input.clear();
+                            }
+                            KeyCode::Esc => { app.confirm_input.clear(); app.ui_mode = UiMode::Normal; }
+                            KeyCode::Backspace => { app.confirm_input.pop(); }
+                            KeyCode::Char(c) => { app.confirm_input.push(c); }
+                            _ => {}
+                        }
                     } else if app.ui_mode == UiMode::NewFolderInput {
                         // Handle new folder input mode
                         match code {
@@ -300,6 +350,95 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                             KeyCode::Char(c) => {
                                 app.input_buffer.push(c);
                             }
+                            _ => {}
+                        }
+                    } else if app.ui_mode == UiMode::Options {
+                        match code {
+                            KeyCode::Esc => {
+                                let _ = options::save_options(&app.options);
+                                app.ui_mode = UiMode::Normal;
+                            }
+                            KeyCode::Left if modifiers.contains(KeyModifiers::CONTROL) => {
+                                if app.options_tab > 0 { app.options_tab -= 1; app.options_cursor = 0; }
+                            }
+                            KeyCode::Right if modifiers.contains(KeyModifiers::CONTROL) => {
+                                if app.options_tab < 6 { app.options_tab += 1; app.options_cursor = 0; }
+                            }
+                            KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.show_advanced = !app.show_advanced;
+                            }
+                            KeyCode::Up => { if app.options_cursor > 0 { app.options_cursor -= 1; } }
+                            KeyCode::Down => {
+                                // Determine max rows by peeking at current UI items length via logical index hack not possible; clamp later on render transitions.
+                                app.options_cursor = app.options_cursor.saturating_add(1);
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                let logical = super::ui::current_options_logical_index();
+                                match logical {
+                                    220 => { app.input_buffer.clear(); app.input_kind = Some(InputKind::AddExcludeFile); app.ui_mode = UiMode::TextInput; }
+                                    221 => { app.input_buffer.clear(); app.input_kind = Some(InputKind::AddExcludeDir); app.ui_mode = UiMode::TextInput; }
+                                    230 => { app.input_buffer.clear(); app.input_kind = Some(InputKind::SetLogFile); app.ui_mode = UiMode::TextInput; }
+                                    v if (300..400).contains(&v) => {
+                                        // Connect to recent host
+                                        let idx = v - 300;
+                                        if let Some(hc) = app.options.recent_hosts.get(idx).cloned() {
+                                            let cwd = std::path::PathBuf::from("/");
+                                            let host = hc.host;
+                                            let port = hc.port;
+                                            app.right = Pane::Remote { host: host.clone(), port, cwd: cwd.clone(), entries: vec![], selected: 0 };
+                                            super::ui::request_remote_dir(&mut app, Focus::Right, host.clone(), port, cwd);
+                                            app.status = format!("Connecting to {}:{}...", host, port);
+                                            let _ = options::save_options(&app.options);
+                                            app.ui_mode = UiMode::Normal;
+                                        }
+                                    }
+                                    900 => { if app.show_advanced { app.options.never_tell_me_the_odds = !app.options.never_tell_me_the_odds; } }
+                                    _ => { options::toggle_option(&mut app.options, logical); }
+                                }
+                            }
+                            KeyCode::Left => { let logical = super::ui::current_options_logical_index(); options::adjust_option(&mut app.options, logical, -1); }
+                            KeyCode::Right => { let logical = super::ui::current_options_logical_index(); options::adjust_option(&mut app.options, logical, 1); }
+                            KeyCode::Backspace => {
+                                match super::ui::current_options_logical_index() {
+                                    100 => app.options.threads = 0,
+                                    101 => app.options.net_workers = 0,
+                                    102 => app.options.net_chunk_mb = 0,
+                                    _ => {}
+                                }
+                            }
+                            KeyCode::Delete => {
+                                // Remove last filter on Filters tab based on cursor selection
+                                if app.options_tab == 3 {
+                                    // Use selection to decide list
+                                    match super::ui::current_options_logical_index() {
+                                        220 => { let _ = app.options.exclude_files.pop(); }
+                                        221 => { let _ = app.options.exclude_dirs.pop(); }
+                                        _ => {}
+                                    }
+                                } else if app.options_tab == 5 && super::ui::current_options_logical_index() == 230 {
+                                    app.options.log_file = None;
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if app.ui_mode == UiMode::TextInput {
+                        match code {
+                            KeyCode::Enter => {
+                                let text = app.input_buffer.trim().to_string();
+                                match app.input_kind {
+                                    Some(InputKind::AddExcludeFile) => { if !text.is_empty() { app.options.exclude_files.push(text); } }
+                                    Some(InputKind::AddExcludeDir) => { if !text.is_empty() { app.options.exclude_dirs.push(text); } }
+                                    Some(InputKind::SetLogFile) => { if !text.is_empty() { app.options.log_file = Some(std::path::PathBuf::from(text)); } }
+                                    None => {}
+                                }
+                                let _ = options::save_options(&app.options);
+                                app.input_buffer.clear();
+                                app.input_kind = None;
+                                app.ui_mode = UiMode::Options;
+                            }
+                            KeyCode::Esc => { app.input_buffer.clear(); app.input_kind = None; app.ui_mode = UiMode::Options; }
+                            KeyCode::Backspace => { app.input_buffer.pop(); }
+                            KeyCode::Char(c) => { app.input_buffer.push(c); }
                             _ => {}
                         }
                     } else {
@@ -340,15 +479,30 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                                 app.input_buffer.clear(); 
                             }
                             // Options overlay
-                            // TODO: Add Options overlay
-                            // (KeyCode::Char('o'), _) | (KeyCode::Char('O'), _) => { app.ui_mode = UiMode::Options; }
+                            (KeyCode::Char('o'), _) | (KeyCode::Char('O'), _) => { app.ui_mode = UiMode::Options; }
                             // Help
                             (KeyCode::Char('h'), _) | (KeyCode::F(1), _) => { ui::toggle_help(&mut app); }
-                            // Ctrl+G initiates transfer confirmation - requires explicit Y/N confirmation
+                            // Ctrl+G prepares command and initiates confirmation
                             (KeyCode::Char('g'), m) if m.contains(KeyModifiers::CONTROL) => {
                                 if app.src.is_some() && app.dest.is_some() && !app.running {
-                                    app.ui_mode = UiMode::ConfirmTransfer;
-                                    app.status = "Press Y to confirm transfer, or Esc to cancel".to_string();
+                                    // Build argv using options
+                                    let (src, dest) = (app.src.clone().unwrap(), app.dest.clone().unwrap());
+                                    let argv = options::build_blit_args(app.mode, &app.options, &src, &dest);
+                                    app.pending_args = Some(argv);
+                                    // Determine if typed confirmation is required
+                                    if matches!(app.mode, Mode::Mirror) {
+                                        app.confirm_required_input = Some("delete".to_string());
+                                        app.ui_mode = UiMode::ConfirmTyped;
+                                        app.status = "Type 'delete' to confirm mirror deletions, or Esc to cancel".to_string();
+                                    } else if matches!(app.mode, Mode::Move) {
+                                        app.confirm_required_input = Some("move".to_string());
+                                        app.ui_mode = UiMode::ConfirmTyped;
+                                        app.status = "Type 'move' to confirm move (source removal), or Esc to cancel".to_string();
+                                    } else {
+                                        app.confirm_required_input = None;
+                                        app.ui_mode = UiMode::ConfirmTransfer;
+                                        app.status = "Press Y to confirm transfer, or Esc to cancel".to_string();
+                                    }
                                 } else if app.src.is_none() || app.dest.is_none() {
                                     app.status = "Select source (Space in left pane) and destination (Space in right pane) first".to_string();
                                 } else if app.running {
@@ -370,23 +524,26 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
 }
 
 fn start_transfer(app: &mut AppState) {
-   // Validate src/dest
-   let (src, dest) = match (&app.src, &app.dest) {
-       (Some(s), Some(d)) => (s.clone(), d.clone()),
-       _ => { app.status = "Select src (s) and dest (d) first".to_string(); return; }
-   };
     // Validate src/dest
     let (src, dest) = match (&app.src, &app.dest) {
         (Some(s), Some(d)) => (s.clone(), d.clone()),
-        _ => { app.status = "Press Space to set Source/Target, then Enter".to_string(); return; }
+        _ => { app.status = "Select src (Space in left) and dest (Space in right) first".to_string(); return; }
     };
+    // Guard dangerous roots (local only)
+    if let (Mode::Move, ui::PathSpec::Local(p)) = (app.mode, &src) {
+        if is_fs_root(p) { app.status = "Refusing to move a filesystem root".to_string(); return; }
+    }
+    if let (Mode::Mirror, ui::PathSpec::Local(p)) = (app.mode, &dest) {
+        if is_fs_root(p) { app.status = "Refusing to mirror into filesystem root".to_string(); return; }
+    }
+
+    // Build argv from options (reuse prepared if present)
+    let argv = if let Some(a) = app.pending_args.take() { a } else { super::options::build_blit_args(app.mode, &app.options, &src, &dest) };
+
     // Build command
     let exe = crate::resolve_blit_path();
-    let sub = match app.mode { Mode::Mirror => "mirror", Mode::Copy => "copy", Mode::Move => "move" };
-    let srcs = ui::pathspec_to_string(&src);
-    let dests = ui::pathspec_to_string(&dest);
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("-v").arg(sub).arg(&srcs).arg(&dests);
+    let mut cmd = std::process::Command::new(&exe);
+    for a in &argv { cmd.arg(a); }
     // Spawn and capture output
     let mut child = match cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
         Ok(c) => c,
@@ -395,10 +552,13 @@ fn start_transfer(app: &mut AppState) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let _ = tx.send(format!("[cmd] blit {} {} {}", sub, srcs, dests));
+    // Preview
+    let mut preview = format!("[cmd] {}", exe.display());
+    for a in &argv { preview.push(' '); if a.contains(' ') { preview.push('"'); preview.push_str(a); preview.push('"'); } else { preview.push_str(a); } }
+    let _ = tx.send(preview);
     app.rx = Some(rx);
     app.running = true;
-    app.status = format!("Running {}…", sub);
+    app.status = "Running transfer…".to_string();
     let handle = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
     app.child = Some(handle.clone());
     // Reader helper
@@ -492,4 +652,11 @@ fn cancel_transfer(app: &mut AppState) {
     let icon = if ui::is_ascii_mode() { "[X]" } else { "⛔" };
     app.status = format!("{} Transfer canceled", icon);
     app.toast = Some((format!("{} Transfer canceled by user", icon), std::time::Instant::now()));
+}
+
+fn is_fs_root(p: &std::path::Path) -> bool {
+    match p.canonicalize() {
+        Ok(cp) => cp.parent().is_none(),
+        Err(_) => false,
+    }
 }

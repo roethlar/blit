@@ -47,6 +47,19 @@ Planned Next
 - Bench against rsync on real datasets; collect CSV and summarize.
 - After evaluation, begin Windows P0 (win_fs layer, symlink/timestamp, case‑insensitive paths).
 
+## 2025-08-28 — Blitty OptionsState (PR1 kickoff)
+
+- Project goals aligned: FAST, SIMPLE, RELIABLE; secure by default (TLS/TOFU), “Ludicrous speed” exposed; `--never-tell-me-the-odds` hidden but supported with warnings.
+- TODO updated: Added phased blitty UI plan (Options → Preview → Confirmations → Remaining tabs/Connect).
+- Implementation start (PR1):
+  - Add `src/bin/blitty/options.rs` with `OptionsState` (safe defaults) and `build_blit_args()` that maps OptionsState + Mode + PathSpec → argv for `blit`.
+  - Wire `OptionsState` into `AppState` (no UI usage yet).
+  - Unit tests to snapshot some arg combinations (copy/mirror/move; excludes; ludicrous preset).
+
+### Daemon default bind update
+- Changed `blitd` default bind from `127.0.0.1:9031` to `0.0.0.0:9031` to meet SIMPLE and functional defaults: the daemon is a network service.
+- Safety preserved by default via TLS + TOFU; existing startup warning for 0.0.0.0 remains.
+
 ## Build (macOS) — 2025-08-25
 - Fixed duplicate `sendfile_to_stream` definitions by scoping the Unix fallback away from macOS.
 - Adjusted `sendfile_to_stream` to take `&mut TcpStream`; updated the large-file send call site.

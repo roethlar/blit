@@ -122,7 +122,7 @@ Common options:
 - `--never-tell-me-the-odds`: DISABLE ALL SECURITY - unencrypted, unsafe mode (trusted LAN benchmarks only)
 
 Daemon options (secure by default):
-- `--bind` and `--root`: server binding and directory (defaults: `127.0.0.1:9031`, current dir)  
+- `--bind` and `--root`: server binding and directory (default bind: `0.0.0.0:9031`, current dir). TLS with TOFU is enabled by default.  
 - `--tls-cert` / `--tls-key`: custom TLS certificate (auto-generates self-signed if not provided)
 - `--never-tell-me-the-odds`: explicitly disable all security for benchmarks (NOT recommended)
 
@@ -135,7 +135,7 @@ Performance tuning:
 
 - Enabled by default (no feature flags required).
 - Dracula theme, dual-pane (local/local by default).
-- Toggle right pane remote with `R` (connects to `127.0.0.1:9031`); navigation with arrows/Enter, pick src/dest with `s`/`d`.
+- Toggle right pane remote with `F2` to connect (defaults to port `9031` with TLS). Navigation with arrows/Enter, pick src/dest with Space in respective panes.
 - Run transfer with `g` (mirror/copy/move based on current mode). Shows a spinner and last few lines of output; press `x` to cancel a running transfer. Remote→remote transfers are not supported.
 
 ## Best Practices

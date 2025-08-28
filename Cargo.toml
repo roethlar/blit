@@ -27,6 +27,7 @@ blake3 = "1.0"      # For fast checksums
 uuid = { version = "1.0", features = ["v4"] } # Added for unique sync job IDs
 serde = { version = "1.0", features = ["derive"] } # (may be used elsewhere)
 serde_json = "1.0"
+toml = "0.8"
 tokio = { version = "1.35", features = ["full"] } # Asynchronous I/O
 quinn = "0.10" # QUIC transport for high-performance networking
 rustls = "0.22" # TLS support for secure connections
@@ -79,4 +80,3 @@ path = "src/bin/blitd.rs"
 [[bin]]
 name = "blitty"
 path = "src/bin/blitty.rs"
-

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Parser)]
 pub struct DaemonOpts {
     /// Bind address (host:port)
-    #[arg(long, default_value = "127.0.0.1:9031")]  // SECURITY: Bind to localhost by default
+    #[arg(long, default_value = "0.0.0.0:9031")]  // Default: listen on all interfaces; TLS/TOFU enforces safety
     pub bind: String,
 
     /// Root directory to serve

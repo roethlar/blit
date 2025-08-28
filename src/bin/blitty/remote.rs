@@ -84,29 +84,26 @@ async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec
     timeout(Duration::from_millis(1000), stream.read_exact(&mut payload)).await
         .map_err(|_| anyhow::anyhow!("Payload read timeout"))??;
 
-    // Parse entries
+    // Parse entries: u32 count, then repeated (u8 kind, u16 name_len, name)
     let mut entries = Vec::new();
     entries.push(Entry { name: "..".to_string(), is_dir: true, is_symlink: false });
 
-    let mut offset = 0;
-    while offset + 3 <= payload.len() {
+    if payload.len() < 4 { return Ok(entries); }
+    let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let mut offset = 4;
+    for _ in 0..count {
+        if offset + 3 > payload.len() { break; }
         let kind = payload[offset];
         offset += 1;
-
-        if offset + 2 > payload.len() { break; }
         let name_len = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
         offset += 2;
-
         if offset + name_len > payload.len() { break; }
         let name = String::from_utf8_lossy(&payload[offset..offset + name_len]).to_string();
         offset += name_len;
-
-        // Skip truncation markers (kind == 2) but add a hint line
         if kind == 2 {
             entries.push(Entry { name: "[More entries on server...]".to_string(), is_dir: false, is_symlink: false });
             continue;
         }
-
         entries.push(Entry { name, is_dir: kind == 1, is_symlink: false });
     }
 
