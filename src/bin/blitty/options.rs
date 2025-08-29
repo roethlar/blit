@@ -1,28 +1,28 @@
-use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OptionsState {
     pub verbose: bool,
     pub progress: bool,
-    pub threads: usize,          // 0 = auto
-    pub net_workers: usize,      // default 4
-    pub net_chunk_mb: usize,     // default 4
+    pub threads: usize,      // 0 = auto
+    pub net_workers: usize,  // default 4
+    pub net_chunk_mb: usize, // default 4
 
-    pub include_empty: bool,     // --empty-dirs vs --no-empty-dirs
-    pub update: bool,            // --update
-    pub dry_run: bool,           // list-only preview
+    pub include_empty: bool, // --empty-dirs vs --no-empty-dirs
+    pub update: bool,        // --update
+    pub dry_run: bool,       // list-only preview
 
     pub exclude_files: Vec<String>, // --xf
     pub exclude_dirs: Vec<String>,  // --xd
 
-    pub checksum: bool,          // --checksum
-    pub force_tar: bool,         // --force_tar
-    pub no_tar: bool,            // --no_tar
-    pub no_verify: bool,         // --no-verify
-    pub no_restart: bool,        // --no-restart
+    pub checksum: bool,   // --checksum
+    pub force_tar: bool,  // --force_tar
+    pub no_tar: bool,     // --no_tar
+    pub no_verify: bool,  // --no-verify
+    pub no_restart: bool, // --no-restart
 
     pub log_file: Option<PathBuf>,
 
@@ -35,9 +35,8 @@ pub struct OptionsState {
     pub xjf: bool,
 
     // Presets
-    pub ludicrous_speed: bool,       // exposed
-    pub never_tell_me_the_odds: bool // hidden, advanced only
-    ,
+    pub ludicrous_speed: bool,        // exposed
+    pub never_tell_me_the_odds: bool, // hidden, advanced only
     // Preferred transfer mode (copy|mirror|move). Stored for TUI convenience.
     pub mode: String,
     pub recent_hosts: Vec<RecentHost>,
@@ -74,50 +73,110 @@ pub fn build_blit_args(
     let mut args: Vec<String> = Vec::new();
 
     // Subcommand
-    let sub = match mode { super::app::Mode::Mirror => "mirror", super::app::Mode::Copy => "copy", super::app::Mode::Move => "move" };
+    let sub = match mode {
+        super::app::Mode::Mirror => "mirror",
+        super::app::Mode::Copy => "copy",
+        super::app::Mode::Move => "move",
+    };
     args.push(sub.to_string());
 
     // Safety/verbosity
-    if opts.verbose { args.push("-v".into()); }
-    if opts.progress { args.push("-p".into()); }
+    if opts.verbose {
+        args.push("-v".into());
+    }
+    // Imply -p unless in unsafe/ludicrous (to keep overhead low)
+    let imply_progress = !opts.ludicrous_speed && !opts.never_tell_me_the_odds;
+    if opts.progress || imply_progress {
+        args.push("-p".into());
+    }
 
     // Performance
-    if opts.threads > 0 { args.push("-t".into()); args.push(opts.threads.to_string()); }
-    if opts.net_workers > 0 { args.push("--net-workers".into()); args.push(opts.net_workers.to_string()); }
-    if opts.net_chunk_mb > 0 { args.push("--net-chunk-mb".into()); args.push(opts.net_chunk_mb.to_string()); }
+    if opts.threads > 0 {
+        args.push("-t".into());
+        args.push(opts.threads.to_string());
+    }
+    if opts.net_workers > 0 {
+        args.push("--net-workers".into());
+        args.push(opts.net_workers.to_string());
+    }
+    if opts.net_chunk_mb > 0 {
+        args.push("--net-chunk-mb".into());
+        args.push(opts.net_chunk_mb.to_string());
+    }
 
     // Directories behavior
-    if opts.include_empty { args.push("--empty-dirs".into()); } else { args.push("--no-empty-dirs".into()); }
-    if opts.update { args.push("--update".into()); }
+    if opts.include_empty {
+        args.push("--empty-dirs".into());
+    } else {
+        args.push("--no-empty-dirs".into());
+    }
+    if opts.update {
+        args.push("--update".into());
+    }
 
     // Dry run (preview)
-    if opts.dry_run { args.push("--list-only".into()); }
+    if opts.dry_run {
+        args.push("--list-only".into());
+    }
 
     // Filters
-    for xf in &opts.exclude_files { args.push("--xf".into()); args.push(xf.clone()); }
-    for xd in &opts.exclude_dirs { args.push("--xd".into()); args.push(xd.clone()); }
+    for xf in &opts.exclude_files {
+        args.push("--xf".into());
+        args.push(xf.clone());
+    }
+    for xd in &opts.exclude_dirs {
+        args.push("--xd".into());
+        args.push(xd.clone());
+    }
 
     // Integrity and transfer tuning
-    if opts.checksum { args.push("--checksum".into()); }
-    if opts.force_tar { args.push("--force_tar".into()); }
-    if opts.no_tar { args.push("--no_tar".into()); }
-    if opts.no_verify { args.push("--no-verify".into()); }
-    if opts.no_restart { args.push("--no-restart".into()); }
+    if opts.checksum {
+        args.push("--checksum".into());
+    }
+    if opts.force_tar {
+        args.push("--force-tar".into());
+    }
+    if opts.no_tar {
+        args.push("--no-tar".into());
+    }
+    if opts.no_verify {
+        args.push("--no-verify".into());
+    }
+    if opts.no_restart {
+        args.push("--no-restart".into());
+    }
 
     // Logging
-    if let Some(p) = &opts.log_file { args.push("--log-file".into()); args.push(p.display().to_string()); }
+    if let Some(p) = &opts.log_file {
+        args.push("--log-file".into());
+        args.push(p.display().to_string());
+    }
 
     // Links
-    if opts.sl { args.push("--sl".into()); }
+    if opts.sl {
+        args.push("--sl".into());
+    }
     #[cfg(windows)]
-    if opts.sj { args.push("--sj".into()); }
-    if opts.xj { args.push("--xj".into()); }
-    if opts.xjd { args.push("--xjd".into()); }
-    if opts.xjf { args.push("--xjf".into()); }
+    if opts.sj {
+        args.push("--sj".into());
+    }
+    if opts.xj {
+        args.push("--xj".into());
+    }
+    if opts.xjd {
+        args.push("--xjd".into());
+    }
+    if opts.xjf {
+        args.push("--xjf".into());
+    }
 
     // Presets
-    if opts.ludicrous_speed { args.push("--ludicrous-speed".into()); }
-    if opts.never_tell_me_the_odds { args.push("--never-tell-me-the-odds".into()); }
+    if opts.ludicrous_speed {
+        args.push("--ludicrous-speed".into());
+    }
+    if opts.never_tell_me_the_odds {
+        args.push("--never-tell-me-the-odds".into());
+    }
 
     // Positional arguments
     let src_s = super::ui::pathspec_to_string(src);
@@ -141,12 +200,22 @@ pub fn toggle_option(opts: &mut OptionsState, idx: usize) {
         6 => opts.no_restart = !opts.no_restart,
         7 => opts.ludicrous_speed = !opts.ludicrous_speed,
         // Links / symlink handling
-        200 => { opts.sl = !opts.sl; },
+        200 => {
+            opts.sl = !opts.sl;
+        }
         #[cfg(windows)]
-        201 => { opts.sj = !opts.sj; },
-        202 => { opts.xj = !opts.xj; },
-        203 => { opts.xjd = !opts.xjd; },
-        204 => { opts.xjf = !opts.xjf; },
+        201 => {
+            opts.sj = !opts.sj;
+        }
+        202 => {
+            opts.xj = !opts.xj;
+        }
+        203 => {
+            opts.xjd = !opts.xjd;
+        }
+        204 => {
+            opts.xjf = !opts.xjf;
+        }
         _ => {}
     }
 }
@@ -166,7 +235,10 @@ pub fn load_options() -> Result<OptionsState> {
 }
 
 pub fn save_options(opts: &OptionsState) -> Result<()> {
-    let dir = config_path().parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    let dir = config_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir).ok();
     let p = config_path();
     let data = toml::to_string(opts)?;
@@ -185,27 +257,36 @@ pub fn save_options(opts: &OptionsState) -> Result<()> {
 }
 
 pub fn add_recent_host(opts: &mut OptionsState, host: &str, port: u16) {
-    let entry = RecentHost { host: host.to_string(), port };
+    let entry = RecentHost {
+        host: host.to_string(),
+        port,
+    };
     // Remove if exists
-    opts.recent_hosts.retain(|h| !(h.host == entry.host && h.port == entry.port));
+    opts.recent_hosts
+        .retain(|h| !(h.host == entry.host && h.port == entry.port));
     // Push front
     opts.recent_hosts.insert(0, entry);
     // Cap list
-    if opts.recent_hosts.len() > 10 { opts.recent_hosts.truncate(10); }
+    if opts.recent_hosts.len() > 10 {
+        opts.recent_hosts.truncate(10);
+    }
 }
 
 pub fn adjust_option(opts: &mut OptionsState, idx: usize, delta: i32) {
     match idx {
         // Performance indices handled by UI mapping
-        100 => { // threads
+        100 => {
+            // threads
             let v = (opts.threads as i32 + delta).clamp(0, 512);
             opts.threads = v as usize;
         }
-        101 => { // net_workers
+        101 => {
+            // net_workers
             let v = (opts.net_workers as i32 + delta).clamp(1, 64);
             opts.net_workers = v as usize;
         }
-        102 => { // net_chunk_mb
+        102 => {
+            // net_chunk_mb
             let v = (opts.net_chunk_mb as i32 + delta).clamp(1, 32);
             opts.net_chunk_mb = v as usize;
         }
@@ -217,12 +298,19 @@ pub fn adjust_option(opts: &mut OptionsState, idx: usize, delta: i32) {
 mod tests {
     use super::*;
 
-    fn lp(p: &str) -> super::super::ui::PathSpec { super::super::ui::PathSpec::Local(PathBuf::from(p)) }
+    fn lp(p: &str) -> super::super::ui::PathSpec {
+        super::super::ui::PathSpec::Local(PathBuf::from(p))
+    }
 
     #[test]
     fn args_copy_defaults() {
         let opts = OptionsState::with_safe_defaults();
-        let args = build_blit_args(super::super::app::Mode::Copy, &opts, &lp("/src"), &lp("/dst"));
+        let args = build_blit_args(
+            super::super::app::Mode::Copy,
+            &opts,
+            &lp("/src"),
+            &lp("/dst"),
+        );
         assert_eq!(args[0], "copy");
         assert!(args.contains(&"--empty-dirs".to_string()));
         assert!(args.ends_with(&vec!["/src".to_string(), "/dst".to_string()]));

@@ -12,10 +12,11 @@ mod fs_enum;
 mod logger;
 mod net;
 mod net_async;
-mod tar_stream;
-mod url;
 mod protocol;
 mod protocol_core;
+mod tar_stream;
+mod tls;
+mod url;
 #[cfg(windows)]
 mod win_fs;
 
@@ -37,8 +38,6 @@ use crate::fs_enum::{
 };
 use crate::logger::{Logger, NoopLogger, TextLogger};
 use crate::tar_stream::{tar_stream_transfer_list, TarConfig};
-use crate::net_async::server;
-use crate::protocol::frame;
 // TUI removed - use blitty binary instead
 use serde::Serialize;
 
@@ -46,7 +45,7 @@ use serde::Serialize;
 struct VerifySummary {
     identical: bool,
     changed_count: usize,
-    extras_count: usize, 
+    extras_count: usize,
     sample: Vec<VerifyEntry>,
 }
 
@@ -88,11 +87,11 @@ struct Args {
     net_chunk_mb: usize,
 
     /// Show processing stages and operations (discovery, categorization, etc.)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     verbose: bool,
 
     /// Show individual file operations as they happen
-    #[arg(short, long)]
+    #[arg(short = 'p', long = "progress", global = true)]
     progress: bool,
 
     /// Mirror mode - copy and delete extra files (same as --delete)
@@ -160,12 +159,18 @@ struct Args {
     log_file: Option<PathBuf>,
 
     /// Copy symbolic links as links (do not follow targets)
-    #[arg(long = "sl", help = "Copy symbolic links as links (do not follow targets)")]
+    #[arg(
+        long = "sl",
+        help = "Copy symbolic links as links (do not follow targets)"
+    )]
     sl: bool,
 
     /// Copy junctions as junctions (do not follow targets) [Windows only]
     #[cfg(windows)]
-    #[arg(long = "sj", help = "Copy junctions as junctions (do not follow targets) [Windows]")]
+    #[arg(
+        long = "sj",
+        help = "Copy junctions as junctions (do not follow targets) [Windows]"
+    )]
     sj: bool,
 
     /// Exclude all symbolic links and junction points
@@ -173,7 +178,10 @@ struct Args {
     xj: bool,
 
     /// Exclude symlinks that point to directories (and junctions)
-    #[arg(long = "xjd", help = "Exclude symlinks that point to directories (and junctions)")]
+    #[arg(
+        long = "xjd",
+        help = "Exclude symlinks that point to directories (and junctions)"
+    )]
     xjd: bool,
 
     /// Exclude symlinks that point to files
@@ -205,32 +213,24 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum CliCommand {
     /// Mirror src to dest (copy + delete extras; include empty dirs)
-    Mirror {
-        src: PathBuf,
-        dest: PathBuf,
-    },
+    Mirror { src: PathBuf, dest: PathBuf },
     /// Copy src to dest (no deletions; include empty dirs)
-    Copy {
-        src: PathBuf,
-        dest: PathBuf,
-    },
+    Copy { src: PathBuf, dest: PathBuf },
     /// Move src to dest (mirror, then remove src after confirmation)
-    Move {
-        src: PathBuf,
-        dest: PathBuf,
-    },
+    Move { src: PathBuf, dest: PathBuf },
     /// Verify two trees are identical (no changes applied)
+    #[command(hide = true)]
     Verify {
         src: PathBuf,
         dest: PathBuf,
         #[arg(long)]
         checksum: bool, // compare by checksum instead of size+mtime
         #[arg(long)]
-        json: bool,     // print JSON summary
+        json: bool, // print JSON summary
         #[arg(long)]
         csv: Option<PathBuf>, // write CSV to file
         #[arg(long)]
-        limit: Option<usize>,  // limit sample lines on stdout
+        limit: Option<usize>, // limit sample lines on stdout
     },
 }
 
@@ -275,8 +275,15 @@ fn main() -> Result<()> {
                 // Remove source (local or remote)
                 if let Some(remote_src) = url::parse_remote_url(src) {
                     // Remote delete via protocol
-                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().context("build tokio runtime for remove")?;
-                    rt.block_on(net_async::client::remove_tree(&remote_src.host, remote_src.port, &remote_src.path))?;
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("build tokio runtime for remove")?;
+                    rt.block_on(net_async::client::remove_tree(
+                        &remote_src.host,
+                        remote_src.port,
+                        &remote_src.path,
+                    ))?;
                 } else {
                     if src.is_file() {
                         let _ = std::fs::remove_file(src);
@@ -286,7 +293,14 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-            CliCommand::Verify { src, dest, checksum, json, csv, limit } => {
+            CliCommand::Verify {
+                src,
+                dest,
+                checksum,
+                json,
+                csv,
+                limit,
+            } => {
                 let summary = verify_trees(src, dest, *checksum)?;
                 // Output
                 if let Some(csv_path) = csv {
@@ -294,11 +308,19 @@ fn main() -> Result<()> {
                     use std::io::Write as _;
                     writeln!(w, "type,path,size_src,size_dest,mtime_src,mtime_dest").ok();
                     for e in summary.sample.iter() {
-                        writeln!(w, "{},{},{},{},{},{}", e.kind, e.path, e.size_src, e.size_dest, e.mtime_src, e.mtime_dest).ok();
+                        writeln!(
+                            w,
+                            "{},{},{},{},{},{}",
+                            e.kind, e.path, e.size_src, e.size_dest, e.mtime_src, e.mtime_dest
+                        )
+                        .ok();
                     }
                 }
                 if *json {
-                    println!("{}", serde_json::to_string_pretty(&summary).unwrap_or("{}".to_string()));
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&summary).unwrap_or("{}".to_string())
+                    );
                 } else {
                     println!("Identical: {}", summary.identical);
                     println!("Changed/new: {}", summary.changed_count);
@@ -309,9 +331,8 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                std::process::exit(if summary.identical {0} else {1});
-            }
-            // Shell command removed - use blitty binary instead
+                std::process::exit(if summary.identical { 0 } else { 1 });
+            } // Shell command removed - use blitty binary instead
         }
     }
 
@@ -358,12 +379,19 @@ fn main() -> Result<()> {
         _ => {
             eprintln!("Interactive mode: enter source and destination paths.");
             use std::io::Write;
-            eprint!("Source: "); std::io::stdout().flush().ok();
-            let mut s = String::new(); std::io::stdin().read_line(&mut s).ok();
-            eprint!("Destination: "); std::io::stdout().flush().ok();
-            let mut d = String::new(); std::io::stdin().read_line(&mut d).ok();
-            let s = s.trim(); let d = d.trim();
-            if s.is_empty() || d.is_empty() { anyhow::bail!("source and destination required"); }
+            eprint!("Source: ");
+            std::io::stdout().flush().ok();
+            let mut s = String::new();
+            std::io::stdin().read_line(&mut s).ok();
+            eprint!("Destination: ");
+            std::io::stdout().flush().ok();
+            let mut d = String::new();
+            std::io::stdin().read_line(&mut d).ok();
+            let s = s.trim();
+            let d = d.trim();
+            if s.is_empty() || d.is_empty() {
+                anyhow::bail!("source and destination required");
+            }
             (PathBuf::from(s), PathBuf::from(d))
         }
     };
@@ -402,10 +430,7 @@ fn main() -> Result<()> {
     }
 
     if args.verbose {
-        println!(
-            "Blit {} - Linux/macOS Optimized",
-            env!("CARGO_PKG_VERSION")
-        );
+        println!("Blit {} - Linux/macOS Optimized", env!("CARGO_PKG_VERSION"));
         println!("Source: {:?}", src_path);
         println!("Destination: {:?}", dest_path);
         println!("Local operation only");
@@ -418,24 +443,6 @@ fn main() -> Result<()> {
     }
 
     // Configure Rayon thread pool for optimal performance
-   // Use physical CPU count by default to avoid hyperthreading overhead
-   let thread_count = if args.threads > 0 {
-       args.threads
-   } else {
-       // Default to physical CPU count for better performance
-       num_cpus::get_physical()
-   };
-   
-   rayon::ThreadPoolBuilder::new()
-       .num_threads(thread_count)
-       .build_global()
-       .context("Failed to configure thread pool")?;
-   
-   if args.verbose {
-       eprintln!("Configured thread pool with {} threads (physical CPUs: {})", 
-                thread_count, num_cpus::get_physical());
-   }
-    // Configure Rayon thread pool for optimal performance
     // Use physical CPU count by default to avoid hyperthreading overhead
     let thread_count = if args.threads > 0 {
         args.threads
@@ -443,16 +450,23 @@ fn main() -> Result<()> {
         // Default to physical CPU count for better performance
         num_cpus::get_physical()
     };
-    
+
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
-        .build_global() {
-        eprintln!("Rayon pool already initialized ({}); continuing with existing pool", e);
+        .build_global()
+    {
+        eprintln!(
+            "Rayon pool already initialized ({}); continuing with existing pool",
+            e
+        );
     }
-    
+
     if args.verbose {
-        eprintln!("Configured thread pool with {} threads (physical CPUs: {})", 
-                 thread_count, num_cpus::get_physical());
+        eprintln!(
+            "Configured thread pool with {} threads (physical CPUs: {})",
+            thread_count,
+            num_cpus::get_physical()
+        );
     }
 
     // Check if source is a single file
@@ -712,8 +726,12 @@ fn main() -> Result<()> {
             }
 
             let medium_pairs = prepare_copy_pairs(&medium_files, &source, &destination);
-            let stats =
-                parallel_copy_files(medium_pairs, buffer_sizer_clone, false /* local only */, &*logger_clone);
+            let stats = parallel_copy_files(
+                medium_pairs,
+                buffer_sizer_clone,
+                false, /* local only */
+                &*logger_clone,
+            );
 
             let _ = tx_clone.send(("medium", stats));
         });
@@ -742,7 +760,8 @@ fn main() -> Result<()> {
                 let dst = compute_destination(&entry.entry.path, &source, &destination);
                 let mut s = stats.lock();
 
-                let copy_result = if cfg!(unix) { // Always local now
+                let copy_result = if cfg!(unix) {
+                    // Always local now
                     mmap_copy_file(&entry.entry.path, &dst)
                 } else {
                     chunked_copy_file(
@@ -858,13 +877,24 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_copy_like(src: &Path, dest: &Path, mirror: bool, include_empty: bool, base_args: &Args) -> Result<()> {
+fn run_copy_like(
+    src: &Path,
+    dest: &Path,
+    mirror: bool,
+    include_empty: bool,
+    base_args: &Args,
+) -> Result<()> {
     // Build a minimal Args clone to re-use existing logic
     let mut args = base_args.clone_for_copylike();
     args.source = Some(src.to_path_buf());
     args.destination = Some(dest.to_path_buf());
-    if mirror { args.mirror = true; args.delete = true; }
-    if include_empty { args.empty_dirs = true; }
+    if mirror {
+        args.mirror = true;
+        args.delete = true;
+    }
+    if include_empty {
+        args.empty_dirs = true;
+    }
     // Delegate to legacy path by falling through to local copy section
     // Simplest: call main copy pipeline by replicating needed subset
     // For now, we route through network URL handling and local pipeline below
@@ -890,7 +920,13 @@ fn run_copy_like(src: &Path, dest: &Path, mirror: bool, include_empty: bool, bas
 }
 
 // Minimal wrapper to reuse existing local flow from main
-fn run_local(src_path: &Path, dest_path: &Path, mirror: bool, include_empty: bool, args: &Args) -> Result<()> {
+fn run_local(
+    src_path: &Path,
+    dest_path: &Path,
+    mirror: bool,
+    include_empty: bool,
+    args: &Args,
+) -> Result<()> {
     // The main function already implements the full local copy pipeline.
     // To avoid duplicating, we call into that pipeline by reproducing its steps here.
     // For brevity and to avoid code duplication, we will just return an error that instructs to use core path.
@@ -912,7 +948,13 @@ fn run_local(src_path: &Path, dest_path: &Path, mirror: bool, include_empty: boo
     } else {
         enumerate_directory_filtered(src_path, &filter)
     }?;
-    let copy_jobs: Vec<CopyJob> = initial_entries.into_iter().map(|entry| CopyJob{ entry, start_offset:0}).collect();
+    let copy_jobs: Vec<CopyJob> = initial_entries
+        .into_iter()
+        .map(|entry| CopyJob {
+            entry,
+            start_offset: 0,
+        })
+        .collect();
     let (small, medium, large) = categorize_files(copy_jobs);
     let buffer_sizer = Arc::new(BufferSizer::new());
     let logger: Arc<dyn Logger + Send + Sync> = Arc::new(NoopLogger);
@@ -921,7 +963,10 @@ fn run_local(src_path: &Path, dest_path: &Path, mirror: bool, include_empty: boo
     let mut total_bytes = 0u64;
     if !small.is_empty() {
         match process_small_files_tar(&small, src_path, dest_path, false, &*logger) {
-            Ok((f, b)) => { total_files_copied += f; total_bytes += b; },
+            Ok((f, b)) => {
+                total_files_copied += f;
+                total_bytes += b;
+            }
             Err(e) => {
                 eprintln!("Error processing small files via TAR: {}", e);
             }
@@ -931,7 +976,8 @@ fn run_local(src_path: &Path, dest_path: &Path, mirror: bool, include_empty: boo
     if !medium.is_empty() {
         let pairs = prepare_copy_pairs(&medium, src_path, dest_path);
         let stats = parallel_copy_files(pairs, buffer_sizer.clone(), false, &*logger);
-        total_files_copied += stats.files_copied; total_bytes += stats.bytes_copied;
+        total_files_copied += stats.files_copied;
+        total_bytes += stats.bytes_copied;
     }
     // Large files chunked or mmap
     for job in &large {
@@ -939,55 +985,73 @@ fn run_local(src_path: &Path, dest_path: &Path, mirror: bool, include_empty: boo
         let bytes = if !false && cfg!(unix) {
             mmap_copy_file(&job.entry.path, &dst)?
         } else {
-            chunked_copy_file(&job.entry.path, &dst, &BufferSizer::new(), false, None, &*logger)?
+            chunked_copy_file(
+                &job.entry.path,
+                &dst,
+                &BufferSizer::new(),
+                false,
+                None,
+                &*logger,
+            )?
         };
-        total_files_copied += 1; total_bytes += bytes;
+        total_files_copied += 1;
+        total_bytes += bytes;
     }
     // Mirror deletions
     if mirror {
         let _ = handle_mirror_deletion(src_path, dest_path, &filter, args.verbose, args.dry_run)?;
     }
-    println!("Copied {} files ({:.2} MB)", total_files_copied, total_bytes as f64 / 1_048_576.0);
+    println!(
+        "Copied {} files ({:.2} MB)",
+        total_files_copied,
+        total_bytes as f64 / 1_048_576.0
+    );
     Ok(())
 }
 
 impl Args {
-    fn clone_for_copylike(&self) -> Self { Self { ..self.clone_shallow() } }
-    fn clone_shallow(&self) -> Self { Args { 
-        source: None,
-        destination: None,
-        threads: self.threads,
-        net_workers: self.net_workers,
-        net_chunk_mb: self.net_chunk_mb,
-        verbose: self.verbose,
-        progress: self.progress,
-        mirror: false,
-        delete: false,
-        update: false,
-        subdirs: self.subdirs,
-        empty_dirs: self.empty_dirs,
-        no_empty_dirs: self.no_empty_dirs,
-        dry_run: self.dry_run,
-        exclude_files: self.exclude_files.clone(),
-        exclude_dirs: self.exclude_dirs.clone(),
-        checksum: self.checksum,
-        force_tar: self.force_tar,
-        no_tar: self.no_tar,
-        no_verify: self.no_verify,
-        no_restart: self.no_restart,
-        // serve_legacy, bind, root removed
-        log_file: self.log_file.clone(),
-        sl: self.sl,
-        #[cfg(windows)]
-        sj: self.sj,
-        xj: self.xj,
-        xjd: self.xjd,
-        xjf: self.xjf,
-        ludicrous_speed: self.ludicrous_speed,
-        never_tell_me_the_odds: self.never_tell_me_the_odds,
-        complete_remote: None,
-        command: None,
-    } }
+    fn clone_for_copylike(&self) -> Self {
+        Self {
+            ..self.clone_shallow()
+        }
+    }
+    fn clone_shallow(&self) -> Self {
+        Args {
+            source: None,
+            destination: None,
+            threads: self.threads,
+            net_workers: self.net_workers,
+            net_chunk_mb: self.net_chunk_mb,
+            verbose: self.verbose,
+            progress: self.progress,
+            mirror: false,
+            delete: false,
+            update: false,
+            subdirs: self.subdirs,
+            empty_dirs: self.empty_dirs,
+            no_empty_dirs: self.no_empty_dirs,
+            dry_run: self.dry_run,
+            exclude_files: self.exclude_files.clone(),
+            exclude_dirs: self.exclude_dirs.clone(),
+            checksum: self.checksum,
+            force_tar: self.force_tar,
+            no_tar: self.no_tar,
+            no_verify: self.no_verify,
+            no_restart: self.no_restart,
+            // serve_legacy, bind, root removed
+            log_file: self.log_file.clone(),
+            sl: self.sl,
+            #[cfg(windows)]
+            sj: self.sj,
+            xj: self.xj,
+            xjd: self.xjd,
+            xjf: self.xjf,
+            ludicrous_speed: self.ludicrous_speed,
+            never_tell_me_the_odds: self.never_tell_me_the_odds,
+            complete_remote: None,
+            command: None,
+        }
+    }
 }
 
 /// Check if path is a network location
@@ -1008,7 +1072,9 @@ fn should_use_tar(small_files: &[CopyJob], is_network: bool) -> bool {
     };
 
     // Dynamic threshold based on file characteristics
-    let threshold = if false /* local only */ {
+    let threshold = if false
+    /* local only */
+    {
         100 // Network always uses lower threshold
     } else {
         // Local dynamic threshold based on average file size
@@ -1034,7 +1100,9 @@ fn copy_single_file(src: &Path, dst: &Path, is_network: bool, verbose: bool) -> 
     }
 
     let buffer_sizer = BufferSizer::new();
-    let bytes = if !false /* local only */ {
+    let bytes = if !false
+    /* local only */
+    {
         // Use Windows CopyFileW for local copies
         windows_copyfile(src, dst)?
     } else {
@@ -1042,7 +1110,7 @@ fn copy_single_file(src: &Path, dst: &Path, is_network: bool, verbose: bool) -> 
             src,
             dst,
             &buffer_sizer,
-            false /* local only */,
+            false, /* local only */
             &crate::logger::NoopLogger,
         )?
     };
@@ -1101,7 +1169,6 @@ fn compute_destination(src_file: &Path, src_root: &Path, dst_root: &Path) -> Pat
     }
 }
 
-
 /// Handle mirror mode deletion (delete extra files in destination)
 fn handle_mirror_deletion(
     source: &Path,
@@ -1115,9 +1182,13 @@ fn handle_mirror_deletion(
     // Get all files that should exist (from source)
     let source_entries = enumerate_directory_filtered(source, filter)?;
     #[cfg(windows)]
-    fn keyify(p: &Path) -> String { p.to_string_lossy().to_ascii_lowercase() }
+    fn keyify(p: &Path) -> String {
+        p.to_string_lossy().to_ascii_lowercase()
+    }
     #[cfg(not(windows))]
-    fn keyify(p: &Path) -> String { p.to_string_lossy().to_string() }
+    fn keyify(p: &Path) -> String {
+        p.to_string_lossy().to_string()
+    }
 
     let mut source_files: HashSet<String> = HashSet::new();
     let mut source_dirs: HashSet<String> = HashSet::new();
@@ -1205,7 +1276,7 @@ fn handle_mirror_deletion(
     // Delete files first
     for (_i, path) in files_to_delete.iter().enumerate() {
         // Simple deletion without progress display
-        
+
         // Clear read-only recursively on Windows before attempting deletion
         #[cfg(windows)]
         blit::win_fs::clear_readonly_recursive(path);
@@ -1233,7 +1304,7 @@ fn handle_mirror_deletion(
         // Clear read-only recursively on Windows before attempting deletion
         #[cfg(windows)]
         blit::win_fs::clear_readonly_recursive(path);
-        
+
         match std::fs::remove_dir(path) {
             Ok(_) => {
                 deleted_dirs += 1;
@@ -1303,29 +1374,360 @@ fn verify_trees(src: &Path, dest: &Path, checksum: bool) -> Result<VerifySummary
     if let Some(remote) = url::parse_remote_url(dest) {
         verify_local_vs_remote(src, &remote.host, remote.port, &remote.path, checksum)
     } else if let Some(remote_src) = url::parse_remote_url(src) {
-        verify_remote_vs_local(&remote_src.host, remote_src.port, &remote_src.path, dest, checksum)
+        verify_remote_vs_local(
+            &remote_src.host,
+            remote_src.port,
+            &remote_src.path,
+            dest,
+            checksum,
+        )
     } else {
         verify_local_vs_local(src, dest, checksum)
     }
 }
 
-fn verify_local_vs_local(src: &Path, dest: &Path, _checksum: bool) -> Result<VerifySummary> {
-    // Simple placeholder for local verification
-    Ok(VerifySummary{ identical: true, changed_count: 0, extras_count: 0, sample: vec![] })
+fn verify_local_vs_local(src: &Path, dest: &Path, checksum: bool) -> Result<VerifySummary> {
+    use crate::fs_enum::enumerate_directory_filtered;
+    use std::collections::{HashMap, HashSet};
+    let filter = FileFilter {
+        exclude_files: vec![],
+        exclude_dirs: vec![],
+        min_size: None,
+        max_size: None,
+        include_empty_dirs: true,
+    };
+    let left = enumerate_directory_filtered(src, &filter)?;
+    let right = enumerate_directory_filtered(dest, &filter)?;
+    let mut left_map: HashMap<String, &FileEntry> = HashMap::new();
+    for e in &left {
+        if !e.is_directory {
+            let rel = e
+                .path
+                .strip_prefix(src)
+                .unwrap_or(&e.path)
+                .to_string_lossy()
+                .to_string();
+            left_map.insert(rel, e);
+        }
+    }
+    let mut right_map: HashMap<String, &FileEntry> = HashMap::new();
+    for e in &right {
+        if !e.is_directory {
+            let rel = e
+                .path
+                .strip_prefix(dest)
+                .unwrap_or(&e.path)
+                .to_string_lossy()
+                .to_string();
+            right_map.insert(rel, e);
+        }
+    }
+    let mut changed = 0usize;
+    let mut extras = 0usize; // extras in dest
+    let mut sample: Vec<VerifyEntry> = Vec::new();
+    let keys: HashSet<_> = left_map
+        .keys()
+        .cloned()
+        .chain(right_map.keys().cloned())
+        .collect();
+    for k in keys {
+        match (left_map.get(&k), right_map.get(&k)) {
+            (Some(l), Some(r)) => {
+                let mut differs = false;
+                if checksum {
+                    let lh = hash_file(&l.path)?;
+                    let rh = hash_file(&r.path)?;
+                    differs = lh != rh;
+                } else {
+                    differs = l.size != r.size;
+                }
+                if differs {
+                    changed += 1;
+                    if sample.len() < 50 {
+                        sample.push(VerifyEntry {
+                            kind: "changed",
+                            path: k.clone(),
+                            size_src: l.size,
+                            size_dest: r.size,
+                            mtime_src: 0,
+                            mtime_dest: 0,
+                        });
+                    }
+                }
+            }
+            (Some(l), None) => {
+                changed += 1;
+                if sample.len() < 50 {
+                    sample.push(VerifyEntry {
+                        kind: "missing_dest",
+                        path: k.clone(),
+                        size_src: l.size,
+                        size_dest: 0,
+                        mtime_src: 0,
+                        mtime_dest: 0,
+                    });
+                }
+            }
+            (None, Some(r)) => {
+                extras += 1;
+                if sample.len() < 50 {
+                    sample.push(VerifyEntry {
+                        kind: "extra_dest",
+                        path: k.clone(),
+                        size_src: 0,
+                        size_dest: r.size,
+                        mtime_src: 0,
+                        mtime_dest: 0,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(VerifySummary {
+        identical: changed == 0 && extras == 0,
+        changed_count: changed,
+        extras_count: extras,
+        sample,
+    })
 }
 
-fn verify_local_vs_remote(src: &Path, host: &str, port: u16, remote_path: &Path, _checksum: bool) -> Result<VerifySummary> {
-    // Placeholder for local vs remote verification
-    Ok(VerifySummary{ identical: true, changed_count: 0, extras_count: 0, sample: vec![] })
+fn verify_local_vs_remote(
+    src: &Path,
+    host: &str,
+    port: u16,
+    remote_path: &Path,
+    _checksum: bool,
+) -> Result<VerifySummary> {
+    use std::collections::{HashMap, HashSet};
+    // Enumerate local files
+    let filter = FileFilter {
+        exclude_files: vec![],
+        exclude_dirs: vec![],
+        min_size: None,
+        max_size: None,
+        include_empty_dirs: true,
+    };
+    let left = enumerate_directory_filtered(src, &filter)?;
+    let mut local_map: HashMap<String, FileEntry> = HashMap::new();
+    for e in left {
+        if !e.is_directory {
+            let rel = e
+                .path
+                .strip_prefix(src)
+                .unwrap_or(&e.path)
+                .to_string_lossy()
+                .to_string();
+            local_map.insert(rel, e);
+        }
+    }
+    // Enumerate remote files recursively and hash remotely
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for verify")?;
+    let remote_files = rt.block_on(net_async::client::list_files_recursive(
+        host,
+        port,
+        remote_path,
+    ))?;
+    let remote_hashes = rt.block_on(net_async::client::remote_hashes(
+        host,
+        port,
+        remote_path,
+        &remote_files,
+    ))?;
+    let mut changed = 0usize;
+    let mut extras = 0usize;
+    let mut sample: Vec<VerifyEntry> = Vec::new();
+    let keys: HashSet<_> = local_map
+        .keys()
+        .cloned()
+        .chain(remote_files.iter().map(|p| p.to_string_lossy().to_string()))
+        .collect();
+    for k in keys {
+        match (local_map.get(&k), remote_hashes.get(&k)) {
+            (Some(l), Some(rh)) => {
+                let lh = hash_file(&l.path)?;
+                if &lh != rh {
+                    changed += 1;
+                    if sample.len() < 50 {
+                        sample.push(VerifyEntry {
+                            kind: "changed",
+                            path: k.clone(),
+                            size_src: l.size,
+                            size_dest: l.size,
+                            mtime_src: 0,
+                            mtime_dest: 0,
+                        });
+                    }
+                }
+            }
+            (Some(l), None) => {
+                changed += 1;
+                if sample.len() < 50 {
+                    sample.push(VerifyEntry {
+                        kind: "missing_remote",
+                        path: k.clone(),
+                        size_src: l.size,
+                        size_dest: 0,
+                        mtime_src: 0,
+                        mtime_dest: 0,
+                    });
+                }
+            }
+            (None, Some(_)) => {
+                extras += 1;
+                if sample.len() < 50 {
+                    sample.push(VerifyEntry {
+                        kind: "extra_remote",
+                        path: k.clone(),
+                        size_src: 0,
+                        size_dest: 0,
+                        mtime_src: 0,
+                        mtime_dest: 0,
+                    });
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(VerifySummary {
+        identical: changed == 0 && extras == 0,
+        changed_count: changed,
+        extras_count: extras,
+        sample,
+    })
 }
 
-fn verify_remote_vs_local(host: &str, port: u16, remote_path: &Path, dest: &Path, _checksum: bool) -> Result<VerifySummary> {
-    // Placeholder for remote vs local verification  
-    Ok(VerifySummary{ identical: true, changed_count: 0, extras_count: 0, sample: vec![] })
+fn verify_remote_vs_local(
+    host: &str,
+    port: u16,
+    remote_path: &Path,
+    dest: &Path,
+    _checksum: bool,
+) -> Result<VerifySummary> {
+    use std::collections::{HashMap, HashSet};
+    // Enumerate remote files and local files
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for verify")?;
+    let remote_files = rt.block_on(net_async::client::list_files_recursive(
+        host,
+        port,
+        remote_path,
+    ))?;
+    let remote_hashes = rt.block_on(net_async::client::remote_hashes(
+        host,
+        port,
+        remote_path,
+        &remote_files,
+    ))?;
+    let filter = FileFilter {
+        exclude_files: vec![],
+        exclude_dirs: vec![],
+        min_size: None,
+        max_size: None,
+        include_empty_dirs: true,
+    };
+    let right = enumerate_directory_filtered(dest, &filter)?;
+    let mut local_map: HashMap<String, FileEntry> = HashMap::new();
+    for e in right {
+        if !e.is_directory {
+            let rel = e
+                .path
+                .strip_prefix(dest)
+                .unwrap_or(&e.path)
+                .to_string_lossy()
+                .to_string();
+            local_map.insert(rel, e);
+        }
+    }
+    let mut changed = 0usize;
+    let mut extras = 0usize;
+    let mut sample: Vec<VerifyEntry> = Vec::new();
+    let keys: HashSet<_> = remote_files
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .chain(local_map.keys().cloned())
+        .collect();
+    for k in keys {
+        match (remote_hashes.get(&k), local_map.get(&k)) {
+            (Some(rh), Some(l)) => {
+                let lh = hash_file(&l.path)?;
+                if &lh != rh {
+                    changed += 1;
+                    if sample.len() < 50 {
+                        sample.push(VerifyEntry {
+                            kind: "changed",
+                            path: k.clone(),
+                            size_src: l.size,
+                            size_dest: l.size,
+                            mtime_src: 0,
+                            mtime_dest: 0,
+                        });
+                    }
+                }
+            }
+            (Some(_), None) => {
+                extras += 1;
+                if sample.len() < 50 {
+                    sample.push(VerifyEntry {
+                        kind: "extra_local",
+                        path: k.clone(),
+                        size_src: 0,
+                        size_dest: 0,
+                        mtime_src: 0,
+                        mtime_dest: 0,
+                    });
+                }
+            }
+            (None, Some(l)) => {
+                changed += 1;
+                if sample.len() < 50 {
+                    sample.push(VerifyEntry {
+                        kind: "missing_local",
+                        path: k.clone(),
+                        size_src: l.size,
+                        size_dest: 0,
+                        mtime_src: 0,
+                        mtime_dest: 0,
+                    });
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(VerifySummary {
+        identical: changed == 0 && extras == 0,
+        changed_count: changed,
+        extras_count: extras,
+        sample,
+    })
 }
 
 fn client_complete_remote(comp_str: &str) -> Result<()> {
-    // Remote completion placeholder
-    println!("Remote completion: {}", comp_str);
-    Ok(())
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for completion")?;
+    rt.block_on(net_async::client::complete_remote(comp_str))
+}
+
+fn hash_file(path: &Path) -> Result<[u8; 32]> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hasher.finalize().as_bytes());
+    Ok(out)
 }

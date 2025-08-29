@@ -11,10 +11,6 @@ use std::time::Instant;
 pub mod server {
     use super::*;
     use crate::protocol::frame;
-    use filetime::{set_file_mtime, FileTime};
-    use std::collections::{HashMap, HashSet};
-    use std::fs::File;
-    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -23,14 +19,24 @@ pub mod server {
     // MAGIC and VERSION imported from crate::protocol
 
     // Use centralized timeout constants and functions from protocol module
-    use crate::protocol::timeouts::{write_deadline_ms, read_deadline_ms, FRAME_HEADER_MS};
+    use crate::protocol::timeouts::{read_deadline_ms, write_deadline_ms, FRAME_HEADER_MS};
+
+    #[inline]
+    fn debug_logs_enabled() -> bool {
+        std::env::var("BLIT_DEBUG_NET").is_ok()
+    }
 
     #[inline]
     async fn read_exact_timed<S>(stream: &mut S, buf: &mut [u8], ms: u64) -> Result<()>
-    where S: tokio::io::AsyncRead + Unpin
+    where
+        S: tokio::io::AsyncRead + Unpin,
     {
         use tokio::io::AsyncReadExt;
-        match timeout(Duration::from_millis(ms), async { stream.read_exact(buf).await }).await {
+        match timeout(Duration::from_millis(ms), async {
+            stream.read_exact(buf).await
+        })
+        .await
+        {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => anyhow::bail!("read timeout ({} ms)", ms),
@@ -40,7 +46,11 @@ pub mod server {
     #[inline]
     async fn write_all_timed(stream: &mut TcpStream, buf: &[u8], ms: u64) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        match timeout(Duration::from_millis(ms), async { stream.write_all(buf).await }).await {
+        match timeout(Duration::from_millis(ms), async {
+            stream.write_all(buf).await
+        })
+        .await
+        {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => anyhow::bail!("write timeout ({} ms)", ms),
@@ -53,7 +63,8 @@ pub mod server {
         payload: &[u8],
         ms: u64,
     ) -> Result<()>
-    where S: tokio::io::AsyncWrite + Unpin
+    where
+        S: tokio::io::AsyncWrite + Unpin,
     {
         match timeout(Duration::from_millis(ms), async {
             let hdr = crate::protocol_core::build_frame_header(t, payload.len() as u32);
@@ -71,14 +82,16 @@ pub mod server {
     }
 
     pub(crate) async fn write_frame<S>(stream: &mut S, t: u8, payload: &[u8]) -> Result<()>
-    where S: tokio::io::AsyncWrite + Unpin
+    where
+        S: tokio::io::AsyncWrite + Unpin,
     {
         let ms = write_deadline_ms(payload.len());
         write_frame_timed(stream, t, payload, ms).await
     }
 
     pub async fn read_frame<S>(stream: &mut S) -> Result<(u8, Vec<u8>)>
-    where S: tokio::io::AsyncRead + Unpin
+    where
+        S: tokio::io::AsyncRead + Unpin,
     {
         // Read header with base timeout
         let mut hdr = [0u8; 11];
@@ -91,11 +104,11 @@ pub mod server {
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => anyhow::bail!("frame header timeout ({} ms)", FRAME_HEADER_MS),
         }
-        
+
         // Use protocol_core helper to parse header
         let (typ, len_u32) = crate::protocol_core::parse_frame_header(&hdr)?;
         let len = len_u32 as usize;
-        
+
         // Validate frame size
         crate::protocol_core::validate_frame_size(len)?;
         let mut payload = vec![0u8; len];
@@ -107,7 +120,8 @@ pub mod server {
     }
 
     pub(crate) async fn read_frame_timed<S>(stream: &mut S, ms: u64) -> Result<(u8, Vec<u8>)>
-    where S: tokio::io::AsyncRead + Unpin
+    where
+        S: tokio::io::AsyncRead + Unpin,
     {
         match timeout(Duration::from_millis(ms), read_frame(stream)).await {
             Ok(res) => res,
@@ -120,1142 +134,48 @@ pub mod server {
         crate::protocol_core::normalize_under_root(root, p)
     }
 
-    pub async fn serve(bind: &str, root: &Path) -> Result<()> {
-        let listener = TcpListener::bind(bind)
-            .await
-            .with_context(|| format!("bind {}", bind))?;
-        eprintln!(
-            "blit async daemon listening on {} root={}",
-            bind,
-            root.display()
-        );
+    pub async fn serve(bind: &str, _root: &Path) -> Result<()> {
+        let listener = TcpListener::bind(bind).await.with_context(|| format!("bind {}", bind))?;
+        eprintln!("blit async daemon listening on {} (plaintext mode)", bind);
         loop {
             let (mut stream, peer) = listener.accept().await?;
             let _ = stream.set_nodelay(true);
             eprintln!("async conn from {}", peer);
-            // Spawn per-connection task.
-            let root = root.to_path_buf();
             tokio::spawn(async move {
-                if let Err(e) = async move {
-                    let started = Instant::now();
-                    // Expect START or LIST_REQ, reply accordingly
-                        let (typ, pl) = read_frame_timed(&mut stream, 500).await?;
-                        if typ == frame::LIST_REQ { // ListReq
-                        // payload: path_len u16 | absolute path bytes (under root)
-                        if pl.len() < 2 { anyhow::bail!("bad LIST_REQ payload"); }
-                        let nlen = u16::from_le_bytes([pl[0], pl[1]]) as usize;
-                        if pl.len() < 2 + nlen { anyhow::bail!("bad LIST_REQ path len"); }
-                        let pstr = std::str::from_utf8(&pl[2..2 + nlen]).unwrap_or("");
-                        // Resolve requested path under root; if it's a file, list its parent; if missing, list root
-                        let mut target = normalize_under_root(&root, Path::new(pstr))?;
-                        if !target.exists() || target.is_file() {
-                            target = target.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone());
-                        }
-                        let mut out: Vec<u8> = Vec::new();
-                        let mut items: Vec<(u8, String)> = Vec::new();
-                        
-                        // TUI pagination: Cap at 1000 entries to keep UI responsive
-                        const MAX_LIST_ENTRIES: usize = 1000;
-                        let mut entry_count = 0;
-                        
-                        if let Ok(rd) = std::fs::read_dir(&target) {
-                            for e in rd.flatten() {
-                                if entry_count >= MAX_LIST_ENTRIES {
-                                    // Add a special marker entry to indicate truncation
-                                    items.push((2u8, format!("... ({} entries max)", MAX_LIST_ENTRIES)));
-                                    break;
-                                }
-                                let name = e.file_name().to_string_lossy().to_string();
-                                let kind = match e.file_type() { Ok(ft) if ft.is_dir() => 1u8, _ => 0u8 };
-                                items.push((kind, name));
-                                entry_count += 1;
-                            }
-                        }
-                        
-                        // Sort entries: directories first, then files, alphabetically within each
-                        items.sort_by(|a, b| {
-                            match (a.0, b.0) {
-                                (1, 0) => std::cmp::Ordering::Less,    // dir before file
-                                (0, 1) => std::cmp::Ordering::Greater, // file after dir
-                                _ => a.1.cmp(&b.1),                    // alphabetical within type
-                            }
-                        });
-                        
-                        out.extend_from_slice(&(items.len() as u32).to_le_bytes());
-                        for (k, n) in items.into_iter() {
-                            out.push(k);
-                            out.extend_from_slice(&(n.len() as u16).to_le_bytes());
-                            out.extend_from_slice(n.as_bytes());
-                        }
-                        // 41 == ListResp
-                        write_frame(&mut stream, frame::LIST_RESP, &out).await?;
-                        return Ok::<(), anyhow::Error>(());
-                    }
-                    // 1 == FrameType::Start in sync path
-                    if typ != frame::START { anyhow::bail!("expected START frame"); }
-                    // Parse destination and flags: dest_len u16 | dest_bytes | flags u8
-                    let (base, flags) = if pl.len() >= 3 {
-                        let n = u16::from_le_bytes([pl[0], pl[1]]) as usize;
-                        if pl.len() >= 3 + n {
-                            let d = std::str::from_utf8(&pl[2..2 + n]).unwrap_or("");
-                            let p = normalize_under_root(&root, Path::new(d))?;
-                            let flags = pl[2 + n];
-                            (p, flags)
-                        } else {
-                            (root.clone(), 0)
-                        }
-                    } else {
-                        (root.clone(), 0)
-                    };
-                    let mirror = (flags & 0b0000_0001) != 0;
-                    let pull = (flags & 0b0000_0010) != 0;
-                    let include_empty_dirs = (flags & 0b0000_0100) != 0;
-                    let speed = (flags & 0b0000_1000) != 0;
-
-                    // 2 == FrameType::Ok
-                    write_frame(&mut stream, frame::OK, b"OK").await?;
-
-                    // Connection-scoped state with counters
-                    struct DeltaState {
-                        dst_path: PathBuf,
-                        file_size: u64,
-                        mtime: i64,
-                        granule: u64,
-                        sample: usize,
-                        need_ranges: Vec<(u64,u64)>,
-                    }
-                    struct Connection {
-                        expected_paths: HashSet<PathBuf>,
-                        needed: HashSet<String>,
-                        client_present: HashSet<String>,
-                        p_files: HashMap<u8, (PathBuf, File, u64, u64, i64)>,
-                        bytes_sent: u64,
-                        bytes_received: u64,
-                        files_sent: u64,
-                        files_received: u64,
-                        verify_batch: Vec<String>, // Collect paths for batch verification
-                    }
-                    let mut conn = Connection {
-                        expected_paths: HashSet::new(),
-                        needed: HashSet::new(),
-                        client_present: HashSet::new(),
-                        p_files: HashMap::new(),
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        files_sent: 0,
-                        files_received: 0,
-                        verify_batch: Vec::new(),
-                    };
-
-                    // Handle frames until Done
-                    let mut delta_state: Option<DeltaState> = None;
-                    loop {
-                        let (t, payload) = read_frame(&mut stream).await?;
-                        match t {
-                            // 14 == ManifestStart, 15 == ManifestEntry, 16 == ManifestEnd
-                            frame::MANIFEST_START => {
-                                // Compute need list from manifest
-                                conn.needed.clear();
-                                loop {
-                                    let (ti, pli) = read_frame_timed(&mut stream, 750).await?;
-                                    if ti == frame::MANIFEST_ENTRY {
-                                        if pli.len() < 3 {
-                                            anyhow::bail!("bad MANIFEST_ENTRY");
-                                        }
-                                        let kind = pli[0];
-                                        let nlen = u16::from_le_bytes([pli[1], pli[2]]) as usize;
-                                        if pli.len() < 3 + nlen {
-                                            anyhow::bail!("bad MANIFEST path len");
-                                        }
-                                        let rels =
-                                            std::str::from_utf8(&pli[3..3 + nlen]).unwrap_or("");
-                                        let relp = Path::new(rels);
-                                        let dst = normalize_under_root(&base, relp)?;
-                                        // Track what client reports as present
-                                        conn.client_present.insert(rels.to_string());
-                                        match kind {
-                                            0 => {
-                                                if pli.len() < 3 + nlen + 8 + 8 {
-                                                    anyhow::bail!("bad file entry");
-                                                }
-                                                let off = 3 + nlen;
-                                                let size = u64::from_le_bytes(
-                                                    pli[off..off + 8].try_into()
-                                                        .context("Invalid size bytes in FILE_START")?,
-                                                );
-                                                let mtime = i64::from_le_bytes(
-                                                    pli[off + 8..off + 16].try_into()
-                                                        .context("Invalid mtime bytes in FILE_START")?,
-                                                );
-                                                let mut need = true;
-                                                if let Ok(md) = std::fs::metadata(&dst) {
-                                                    if md.is_file() {
-                                                        let dsize = md.len();
-                                                        let dmtime = md
-                                                            .modified()
-                                                            .ok()
-                                                            .and_then(|t| {
-                                                                t.duration_since(
-                                                                    std::time::UNIX_EPOCH,
-                                                                )
-                                                                .ok()
-                                                            })
-                                                            .map(|d| d.as_secs() as i64)
-                                                            .unwrap_or(0);
-                                                        let dt = (dmtime - mtime).abs();
-                                                        need = !(dsize == size && dt <= 2);
-                                                    }
-                                                }
-                                                if need {
-                                                    conn.needed.insert(rels.to_string());
-                                                }
-                                                conn.expected_paths.insert(dst);
-                                            }
-                                            1 => {
-                                                // symlink
-                                                if pli.len() < 3 + nlen + 2 {
-                                                    anyhow::bail!("bad symlink entry");
-                                                }
-                                                let off = 3 + nlen;
-                                                let tlen =
-                                                    u16::from_le_bytes([pli[off], pli[off + 1]])
-                                                        as usize;
-                                                if pli.len() < off + 2 + tlen {
-                                                    anyhow::bail!("bad symlink target len");
-                                                }
-                                                let target = std::str::from_utf8(
-                                                    &pli[off + 2..off + 2 + tlen],
-                                                )
-                                                .unwrap_or("");
-                                                let mut need = true;
-                                                if let Ok(smd) = std::fs::symlink_metadata(&dst) {
-                                                    if smd.file_type().is_symlink() {
-                                                        if let Ok(cur) = std::fs::read_link(&dst) {
-                                                            if cur.as_os_str()
-                                                                == std::ffi::OsStr::new(target)
-                                                            {
-                                                                need = false;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                if need {
-                                                    conn.needed.insert(rels.to_string());
-                                                }
-                                                conn.expected_paths.insert(dst);
-                                            }
-                                            2 => {
-                                                std::fs::create_dir_all(&dst).ok();
-                                                conn.expected_paths.insert(dst);
-                                            }
-                                            _ => {}
-                                        }
-                                        continue;
-                                    } else if ti == frame::MANIFEST_END {
-                                        // Send NeedList with computed entries
-                                        let mut resp = Vec::with_capacity(4 + conn.needed.len() * 8);
-                                        resp.extend_from_slice(
-                                            &(conn.needed.len() as u32).to_le_bytes(),
-                                        );
-                                        for p in &conn.needed {
-                                            let b = p.as_bytes();
-                                            resp.extend_from_slice(&(b.len() as u16).to_le_bytes());
-                                            resp.extend_from_slice(b);
-                                        }
-                                        {
-    let payload_len = resp.len() as u64;
-    write_frame(&mut stream, frame::NEED_LIST, &resp).await?;
-    conn.bytes_sent += (payload_len as u64) + 11;
-}
-                                                                                      // If client is pulling, send files now
-                                        if pull {
-                                            // Directories first
-                                            if include_empty_dirs {
-                                                for ent in walkdir::WalkDir::new(&base)
-                                                    .follow_links(false)
-                                                    .into_iter()
-                                                    .filter_map(|e| e.ok())
-                                                {
-                                                    if ent.file_type().is_dir() {
-                                                        let rel = ent
-                                                            .path()
-                                                            .strip_prefix(&base)
-                                                            .unwrap_or(ent.path());
-                                                        if rel.as_os_str().is_empty() {
-                                                            continue;
-                                                        }
-                                                        let rels = rel.to_string_lossy();
-                                                        let mut plm =
-                                                            Vec::with_capacity(2 + rels.len());
-                                                        plm.extend_from_slice(
-                                                            &(rels.len() as u16).to_le_bytes(),
-                                                        );
-                                                        plm.extend_from_slice(rels.as_bytes());
-                                            write_frame(&mut stream, frame::MKDIR, &plm)
-                                                            .await?; // MkDir
-                                                    }
-                                                }
-                                            }
-                                            // Send needed or missing entries
-                                            // 1) Partition into small-file TAR bundle and per-file sends
-                                            let small_threshold: u64 = 1_000_000; // ~1MB
-                                            let mut small_files: Vec<(std::path::PathBuf, String, u64, u32)> = Vec::new();
-                                            let mut large_files: Vec<(std::path::PathBuf, String, u64, i64, u32)> = Vec::new();
-                                            for ent in walkdir::WalkDir::new(&base)
-                                                .follow_links(false)
-                                                .into_iter()
-                                                .filter_map(|e| e.ok())
-                                            {
-                                                let rel = ent
-                                                    .path()
-                                                    .strip_prefix(&base)
-                                                    .unwrap_or(ent.path());
-                                                if rel.as_os_str().is_empty() {
-                                                    continue;
-                                                }
-                                                let rels = rel.to_string_lossy().to_string();
-                                                let send_this = conn.needed.contains(&rels)
-                                                    || !conn.client_present.contains(&rels);
-                                                if !send_this {
-                                                    continue;
-                                                }
-                                                if ent.file_type().is_symlink() {
-                                                    if let Ok(t) = std::fs::read_link(ent.path()) {
-                                                        let targ = t.to_string_lossy();
-                                                        let mut pls = Vec::with_capacity(
-                                                            2 + rels.len() + 2 + targ.len(),
-                                                        );
-                                                        pls.extend_from_slice(
-                                                            &(rels.len() as u16).to_le_bytes(),
-                                                        );
-                                                        pls.extend_from_slice(rels.as_bytes());
-                                                        pls.extend_from_slice(
-                                                            &(targ.len() as u16).to_le_bytes(),
-                                                        );
-                                                        pls.extend_from_slice(targ.as_bytes());
-                                            write_frame(&mut stream, frame::SYMLINK, &pls)
-                                                            .await?; // Symlink
-                                                        // Count symlink as a sent item
-                                                        conn.files_sent = conn.files_sent.saturating_add(1);
-                                                    }
-                                                    continue;
-                                                }
-                                                if ent.file_type().is_file() {
-                                                    match ent.metadata() {
-                                                        Ok(md) => {
-                                                            let size = md.len();
-                                                            let mtime = md
-                                                                .modified()
-                                                                .ok()
-                                                                .and_then(|t| t
-                                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                                    .ok())
-                                                                .map(|d| d.as_secs() as i64)
-                                                                .unwrap_or(0);
-                                                            #[cfg(unix)]
-                                                            use std::os::unix::fs::PermissionsExt;
-                                                            let mode: u32 = {
-                                                                #[cfg(unix)]
-                                                                { md.permissions().mode() }
-                                                                #[cfg(not(unix))]
-                                                                { 0 }
-                                                            };
-                                                            if size <= small_threshold {
-                                                                small_files.push((ent.path().to_path_buf(), rels, size, mode));
-                                                            } else {
-                                                                large_files.push((ent.path().to_path_buf(), rels, size, mtime, mode));
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            eprintln!(
-                                                                "async pull: metadata failed {}: {}",
-                                                                ent.path().display(),
-                                                                e
-                                                            );
-                                                            continue;
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            // 2) Send TAR for small files if any
-                                            if !small_files.is_empty() {
-                                                // Start TAR sequence
-                                                write_frame(&mut stream, frame::TAR_START, &[]).await?;
-                                                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-                                                // Writer that batches into chunks and sends via blocking_send from blocking context
-                                                struct TarChanWriter {
-                                                    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-                                                    buf: Vec<u8>,
-                                                    cap: usize,
-                                                }
-                                                impl std::io::Write for TarChanWriter {
-                                                    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                                                        let mut rem = data;
-                                                        while !rem.is_empty() {
-                                                            let space = self.cap - self.buf.len();
-                                                            let take = rem.len().min(space);
-                                                            self.buf.extend_from_slice(&rem[..take]);
-                                                            rem = &rem[take..];
-                                                            if self.buf.len() >= self.cap {
-                                                                let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(self.cap));
-                                                                // blocking_send is fine in blocking context
-                                                                self.tx.blocking_send(chunk).map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
-                                                            }
-                                                        }
-                                                        Ok(data.len())
-                                                    }
-                                                    fn flush(&mut self) -> std::io::Result<()> {
-                                                        if !self.buf.is_empty() {
-                                                            let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(self.cap));
-                                                            self.tx.blocking_send(chunk).map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
-                                                        }
-                                                        Ok(())
-                                                    }
-                                                }
-                                                let files_for_tar = small_files.clone();
-                                                let chunk_size = if speed { 2 * 1024 * 1024 } else { 1024 * 1024 };
-                                                let tar_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                                                    let mut w = TarChanWriter { tx, buf: Vec::with_capacity(chunk_size), cap: chunk_size };
-                                                    {
-                                                        let mut builder = tar::Builder::new(&mut w);
-                                                        // Preserve original mtimes and modes from filesystem metadata
-                                                        for (src, rels, _size, _mode) in files_for_tar.into_iter() {
-                                                            let relp = std::path::Path::new(&rels);
-                                                            builder.append_path_with_name(&src, relp).context("append file to tar")?;
-                                                        }
-                                                        builder.finish().context("finish tar")?;
-                                                    }
-                                                    let _ = std::io::Write::flush(&mut w);
-                                                    Ok(())
-                                                });
-                                                // Forward chunks as TAR_DATA frames
-                                                while let Some(chunk) = rx.recv().await {
-                                                    let frame = chunk; // already owned
-                                                    write_frame(&mut stream, frame::TAR_DATA, &frame).await?;
-                                                    // Do not count tar frame bytes toward logical bytes_sent to match classic metrics
-                                                }
-                                                // Await tar task
-                                                match tar_task.await {
-                                                    Ok(Ok(())) => {}
-                                                    Ok(Err(e)) => anyhow::bail!("tar pack error: {}", e),
-                                                    Err(e) => anyhow::bail!("tar task join error: {}", e),
-                                                }
-                                                // End of TAR
-                                                write_frame(&mut stream, frame::TAR_END, &[]).await?;
-                                                // Update counters to align with classic: sum file sizes and count files
-                                                let total_small_bytes: u64 = small_files
-                                                    .iter()
-                                                    .map(|(_src, _rels, size, _mode)| *size)
-                                                    .sum();
-                                                conn.bytes_sent = conn.bytes_sent.saturating_add(total_small_bytes);
-                                                conn.files_sent = conn.files_sent.saturating_add(small_files.len() as u64);
-                                                // Optionally send POSIX modes explicitly for parity
-                                                #[cfg(unix)]
-                                                {
-                                                    for (_src, rels, _size, mode) in small_files.iter() {
-                                                        let mut pla = Vec::with_capacity(2 + rels.len() + 1 + 4);
-                                                        pla.extend_from_slice(&(rels.len() as u16).to_le_bytes());
-                                                        pla.extend_from_slice(rels.as_bytes());
-                                                        pla.push(0u8);
-                                                        pla.extend_from_slice(&mode.to_le_bytes());
-                                                write_frame(&mut stream, frame::SET_ATTR, &pla).await?;
-                                                    }
-                                                }
-                                            }
-
-                                            // 3) Send large files individually
-                                            for (src, rels, size, mtime, mode) in large_files.into_iter() {
-                                                let mut plf = Vec::with_capacity(2 + rels.len() + 8 + 8);
-                                                plf.extend_from_slice(&(rels.len() as u16).to_le_bytes());
-                                                plf.extend_from_slice(rels.as_bytes());
-                                                plf.extend_from_slice(&size.to_le_bytes());
-                                                plf.extend_from_slice(&mtime.to_le_bytes());
-                                            write_frame(&mut stream, frame::FILE_START, &plf).await?;
-                                                // Stream data
-                                                let mut f = match tokio::fs::File::open(&src).await {
-                                                    Ok(f) => f,
-                                                    Err(e) => { eprintln!("async pull: open failed {}: {}", src.display(), e); continue; }
-                                                };
-                                                let mut buf = vec![0u8; if speed { 4 * 1024 * 1024 } else { 2 * 1024 * 1024 }];
-                                                loop {
-                                                    use tokio::io::AsyncReadExt;
-                                                    let n = match f.read(&mut buf).await {
-                                                        Ok(n) => n,
-                                                        Err(e) => { eprintln!("async pull: read failed {}: {}", src.display(), e); break; }
-                                                    };
-                                                    if n == 0 { break; }
-                                                if let Err(e) = write_frame(&mut stream, frame::FILE_DATA, &buf[..n]).await {
-                                                        eprintln!("async pull: send chunk failed {}: {}", src.display(), e);
-                                                        return Err(e);
-                                                    }
-                                                    conn.bytes_sent = conn.bytes_sent.saturating_add(n as u64);
-                                                }
-                                            write_frame(&mut stream, frame::FILE_END, &[]).await?;
-                                                conn.files_sent = conn.files_sent.saturating_add(1);
-                                                // POSIX mode via SetAttr
-                                                #[cfg(unix)]
-                                                {
-                                                    let mut pla = Vec::with_capacity(2 + rels.len() + 1 + 4);
-                                                    pla.extend_from_slice(&(rels.len() as u16).to_le_bytes());
-                                                    pla.extend_from_slice(rels.as_bytes());
-                                                    pla.push(0u8);
-                                                    pla.extend_from_slice(&mode.to_le_bytes());
-                                                    write_frame(&mut stream, frame::SET_ATTR, &pla).await?;
-                                                }
-                                            }
-                                            // Done and wait for client OK
-                                            write_frame(&mut stream, frame::DONE, &[]).await?;
-                                let (tt, _plok) = read_frame_timed(&mut stream, 500).await?;
-                                            if tt != frame::OK {
-                                                anyhow::bail!("client did not ack DONE");
-                                            }
-                                            return Ok::<(), anyhow::Error>(());
-                                        }
-                                        break;
-                                    } else {
-                                        anyhow::bail!("unexpected frame during manifest: {}", ti);
-                                    }
-                                }
-                            }
-                            // 8 == TarStart, 9 == TarData, 10 == TarEnd
-                            frame::TAR_START => {
-                                // Streaming tar unpack without temp files.
-                                // Use a bounded channel to feed a blocking unpacker.
-                                let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
-                                let (res_tx, res_rx) = tokio::sync::oneshot::channel::<(u64,u64)>();
-                                struct ChanReader {
-                                    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-                                    buf: Vec<u8>,
-                                    pos: usize,
-                                    done: bool,
-                                }
-                                impl std::io::Read for ChanReader {
-                                    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-                                        if self.done { return Ok(0); }
-                                        if self.pos >= self.buf.len() {
-                                            match self.rx.blocking_recv() {
-                                                Some(chunk) => { self.buf = chunk; self.pos = 0; }
-                                                None => { self.done = true; return Ok(0); }
-                                            }
-                                        }
-                                        let n = out.len().min(self.buf.len() - self.pos);
-                                        if n > 0 { out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]); self.pos += n; }
-                                        Ok(n)
-                                    }
-                                }
-                                let base_dir = base.clone();
-                                let unpacker = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                                    let reader = ChanReader { rx, buf: Vec::new(), pos: 0, done: false };
-                                    let mut ar = tar::Archive::new(reader);
-                                    ar.set_overwrite(true);
-                                    let mut files: u64 = 0;
-                                    let mut bytes: u64 = 0;
-                                    let entries = ar.entries().context("tar entries")?;
-                                    for e in entries {
-                                        let mut entry = e.context("tar entry")?;
-                                        let et = entry.header().entry_type();
-                                        if et.is_file() {
-                                            if let Ok(sz) = entry.header().size() { bytes = bytes.saturating_add(sz); files = files.saturating_add(1); }
-                                        }
-                                        entry.unpack_in(&base_dir).context("unpack entry")?;
-                                    }
-                                    let _ = res_tx.send((files, bytes));
-                                    Ok(())
-                                });
-                                // Feed frames to unpacker
-                                loop {
-                                    let (ti, pli) = read_frame_timed(&mut stream, 750).await?;
-                                    if ti == frame::TAR_DATA {
-                                        let sz = pli.len() as u64;
-                                        if tx.send(pli).await.is_err() { anyhow::bail!("tar unpacker closed"); }
-                                        let _ = sz; // transport bytes ignored; use logical bytes from unpacker
-                                        continue;
-                                    }
-                                    if ti == frame::TAR_END { break; }
-                                    anyhow::bail!("unexpected frame during tar: {}", ti);
-                                }
-                                drop(tx);
-                                // Await unpack completion
-                                match unpacker.await {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(e)) => { anyhow::bail!("tar unpack error: {}", e); }
-                                    Err(join_err) => { anyhow::bail!("tar unpack task error: {}", join_err); }
-                                }
-                                if let Ok((files, bytes)) = res_rx.await { conn.files_received = conn.files_received.saturating_add(files); conn.bytes_received = conn.bytes_received.saturating_add(bytes); }
-                                write_frame(&mut stream, frame::OK, b"TAR_OK").await?;
-                            }
-                            // 11 == PFileStart, 12 == PFileData, 13 == PFileEnd
-                            frame::PFILE_START => {
-                                if payload.len() < 1 + 2 {
-                                    anyhow::bail!("bad PFILE_START");
-                                }
-                                let sid = payload[0];
-                                let nlen = u16::from_le_bytes([payload[1], payload[2]]) as usize;
-                                if payload.len() < 1 + 2 + nlen + 8 + 8 {
-                                    anyhow::bail!("bad PFILE_START len");
-                                }
-                                let rel = std::str::from_utf8(&payload[3..3 + nlen]).unwrap_or("");
-                                let mut off = 3 + nlen;
-                                let size =
-                                    u64::from_le_bytes(payload[off..off + 8].try_into()
-                                        .context("Invalid size bytes in FILE_START")?);
-                                off += 8;
-                                let mtime =
-                                    i64::from_le_bytes(payload[off..off + 8].try_into()
-                                        .context("Invalid mtime bytes in FILE_START")?);
-                                let dst = normalize_under_root(&base, Path::new(rel))?;
-                                if let Some(parent) = dst.parent() {
-                                    std::fs::create_dir_all(parent).ok();
-                                }
-                                let f = File::create(&dst)
-                                    .with_context(|| format!("create {}", dst.display()))?;
-                                let _ = f.set_len(size);
-                                conn.expected_paths.insert(dst.clone());
-                                conn.p_files.insert(sid, (dst, f, size, 0, mtime));
-                            }
-                            frame::PFILE_DATA => {
-                                if payload.len() < 1 {
-                                    anyhow::bail!("bad PFILE_DATA");
-                                }
-                                let sid = payload[0];
-                                if let Some((_p, f, _sz, ref mut written, _mt)) =
-                                    conn.p_files.get_mut(&sid)
-                                {
-                                    let data = &payload[1..];
-                                    let is_zero = data.iter().all(|&b| b == 0);
-                                    if is_zero && data.len() >= 128 * 1024 {
-                                        use std::io::{Seek, SeekFrom};
-                                        let _ = f.seek(SeekFrom::Current(data.len() as i64));
-                                    } else {
-                                        f.write_all(data).context("write PFILE_DATA")?;
-                                    }
-                                    *written += data.len() as u64;
-                                    conn.bytes_received = conn.bytes_received.saturating_add(data.len() as u64);
-                                } else {
-                                    anyhow::bail!("PFILE_DATA unknown stream");
-                                }
-                            }
-                            frame::PFILE_END => {
-                                if payload.len() < 1 {
-                                    anyhow::bail!("bad PFILE_END");
-                                }
-                                let sid = payload[0];
-                                if let Some((p, _f, sz, written, mt)) = conn.p_files.remove(&sid) {
-                                    if written != sz {
-                                        eprintln!(
-                                            "async short write: {} {}/{}",
-                                            p.display(),
-                                            written,
-                                            sz
-                                        );
-                                    }
-                                    let ft = FileTime::from_unix_time(mt, 0);
-                                    let _ = set_file_mtime(&p, ft);
-                                    conn.files_received = conn.files_received.saturating_add(1);
-                                }
-                            }
-                            // 19 == MkDir
-                            19u8 => {
-                                if payload.len() < 2 {
-                                    anyhow::bail!("bad MKDIR");
-                                }
-                                let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                                if payload.len() < 2 + nlen {
-                                    anyhow::bail!("bad MKDIR payload");
-                                }
-                                let rel = std::str::from_utf8(&payload[2..2 + nlen]).unwrap_or("");
-                                let dir_path = normalize_under_root(&base, Path::new(rel))?;
-                                let _ = std::fs::create_dir_all(&dir_path);
-                                conn.expected_paths.insert(dir_path);
-                            }
-                            // 18 == Symlink
-                            frame::SYMLINK => {
-                                if payload.len() < 2 {
-                                    anyhow::bail!("bad SYMLINK");
-                                }
-                                let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                                if payload.len() < 2 + nlen + 2 {
-                                    anyhow::bail!("bad SYMLINK payload");
-                                }
-                                let rel = std::str::from_utf8(&payload[2..2 + nlen]).unwrap_or("");
-                                let off = 2 + nlen;
-                                let tlen =
-                                    u16::from_le_bytes([payload[off], payload[off + 1]]) as usize;
-                                if payload.len() < off + 2 + tlen {
-                                    anyhow::bail!("bad SYMLINK target len");
-                                }
-                                let target = std::str::from_utf8(&payload[off + 2..off + 2 + tlen])
-                                    .unwrap_or("");
-                                let dst_path = normalize_under_root(&base, Path::new(rel))?;
-                                if let Some(parent) = dst_path.parent() {
-                                    std::fs::create_dir_all(parent).ok();
-                                }
-                                #[cfg(unix)]
-                                {
-                                    let _ = std::fs::remove_file(&dst_path);
-                                    std::os::unix::fs::symlink(target, &dst_path).ok();
-                                }
-                                #[cfg(windows)]
-                                {
-                                    let _ = std::fs::remove_file(&dst_path);
-                                    let _ = std::fs::remove_dir(&dst_path);
-                                    let _ = crate::win_fs::create_symlink(Path::new(target), &dst_path);
-                                }
-                                conn.expected_paths.insert(dst_path);
-                                conn.files_received = conn.files_received.saturating_add(1);
-                            }
-                            // 30 == SetAttr (flags + optional POSIX mode)
-                            frame::SET_ATTR => {
-                                if payload.len() < 2 + 1 {
-                                    anyhow::bail!("bad SET_ATTR");
-                                }
-                                let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                                if payload.len() < 2 + nlen + 1 {
-                                    anyhow::bail!("bad SET_ATTR payload");
-                                }
-                                let rel = std::str::from_utf8(&payload[2..2 + nlen]).unwrap_or("");
-                                let flags = payload[2 + nlen];
-                                let dst = normalize_under_root(&base, Path::new(rel))?;
-                                #[cfg(windows)]
-                                {
-                                    use std::os::windows::ffi::OsStrExt;
-                                    use windows::core::PCWSTR;
-                                    use windows::Win32::Storage::FileSystem::{
-                                        GetFileAttributesW, SetFileAttributesW,
-                                        FILE_ATTRIBUTE_READONLY, FILE_FLAGS_AND_ATTRIBUTES,
-                                    };
-                                    let wide: Vec<u16> = dst
-                                        .as_os_str()
-                                        .encode_wide()
-                                        .chain(std::iter::once(0))
-                                        .collect();
-                                    unsafe {
-                                        let mut attrs = GetFileAttributesW(PCWSTR(wide.as_ptr()));
-                                        if attrs == u32::MAX {
-                                            attrs = 0;
-                                        }
-                                        if (flags & 0b0000_0001) != 0 {
-                                            attrs |= FILE_ATTRIBUTE_READONLY.0;
-                                        } else {
-                                            attrs &= !FILE_ATTRIBUTE_READONLY.0;
-                                        }
-                                        let _ = SetFileAttributesW(
-                                            PCWSTR(wide.as_ptr()),
-                                            FILE_FLAGS_AND_ATTRIBUTES(attrs),
-                                        );
-                                    }
-                                }
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    // Optional POSIX mode trailing (u32 LE)
-                                    if payload.len() >= 2 + nlen + 1 + 4 {
-                                        let off = 2 + nlen + 1;
-                                        let mode = u32::from_le_bytes([
-                                            payload[off],
-                                            payload[off + 1],
-                                            payload[off + 2],
-                                            payload[off + 3],
-                                        ]);
-                                        let _ = std::fs::set_permissions(
-                                            &dst,
-                                            std::fs::Permissions::from_mode(mode),
-                                        );
-                                    }
-                                }
-                                let _ = flags;
-                            }
-                            // 31 == VerifyReq - collect for batch processing
-                            frame::VERIFY_REQ => {
-                                if payload.len() < 2 {
-                                    anyhow::bail!("bad VERIFY_REQ");
-                                }
-                                let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                                if payload.len() < 2 + nlen {
-                                    anyhow::bail!("bad VERIFY_REQ len");
-                                }
-                                let rel = std::str::from_utf8(&payload[2..2 + nlen]).unwrap_or("");
-                                
-                                // Add to batch for processing when VERIFY_DONE is received
-                                conn.verify_batch.push(rel.to_string());
-                                
-                                // Note: We don't send a response yet - wait for VERIFY_DONE
-                            }
-                            
-                            // 33 == VerifyDone - process all batched verify requests
-                            frame::VERIFY_DONE => {
-                                // Process all batched verify requests
-                                for rel in &conn.verify_batch {
-                                    let path = normalize_under_root(&base, Path::new(rel))?;
-                                    
-                                    // Build response: [status:1][pathlen:2][path:n][hash:32]
-                                    // Status: 0=OK, 1=NOT_FOUND, 2=ERROR
-                                    let mut response = Vec::new();
-                                    
-                                    match std::fs::File::open(&path) {
-                                        Ok(mut f) => {
-                                            // File exists and is readable
-                                            response.push(0u8); // Status: OK
-                                            
-                                            // Echo back the path
-                                            let path_bytes = rel.as_bytes();
-                                            response.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
-                                            response.extend_from_slice(path_bytes);
-                                            
-                                            // Compute and append hash
-                                            let mut hasher = blake3::Hasher::new();
-                                            let mut buf = vec![0u8; 4 * 1024 * 1024];
-                                            loop {
-                                                use std::io::Read as _;
-                                                match f.read(&mut buf) {
-                                                    Ok(0) => break,
-                                                    Ok(n) => { hasher.update(&buf[..n]); },
-                                                    Err(_) => {
-                                                        // Read error during hashing
-                                                        response[0] = 2; // Change status to ERROR
-                                                        response.extend_from_slice(&[0u8; 32]); // Zero hash
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            
-                                            if response[0] == 0 {
-                                                let hash = hasher.finalize();
-                                                response.extend_from_slice(hash.as_bytes());
-                                            }
-                                        }
-                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                            // File doesn't exist
-                                            response.push(1u8); // Status: NOT_FOUND
-                                            
-                                            // Echo back the path
-                                            let path_bytes = rel.as_bytes();
-                                            response.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
-                                            response.extend_from_slice(path_bytes);
-                                            
-                                            // No hash for missing files
-                                            response.extend_from_slice(&[0u8; 32]);
-                                        }
-                                        Err(_) => {
-                                            // Other error (permissions, etc.)
-                                            response.push(2u8); // Status: ERROR
-                                            
-                                            // Echo back the path
-                                            let path_bytes = rel.as_bytes();
-                                            response.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
-                                            response.extend_from_slice(path_bytes);
-                                            
-                                            // No hash on error
-                                            response.extend_from_slice(&[0u8; 32]);
-                                        }
-                                    }
-                                    
-                                    // Send each response
-                                    write_frame(&mut stream, frame::VERIFY_HASH, &response).await?;
-                                }
-                                
-                                // Clear the batch
-                                conn.verify_batch.clear();
-                                
-                                // Send DONE to signal batch complete
-                                write_frame(&mut stream, frame::DONE, &[]).await?;
-                            }
-                            // 29 == FileRawStart (followed by raw body bytes, not framed)
-                            frame::FILE_RAW_START => {
-                                if payload.len() < 2 + 8 + 8 {
-                                    anyhow::bail!("bad FILE_RAW_START");
-                                }
-                                let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                                if payload.len() < 2 + nlen + 8 + 8 {
-                                    anyhow::bail!("bad FILE_RAW_START len");
-                                }
-                                let rel = std::str::from_utf8(&payload[2..2 + nlen]).unwrap_or("");
-                                let mut off = 2 + nlen;
-                                let size =
-                                    u64::from_le_bytes(payload[off..off + 8].try_into()
-                                        .context("Invalid size bytes in FILE_START")?);
-                                off += 8;
-                                let mtime =
-                                    i64::from_le_bytes(payload[off..off + 8].try_into()
-                                        .context("Invalid mtime bytes in FILE_START")?);
-                                let dst = normalize_under_root(&base, Path::new(rel))?;
-                                if let Some(parent) = dst.parent() {
-                                    std::fs::create_dir_all(parent).ok();
-                                }
-                                let mut f = File::create(&dst)
-                                    .with_context(|| format!("create {}", dst.display()))?;
-                                let _ = f.set_len(size);
-                                // Read raw body bytes directly from stream (sparse-friendly) with deadlines
-                                let mut remaining = size as usize;
-                                let mut buf = vec![0u8; 4 * 1024 * 1024];
-                                use std::io::{Seek, SeekFrom};
-                                while remaining > 0 {
-                                    let to_read = remaining.min(buf.len());
-                                    let ms = crate::protocol::timeouts::READ_BASE_MS + ((to_read as u64 + 1_048_575) / 1_048_576) * crate::protocol::timeouts::PER_MB_MS;
-                                    let n = match timeout(Duration::from_millis(ms), async { stream.read(&mut buf[..to_read]).await }).await {
-                                        Ok(Ok(n)) => n,
-                                        Ok(Err(e)) => return Err(e.into()),
-                                        Err(_) => anyhow::bail!("raw body read timeout"),
-                                    };
-                                    if n == 0 {
-                                        anyhow::bail!("unexpected EOF during raw file body");
-                                    }
-                                    let is_zero = buf[..n].iter().all(|&b| b == 0);
-                                    if is_zero && n >= 128 * 1024 {
-                                        let _ = f.seek(SeekFrom::Current(n as i64));
-                                    } else {
-                                        f.write_all(&buf[..n]).context("write raw file body")?;
-                                    }
-                                    remaining -= n;
-                                    conn.bytes_received = conn.bytes_received.saturating_add(n as u64);
-                                }
-                                let ft = FileTime::from_unix_time(mtime, 0);
-                                let _ = set_file_mtime(&dst, ft);
-                                conn.expected_paths.insert(dst);
-                                conn.files_received = conn.files_received.saturating_add(1);
-                            }
-                            // 21 == DeltaStart, 22 == DeltaSample, 23 == DeltaEnd
-                            frame::DELTA_START => {
-                                // payload: nlen u16 | rel bytes | size u64 | mtime i64 | granule u32 | sample u32
-                                if payload.len() < 2 + 8 + 8 + 4 + 4 { anyhow::bail!("bad DELTA_START"); }
-                                let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                                if payload.len() < 2 + nlen + 8 + 8 + 4 + 4 { anyhow::bail!("bad DELTA_START len"); }
-                                let rels = std::str::from_utf8(&payload[2..2+nlen]).unwrap_or("");
-                                let mut off = 2 + nlen;
-                                let fsize = u64::from_le_bytes(payload[off..off+8].try_into()
-                                    .context("Invalid size bytes in NEED")?); off+=8;
-                                let fmtime = i64::from_le_bytes(payload[off..off+8].try_into()
-                                    .context("Invalid mtime bytes in NEED")?); off+=8;
-                                let granule = u32::from_le_bytes(payload[off..off+4].try_into()
-                                    .context("Invalid granule bytes in NEED")?) as u64; off+=4;
-                                let sample = u32::from_le_bytes(payload[off..off+4].try_into()
-                                    .context("Invalid sample bytes in NEED")?) as usize;
-                                let dst = normalize_under_root(&base, Path::new(rels))?;
-                                if let Some(parent) = dst.parent() { std::fs::create_dir_all(parent).ok(); }
-                                let mut f = File::options().create(true).read(true).write(true).open(&dst)?;
-                                let _ = f.set_len(fsize);
-                                drop(f);
-                                delta_state = Some(DeltaState{ dst_path: dst, file_size: fsize, mtime: fmtime, granule, sample, need_ranges: Vec::new() });
-                            }
-                            frame::DELTA_SAMPLE => {
-                                // payload: offset u64 | hash_len u16 | hash bytes
-                                if payload.len() < 8 + 2 { anyhow::bail!("bad DELTA_SAMPLE"); }
-                                let off = u64::from_le_bytes(payload[0..8].try_into()
-                                    .context("Invalid offset bytes in DELTA_SAMPLE")?);
-                                let hlen = u16::from_le_bytes(payload[8..10].try_into()
-                                    .context("Invalid hash length bytes in DELTA_SAMPLE")?) as usize;
-                                if payload.len() < 10 + hlen { anyhow::bail!("bad DELTA_SAMPLE hash len"); }
-                                let hashc = &payload[10..10+hlen];
-                                if let Some(ds) = delta_state.as_mut() {
-                                    if let Ok(mut f) = File::open(&ds.dst_path) {
-                                        use std::io::{Read, Seek, SeekFrom};
-                                        let mut buf = vec![0u8; ds.sample];
-                                        let _ = f.seek(SeekFrom::Start(off));
-                                        let n = f.read(&mut buf).unwrap_or(0);
-                                        let n = std::cmp::min(n, ds.sample);
-                                        let h = blake3::hash(&buf[..n]);
-                                        if h.as_bytes() != hashc {
-                                            let start = (off / ds.granule) * ds.granule;
-                                            let end = (start + ds.granule).min(ds.file_size);
-                                            ds.need_ranges.push((start, end - start));
-                                        }
-                                    } else {
-                                        ds.need_ranges.clear();
-                                        ds.need_ranges.push((0, ds.file_size));
-                                    }
-                                }
-                            }
-                            frame::DELTA_END => {
-                                // Coalesce and send NeedRanges
-                                if let Some(ds) = delta_state.as_mut() {
-                                    let mut v = std::mem::take(&mut ds.need_ranges);
-                                    v.sort_by_key(|r| r.0);
-                                    let mut coalesced: Vec<(u64,u64)> = Vec::new();
-                                    for (mut s_off, mut s_len) in v.into_iter() {
-                                        if let Some(last) = coalesced.last_mut() {
-                                            let last_end = last.0 + last.1;
-                                            if s_off <= last_end { let new_end = (s_off + s_len).max(last_end); last.1 = new_end - last.0; continue; }
-                                        }
-                                        coalesced.push((s_off, s_len));
-                                    }
-                                    let mut hdr = Vec::with_capacity(4);
-                                    hdr.extend_from_slice(&(coalesced.len() as u32).to_le_bytes());
-                                    write_frame(&mut stream, frame::NEED_RANGES_START, &hdr).await?;
-                                    for (off, len) in &coalesced {
-                                        let mut pl = Vec::with_capacity(16);
-                                        pl.extend_from_slice(&off.to_le_bytes());
-                                        pl.extend_from_slice(&len.to_le_bytes());
-                                        write_frame(&mut stream, frame::NEED_RANGE, &pl).await?;
-                                    }
-                                    write_frame(&mut stream, frame::NEED_RANGES_END, &[]).await?;
-                                    ds.need_ranges = coalesced;
-                                } else {
-                                    write_frame(&mut stream, frame::NEED_RANGES_START, &0u32.to_le_bytes()).await?;
-                                    write_frame(&mut stream, frame::NEED_RANGES_END, &[]).await?;
-                                }
-                            }
-                            frame::DELTA_DATA => {
-                                // payload: offset u64 | data bytes
-                                if payload.len() < 8 { anyhow::bail!("bad DELTA_DATA"); }
-                                let off = u64::from_le_bytes(payload[0..8].try_into()
-                                    .context("Invalid offset bytes in DELTA_DATA")?);
-                                let data = &payload[8..];
-                                if let Some(ds) = delta_state.as_ref() {
-                                    use std::io::{Seek, SeekFrom, Write};
-                                    let mut f = File::options().read(true).write(true).open(&ds.dst_path)?;
-                                    let _ = f.seek(SeekFrom::Start(off));
-                                    if off.saturating_add(data.len() as u64) > ds.file_size { anyhow::bail!("DELTA_DATA out of range"); }
-                                    f.write_all(data)?;
-                                    conn.bytes_received = conn.bytes_received.saturating_add(data.len() as u64);
-                                }
-                            }
-                            frame::DELTA_DONE => {
-                                if let Some(ds) = delta_state.take() {
-                                    let ft = FileTime::from_unix_time(ds.mtime, 0);
-                                    let _ = set_file_mtime(&ds.dst_path, ft);
-                                    conn.expected_paths.insert(ds.dst_path.clone());
-                                    conn.files_received = conn.files_received.saturating_add(1);
-                                }
-                                write_frame(&mut stream, frame::OK, b"OK").await?;
-                            }
-                            // 7 == Done
-                            frame::DONE => {
-                                // Mirror delete if requested
-                                if mirror {
-                                    let mut all_dirs: Vec<PathBuf> = Vec::new();
-                                    #[cfg(windows)]
-                                    fn keyify(p: &Path) -> String { p.to_string_lossy().to_ascii_lowercase() }
-                                    #[cfg(not(windows))]
-                                    fn keyify(p: &Path) -> String { p.to_string_lossy().to_string() }
-                                    #[cfg(windows)]
-                                    let expected_set: std::collections::HashSet<String> = conn
-                                        .expected_paths
-                                        .iter()
-                                        .map(|p| keyify(p))
-                                        .collect();
-                                    #[cfg(not(windows))]
-                                    let expected_set: std::collections::HashSet<String> = conn
-                                        .expected_paths
-                                        .iter()
-                                        .map(|p| keyify(p))
-                                        .collect();
-                                    for e in walkdir::WalkDir::new(&base)
-                                        .into_iter()
-                                        .filter_map(|e| e.ok())
-                                    {
-                                        let p = e.path().to_path_buf();
-                                        if e.file_type().is_dir() {
-                                            all_dirs.push(p);
-                                            continue;
-                                        }
-                                        if e.file_type().is_file() || e.file_type().is_symlink() {
-                                            if !expected_set.contains(&keyify(&p)) {
-                                                #[cfg(windows)]
-                                                crate::win_fs::clear_readonly_recursive(&p);
-                                                let _ = std::fs::remove_file(&p);
-                                            }
-                                        }
-                                    }
-                                    all_dirs
-                                        .sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-                                    for d in all_dirs {
-                                        if !expected_set.contains(&keyify(&d)) {
-                                            #[cfg(windows)]
-                                            crate::win_fs::clear_readonly_recursive(&d);
-                                            let _ = std::fs::remove_dir(&d);
-                                        }
-                                    }
-                                }
-                                write_frame(&mut stream, frame::OK, b"OK").await?;
-                                // Log connection counters and elapsed time
-                                let elapsed_ms = started.elapsed().as_millis();
-                                eprintln!(
-                                    "Connection summary: files_sent={}, bytes_sent={}, files_received={}, bytes_received={}, elapsed_ms={}",
-                                    conn.files_sent, conn.bytes_sent, conn.files_received, conn.bytes_received, elapsed_ms
-                                );
-                                break;
-                            }
-                            // Ignore range frames until implemented
-                            frame::NEED_RANGES_START | frame::NEED_RANGE | frame::NEED_RANGES_END => {
-                                let _ = payload;
-                                // For now, do nothing; future work will implement.
-                                continue;
-                            }
-                            // Remove tree request (for move when src is remote)
-                            frame::REMOVE_TREE_REQ => {
-                                if payload.len() < 2 { anyhow::bail!("bad REMOVE_TREE_REQ"); }
-                                let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                                if payload.len() < 2 + nlen { anyhow::bail!("bad REMOVE_TREE_REQ len"); }
-                                let rel = std::str::from_utf8(&payload[2..2+nlen]).unwrap_or("");
-                                let base_path = normalize_under_root(&base, Path::new(rel))?;
-                                // Delete files then dirs (deepest-first)
-                                let mut err: Option<String> = None;
-                                if base_path.exists() {
-                                    let mut dirs: Vec<PathBuf> = Vec::new();
-                                    for e in walkdir::WalkDir::new(&base_path).into_iter().filter_map(|e| e.ok()) {
-                                        let p = e.path().to_path_buf();
-                                        if e.file_type().is_dir() { dirs.push(p); continue; }
-                                        if e.file_type().is_file() || e.file_type().is_symlink() {
-                                            #[cfg(windows)]
-                                            crate::win_fs::clear_readonly_recursive(&p);
-                                            if let Err(e) = std::fs::remove_file(&p) { err = Some(format!("{}", e)); break; }
-                                        }
-                                    }
-                                    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-                                    if err.is_none() {
-                                        for d in dirs { 
-                                            #[cfg(windows)]
-                                            crate::win_fs::clear_readonly_recursive(&d);
-                                            let _ = std::fs::remove_dir(&d); 
-                                        }
-                                        #[cfg(windows)]
-                                        crate::win_fs::clear_readonly_recursive(&base_path);
-                                        let _ = std::fs::remove_dir(&base_path);
-                                    }
-                                }
-                                let mut resp = Vec::with_capacity(1 + 128);
-                                if let Some(e) = err { resp.push(1u8); resp.extend_from_slice(e.as_bytes()); } else { resp.push(0u8); }
-                                write_frame(&mut stream, frame::REMOVE_TREE_RESP, &resp).await?;
-                            }
-                            _ => {
-                                anyhow::bail!("unexpected frame: {}", t);
-                            }
-                        }
-                    }
-                    Ok::<(), anyhow::Error>(())
-                }
-                .await
-                {
-                    eprintln!("async connection error: {}", e);
+                // Politely inform client that plaintext mode is disabled by default
+                if let Ok((_t,_pl)) = read_frame_timed(&mut stream, 1000).await {
+                    let _ = write_frame(&mut stream, frame::ERROR, b"plaintext mode disabled; use TLS").await;
                 }
             });
         }
     }
-
-    pub async fn serve_with_tls(bind: &str, root: &Path, tls_config: rustls::ServerConfig) -> Result<()> {
-        use tokio_rustls::TlsAcceptor;
+pub async fn serve_with_tls(
+        bind: &str,
+        root: &Path,
+        tls_config: rustls::ServerConfig,
+    ) -> Result<()> {
         use std::sync::Arc;
-        
+        use tokio_rustls::TlsAcceptor;
+
         let listener = TcpListener::bind(bind)
             .await
             .with_context(|| format!("bind {}", bind))?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-        
+
         eprintln!(
             "blit async daemon (TLS) listening on {} root={}",
             bind,
             root.display()
         );
-        
+
         loop {
             let (tcp_stream, peer) = listener.accept().await?;
             let _ = tcp_stream.set_nodelay(true);
             eprintln!("async TLS conn from {}", peer);
-            
+
             let acceptor = acceptor.clone();
             let root = root.to_path_buf();
-            
+
             tokio::spawn(async move {
                 // Perform TLS handshake
                 let mut stream = match acceptor.accept(tcp_stream).await {
@@ -1268,17 +188,35 @@ pub mod server {
                 if let Err(e) = async move {
                     let started = Instant::now();
                     // Expect START or LIST_REQ, reply accordingly
-                    let (typ, pl) = read_frame_timed(&mut stream, 500).await?;
+                    let (typ, pl) = read_frame_timed(&mut stream, 2500).await?;
                     if typ == frame::LIST_REQ {
                         // payload: path_len u16 | absolute path bytes (under root)
-                        if pl.len() < 2 { anyhow::bail!("bad LIST_REQ payload"); }
+                        if pl.len() < 2 {
+                            anyhow::bail!("bad LIST_REQ payload");
+                        }
                         let nlen = u16::from_le_bytes([pl[0], pl[1]]) as usize;
-                        if pl.len() < 2 + nlen { anyhow::bail!("bad LIST_REQ path len"); }
-                        let pstr = std::str::from_utf8(&pl[2..2 + nlen]).unwrap_or("");
+                        if pl.len() < 2 + nlen {
+                            anyhow::bail!("bad LIST_REQ path len");
+                        }
+                        let pbytes = &pl[2..2 + nlen];
+                        let preq_raw = std::str::from_utf8(pbytes).unwrap_or("");
+                        let mut rel = PathBuf::new();
+                        for comp in Path::new(preq_raw).components() {
+                            use std::path::Component::*;
+                            match comp {
+                                RootDir | CurDir => continue,
+                                ParentDir => continue,
+                                Normal(s) => rel.push(s),
+                                Prefix(_) => continue,
+                            }
+                        }
                         // Resolve requested path under root; if it's a file, list its parent; if missing, list root
-                        let mut target = normalize_under_root(&root, Path::new(pstr))?;
+                        let mut target = normalize_under_root(&root, &rel)?;
                         if !target.exists() || target.is_file() {
-                            target = target.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone());
+                            target = target
+                                .parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| root.clone());
                         }
                         let mut out: Vec<u8> = Vec::new();
                         let mut items: Vec<(u8, String)> = Vec::new();
@@ -1287,11 +225,17 @@ pub mod server {
                         if let Ok(rd) = std::fs::read_dir(&target) {
                             for e in rd.flatten() {
                                 if entry_count >= MAX_LIST_ENTRIES {
-                                    items.push((2u8, format!("... ({} entries max)", MAX_LIST_ENTRIES)));
+                                    items.push((
+                                        2u8,
+                                        format!("... ({} entries max)", MAX_LIST_ENTRIES),
+                                    ));
                                     break;
                                 }
                                 let name = e.file_name().to_string_lossy().to_string();
-                                let kind = match e.file_type() { Ok(ft) if ft.is_dir() => 1u8, _ => 0u8 };
+                                let kind = match e.file_type() {
+                                    Ok(ft) if ft.is_dir() => 1u8,
+                                    _ => 0u8,
+                                };
                                 items.push((kind, name));
                                 entry_count += 1;
                             }
@@ -1310,26 +254,39 @@ pub mod server {
                         write_frame(&mut stream, frame::LIST_RESP, &out).await?;
                         return Ok::<(), anyhow::Error>(());
                     }
-                    if typ != frame::START { anyhow::bail!("expected START frame"); }
+                    if typ != frame::START {
+                        anyhow::bail!("expected START frame");
+                    }
                     // Parse destination and flags: dest_len u16 | dest_bytes | flags u8
                     let (base, flags) = if pl.len() >= 3 {
                         let n = u16::from_le_bytes([pl[0], pl[1]]) as usize;
                         if pl.len() >= 3 + n {
                             let d = std::str::from_utf8(&pl[2..2 + n]).unwrap_or("");
-                            let p = normalize_under_root(&root, Path::new(d))?;
+                            // Sanitize absolute/relative components similar to LIST_REQ
+                            let mut rel = PathBuf::new();
+                            for comp in Path::new(d).components() {
+                                use std::path::Component::*;
+                                match comp {
+                                    RootDir | Prefix(_) | CurDir => continue,
+                                    ParentDir => continue,
+                                    Normal(s) => rel.push(s),
+                                }
+                            }
+                            let p = normalize_under_root(&root, &rel)?;
                             let flags = pl[2 + n];
                             (p, flags)
-                        } else { (root.clone(), 0) }
-                    } else { (root.clone(), 0) };
-                    let mirror = (flags & 0b0000_0001) != 0;
-                    let pull = (flags & 0b0000_0010) != 0;
-                    let include_empty_dirs = (flags & 0b0000_0100) != 0;
+                        } else {
+                            (root.clone(), 0)
+                        }
+                    } else {
+                        (root.clone(), 0)
+                    };
+                    let _mirror = (flags & 0b0000_0001) != 0;
+                    let _pull = (flags & 0b0000_0010) != 0;
+                    let _include_empty_dirs = (flags & 0b0000_0100) != 0;
                     let _speed = (flags & 0b0000_1000) != 0;
                     write_frame(&mut stream, frame::OK, b"OK").await?;
-                    // The remainder of the connection handling is identical to the plaintext path.
-                    // For brevity and correctness, reuse the existing logic by continuing to use `stream` here.
-                    // From this point on, the code mirrors the non-TLS path verbatim.
-                    
+
                     // Connection-scoped state with counters
                     struct DeltaState {
                         dst_path: PathBuf,
@@ -1337,13 +294,14 @@ pub mod server {
                         mtime: i64,
                         granule: u64,
                         sample: usize,
-                        need_ranges: Vec<(u64,u64)>,
+                        need_ranges: Vec<(u64, u64)>,
                     }
                     struct Connection {
                         expected_paths: std::collections::HashSet<PathBuf>,
                         needed: std::collections::HashSet<String>,
                         client_present: std::collections::HashSet<String>,
-                        p_files: std::collections::HashMap<u8, (PathBuf, std::fs::File, u64, u64, i64)>,
+                        p_files:
+                            std::collections::HashMap<u8, (PathBuf, std::fs::File, u64, u64, i64)>,
                         bytes_sent: u64,
                         bytes_received: u64,
                         files_sent: u64,
@@ -1371,22 +329,45 @@ pub mod server {
                                 conn.verify_batch.clear();
                             }
                             fids::MANIFEST_ENTRY => {
-                                if payload.len() < 1 + 2 { anyhow::bail!("bad MANIFEST_ENTRY"); }
+                                if payload.len() < 1 + 2 {
+                                    anyhow::bail!("bad MANIFEST_ENTRY");
+                                }
                                 let kind = payload[0];
                                 let nlen = u16::from_le_bytes([payload[1], payload[2]]) as usize;
-                                if payload.len() < 1 + 2 + nlen { anyhow::bail!("bad MANIFEST_ENTRY name len"); }
-                                let name = std::str::from_utf8(&payload[3..3+nlen]).unwrap_or("").to_string();
-                                conn.client_present.insert(name);
+                                if payload.len() < 1 + 2 + nlen {
+                                    anyhow::bail!("bad MANIFEST_ENTRY name len");
+                                }
+                                let name = std::str::from_utf8(&payload[3..3 + nlen])
+                                    .unwrap_or("")
+                                    .to_string();
+                                conn.client_present.insert(name.clone());
+                                if kind == 0 || kind == 1 {
+                                    conn.needed.insert(name);
+                                }
                             }
                             fids::MANIFEST_END => {
-                                // Respond with empty need list (placeholder): actual delta logic occurs later
-                                let out = (0u32).to_le_bytes().to_vec();
-                                write_frame(&mut stream, frame::NEED_LIST, &out).await?;
+                                // Build NEED_LIST from client-present entries (naive: request all)
+                                let mut resp = Vec::new();
+                                let count = conn.needed.len() as u32;
+                                resp.extend_from_slice(&count.to_le_bytes());
+                                for name in conn.needed.iter() {
+                                    let nb = name.as_bytes();
+                                    resp.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+                                    resp.extend_from_slice(nb);
+                                }
+                                write_frame(&mut stream, frame::NEED_LIST, &resp).await?;
+                                if debug_logs_enabled() {
+                                    eprintln!("[TLS] NEED_LIST sent: {}", count);
+                                }
                             }
                             fids::TAR_START => {
+                                if debug_logs_enabled() {
+                                    eprintln!("[TLS] TAR_START");
+                                }
                                 // Streaming tar unpack without temp files (mirror plaintext path)
                                 let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
-                                let (res_tx, res_rx) = tokio::sync::oneshot::channel::<(u64,u64)>();
+                                let (res_tx, res_rx) =
+                                    tokio::sync::oneshot::channel::<(u64, u64)>();
                                 struct ChanReader {
                                     rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
                                     buf: Vec<u8>,
@@ -1395,50 +376,155 @@ pub mod server {
                                 }
                                 impl std::io::Read for ChanReader {
                                     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-                                        if self.done { return Ok(0); }
+                                        if self.done {
+                                            return Ok(0);
+                                        }
                                         if self.pos >= self.buf.len() {
                                             match self.rx.blocking_recv() {
-                                                Some(chunk) => { self.buf = chunk; self.pos = 0; }
-                                                None => { self.done = true; return Ok(0); }
+                                                Some(chunk) => {
+                                                    self.buf = chunk;
+                                                    self.pos = 0;
+                                                }
+                                                None => {
+                                                    self.done = true;
+                                                    return Ok(0);
+                                                }
                                             }
                                         }
                                         let n = out.len().min(self.buf.len() - self.pos);
-                                        if n > 0 { out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]); self.pos += n; }
+                                        if n > 0 {
+                                            out[..n]
+                                                .copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                                            self.pos += n;
+                                        }
                                         Ok(n)
                                     }
                                 }
                                 let base_dir = base.clone();
-                                let unpacker = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                                    let reader = ChanReader { rx, buf: Vec::new(), pos: 0, done: false };
-                                    let mut ar = tar::Archive::new(reader);
-                                    ar.set_overwrite(true);
-                                    let mut files: u64 = 0;
-                                    let mut bytes: u64 = 0;
-                                    let entries = ar.entries().context("tar entries")?;
-                                    for e in entries {
-                                        let mut entry = e.context("tar entry")?;
-                                        let et = entry.header().entry_type();
-                                        if et.is_file() {
-                                            if let Ok(sz) = entry.header().size() { bytes = bytes.saturating_add(sz); files = files.saturating_add(1); }
+                                let unpacker =
+                                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                                        let reader = ChanReader {
+                                            rx,
+                                            buf: Vec::new(),
+                                            pos: 0,
+                                            done: false,
+                                        };
+                                        let mut ar = tar::Archive::new(reader);
+                                        ar.set_overwrite(true);
+                                        let mut files: u64 = 0;
+                                        let mut bytes: u64 = 0;
+                                        let entries = ar.entries().context("tar entries")?;
+                                        for e in entries {
+                                            let mut entry = e.context("tar entry")?;
+                                            let et = entry.header().entry_type();
+                                            if let Ok(rel) = entry.path() {
+                                                let dst = base_dir.join(&*rel);
+                                                if debug_logs_enabled() {
+                                                    eprintln!("[TLS] TAR entry: {}", dst.display());
+                                                }
+                                                // Skip device/FIFO/hardlink entries defensively
+                                                if et.is_block_special()
+                                                    || et.is_character_special()
+                                                    || et.is_fifo()
+                                                    || et.is_hard_link()
+                                                {
+                                                    continue;
+                                                }
+                                                if let Some(parent) = dst.parent() {
+                                                    let _ = std::fs::create_dir_all(parent);
+                                                }
+                                            }
+                                            if et.is_file() {
+                                                if let Ok(sz) = entry.header().size() {
+                                                    bytes = bytes.saturating_add(sz);
+                                                    files = files.saturating_add(1);
+                                                }
+                                            }
+                                            entry.unpack_in(&base_dir).context("unpack entry")?;
                                         }
-                                        entry.unpack_in(&base_dir).context("unpack entry")?;
-                                    }
-                                    let _ = res_tx.send((files, bytes));
-                                    Ok(())
-                                });
+                                        let _ = res_tx.send((files, bytes));
+                                        Ok(())
+                                    });
                                 loop {
                                     let (ti, pli) = read_frame_timed(&mut stream, 750).await?;
                                     if ti == frame::TAR_DATA {
-                                        if tx.send(pli).await.is_err() { anyhow::bail!("tar unpacker closed"); }
+                                        if tx.send(pli).await.is_err() {
+                                            anyhow::bail!("tar unpacker closed");
+                                        }
                                         continue;
                                     }
-                                    if ti == frame::TAR_END { break; }
+                                    if ti == frame::TAR_END {
+                                        break;
+                                    }
                                     anyhow::bail!("unexpected frame during tar: {}", ti);
                                 }
                                 drop(tx);
                                 let _ = unpacker.await;
                                 let _ = res_rx.await;
                                 write_frame(&mut stream, frame::OK, b"TAR_OK").await?;
+                                if debug_logs_enabled() {
+                                    eprintln!("[TLS] TAR_OK");
+                                }
+                            }
+                            fids::FILE_RAW_START => {
+                                // Receive single raw file
+                                if payload.len() < 2 + 8 + 8 {
+                                    anyhow::bail!("bad FILE_RAW_START");
+                                }
+                                let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                                if payload.len() < 2 + nlen + 8 + 8 {
+                                    anyhow::bail!("bad FILE_RAW_START len");
+                                }
+                                let rel = std::str::from_utf8(&payload[2..2 + nlen]).unwrap_or("");
+                                let mut off = 2 + nlen;
+                                let size = u64::from_le_bytes(
+                                    payload[off..off + 8].try_into().context("Invalid size")?,
+                                );
+                                off += 8;
+                                let mtime = i64::from_le_bytes(
+                                    payload[off..off + 8].try_into().context("Invalid mtime")?,
+                                );
+                                let dst = normalize_under_root(&base, std::path::Path::new(rel))?;
+                                if let Some(parent) = dst.parent() {
+                                    std::fs::create_dir_all(parent).ok();
+                                }
+                                let mut f = std::fs::File::create(&dst)
+                                    .with_context(|| format!("create {}", dst.display()))?;
+                                let _ = f.set_len(size);
+                                let mut remaining = size as usize;
+                                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                                use std::io::{Seek, SeekFrom, Write as _};
+                                while remaining > 0 {
+                                    let to_read = remaining.min(buf.len());
+                                    let ms = crate::protocol::timeouts::READ_BASE_MS
+                                        + (to_read as u64).div_ceil(1_048_576)
+                                            * crate::protocol::timeouts::PER_MB_MS;
+                                    let n = match tokio::time::timeout(
+                                        std::time::Duration::from_millis(ms),
+                                        async {
+                                            use tokio::io::AsyncReadExt;
+                                            stream.read(&mut buf[..to_read]).await
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(n)) => n,
+                                        Ok(Err(e)) => return Err(e.into()),
+                                        Err(_) => anyhow::bail!("raw body read timeout"),
+                                    };
+                                    if n == 0 {
+                                        anyhow::bail!("unexpected EOF during raw file body");
+                                    }
+                                    let is_zero = buf[..n].iter().all(|&b| b == 0);
+                                    if is_zero && n >= 128 * 1024 {
+                                        let _ = f.seek(SeekFrom::Current(n as i64));
+                                    } else {
+                                        f.write_all(&buf[..n]).context("write raw body")?;
+                                    }
+                                    remaining -= n;
+                                }
+                                let ft = filetime::FileTime::from_unix_time(mtime, 0);
+                                let _ = filetime::set_file_mtime(&dst, ft);
                             }
                             fids::DONE => {
                                 write_frame(&mut stream, frame::OK, b"OK").await?;
@@ -1467,9 +553,9 @@ pub mod server {
 #[allow(dead_code)]
 pub mod client {
     use super::*;
+    use crate::protocol::frame;
     use crate::url;
     use anyhow::{Context, Result};
-    use crate::protocol::frame;
     use filetime::{set_file_mtime, FileTime};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -1478,11 +564,15 @@ pub mod client {
     use tokio::net::TcpStream;
     use tokio::sync::Mutex;
     use tokio::time::{timeout, Duration};
-    use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
+    use tokio_rustls::{client::TlsStream as ClientTlsStream, TlsConnector};
 
     #[inline]
     async fn write_all_timed(stream: &mut TcpStream, buf: &[u8], ms: u64) -> Result<()> {
-        match timeout(Duration::from_millis(ms), async { stream.write_all(buf).await }).await {
+        match timeout(Duration::from_millis(ms), async {
+            stream.write_all(buf).await
+        })
+        .await
+        {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => anyhow::bail!("raw body write timeout ({} ms)", ms),
@@ -1500,7 +590,7 @@ pub mod client {
 
     enum StreamAny {
         Plain(TcpStream),
-        Tls(ClientTlsStream<TcpStream>),
+        Tls(Box<ClientTlsStream<TcpStream>>),
     }
 
     impl StreamAny {
@@ -1514,10 +604,143 @@ pub mod client {
         async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
             use tokio::io::AsyncReadExt;
             match self {
-                StreamAny::Plain(s) => { let _ = s.read_exact(buf).await?; Ok(()) }
-                StreamAny::Tls(s) => { let _ = s.read_exact(buf).await?; Ok(()) }
+                StreamAny::Plain(s) => {
+                    let _ = s.read_exact(buf).await?;
+                    Ok(())
+                }
+                StreamAny::Tls(s) => {
+                    let _ = s.read_exact(buf).await?;
+                    Ok(())
+                }
             }
         }
+    }
+
+    // List a remote directory (non-recursive). Returns (name, is_dir).
+    pub async fn list_dir(
+        host: &str,
+        port: u16,
+        path: &std::path::Path,
+    ) -> Result<Vec<(String, bool)>> {
+        let mut stream = connect_secure(host, port, true).await?;
+        let path_str = path.to_string_lossy();
+        let mut payload = Vec::with_capacity(2 + path_str.len());
+        payload.extend_from_slice(&(path_str.len() as u16).to_le_bytes());
+        payload.extend_from_slice(path_str.as_bytes());
+        write_frame_any(&mut stream, frame::LIST_REQ, &payload).await?;
+        let (t, pl) = read_frame_any(&mut stream).await?;
+        if t != frame::LIST_RESP {
+            anyhow::bail!("unexpected frame: {}", t);
+        }
+        let mut out = Vec::new();
+        if pl.len() < 4 {
+            return Ok(out);
+        }
+        let count = u32::from_le_bytes([pl[0], pl[1], pl[2], pl[3]]) as usize;
+        let mut off = 4;
+        for _ in 0..count {
+            if off + 3 > pl.len() {
+                break;
+            }
+            let kind = pl[off];
+            off += 1;
+            let nlen = u16::from_le_bytes([pl[off], pl[off + 1]]) as usize;
+            off += 2;
+            if off + nlen > pl.len() {
+                break;
+            }
+            let name = String::from_utf8_lossy(&pl[off..off + nlen]).to_string();
+            off += nlen;
+            // Filter special marker entries if present
+            if name.starts_with("[More entries") || name.starts_with("...") {
+                continue;
+            }
+            out.push((name, kind == 1));
+        }
+        Ok(out)
+    }
+
+    // Recursively enumerate all files under remote base, returning relative paths (files only).
+    pub async fn list_files_recursive(
+        host: &str,
+        port: u16,
+        base: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        let mut files = Vec::new();
+        let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(base)];
+        while let Some(dir) = stack.pop() {
+            let entries = list_dir(host, port, &dir).await.unwrap_or_default();
+            for (name, is_dir) in entries {
+                if name == ".." {
+                    continue;
+                }
+                let child = dir.join(&name);
+                if is_dir {
+                    stack.push(child);
+                } else {
+                    // Compute relative to base
+                    let rel = child.strip_prefix(base).unwrap_or(&child).to_path_buf();
+                    files.push(rel);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    // Request hashes for a batch of relative file paths under base. Returns map path->hash (32 bytes) for found files.
+    pub async fn remote_hashes(
+        host: &str,
+        port: u16,
+        base: &std::path::Path,
+        rels: &[std::path::PathBuf],
+    ) -> Result<std::collections::HashMap<String, [u8; 32]>> {
+        let mut s = connect_secure(host, port, true).await?;
+        // Start session with base path
+        let dest_s = base.to_string_lossy();
+        let mut pl = Vec::with_capacity(2 + dest_s.len() + 1);
+        pl.extend_from_slice(&(dest_s.len() as u16).to_le_bytes());
+        pl.extend_from_slice(dest_s.as_bytes());
+        pl.push(0); // flags
+        write_frame_any(&mut s, frame::START, &pl).await?;
+        let (typ, _ok) = read_frame_any(&mut s).await?;
+        if typ != frame::OK {
+            anyhow::bail!("server did not OK START");
+        }
+
+        for r in rels {
+            let rstr = r.to_string_lossy();
+            let mut plv = Vec::with_capacity(2 + rstr.len());
+            plv.extend_from_slice(&(rstr.len() as u16).to_le_bytes());
+            plv.extend_from_slice(rstr.as_bytes());
+            write_frame_any(&mut s, frame::VERIFY_REQ, &plv).await?;
+        }
+        write_frame_any(&mut s, frame::VERIFY_DONE, &[]).await?;
+
+        let mut out: std::collections::HashMap<String, [u8; 32]> = std::collections::HashMap::new();
+        loop {
+            let (t, pl) = read_frame_any(&mut s).await?;
+            if t == frame::DONE {
+                break;
+            }
+            if t != frame::VERIFY_HASH {
+                anyhow::bail!("unexpected frame {} during verify", t);
+            }
+            if pl.len() < 1 + 2 {
+                continue;
+            }
+            let status = pl[0];
+            let nlen = u16::from_le_bytes([pl[1], pl[2]]) as usize;
+            if pl.len() < 3 + nlen + 32 {
+                continue;
+            }
+            let name = String::from_utf8_lossy(&pl[3..3 + nlen]).to_string();
+            if status == 0 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&pl[3 + nlen..3 + nlen + 32]);
+                out.insert(name, arr);
+            }
+        }
+        Ok(out)
     }
 
     async fn connect_secure(host: &str, port: u16, secure: bool) -> Result<StreamAny> {
@@ -1533,15 +756,21 @@ pub mod client {
         let cx = TlsConnector::from(std::sync::Arc::new(cfg));
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|_| anyhow::anyhow!("Invalid server name for TLS: {}", host))?;
-        let tls = cx.connect(server_name, tcp).await
-            .map_err(|e| anyhow::anyhow!("TLS handshake failed (server may be running in unsafe mode): {}", e))?;
-        Ok(StreamAny::Tls(tls))
+        let tls = cx.connect(server_name, tcp).await.map_err(|e| {
+            anyhow::anyhow!(
+                "TLS handshake failed (server may be running in unsafe mode): {}",
+                e
+            )
+        })?;
+        Ok(StreamAny::Tls(Box::new(tls)))
     }
 
     async fn write_frame_any(stream: &mut StreamAny, t: u8, payload: &[u8]) -> Result<()> {
         let hdr = crate::protocol_core::build_frame_header(t, payload.len() as u32);
         stream.write_all(&hdr).await?;
-        if !payload.is_empty() { stream.write_all(payload).await?; }
+        if !payload.is_empty() {
+            stream.write_all(payload).await?;
+        }
         Ok(())
     }
 
@@ -1553,7 +782,9 @@ pub mod client {
         let len = len_u32 as usize;
         validate_frame_size(len)?;
         let mut payload = vec![0u8; len];
-        if len > 0 { stream.read_exact(&mut payload).await?; }
+        if len > 0 {
+            stream.read_exact(&mut payload).await?;
+        }
         Ok((typ, payload))
     }
 
@@ -1614,10 +845,13 @@ pub mod client {
 
         let hdr = crate::protocol_core::build_frame_header(frame::LIST_REQ, payload.len() as u32);
 
-        match timeout(Duration::from_millis(crate::protocol::timeouts::CONNECT_MS), async {
-            stream.write_all(&hdr).await?;
-            stream.write_all(&payload).await
-        })
+        match timeout(
+            Duration::from_millis(crate::protocol::timeouts::CONNECT_MS),
+            async {
+                stream.write_all(&hdr).await?;
+                stream.write_all(&payload).await
+            },
+        )
         .await
         {
             Ok(Ok(_)) => {}
@@ -1635,8 +869,11 @@ pub mod client {
         if resp_payload.len() < 4 {
             return Ok(());
         }
-        let count = u32::from_le_bytes(resp_payload[off..off + 4].try_into()
-            .context("Invalid count bytes in NEED response")?);
+        let count = u32::from_le_bytes(
+            resp_payload[off..off + 4]
+                .try_into()
+                .context("Invalid count bytes in NEED response")?,
+        );
         off += 4;
 
         for _ in 0..count {
@@ -1648,8 +885,11 @@ pub mod client {
             if resp_payload.len() < off + 2 {
                 break;
             }
-            let nlen = u16::from_le_bytes(resp_payload[off..off + 2].try_into()
-                .context("Invalid name length bytes in NEED response")?) as usize;
+            let nlen = u16::from_le_bytes(
+                resp_payload[off..off + 2]
+                    .try_into()
+                    .context("Invalid name length bytes in NEED response")?,
+            ) as usize;
             off += 2;
             if resp_payload.len() < off + nlen {
                 break;
@@ -1663,10 +903,7 @@ pub mod client {
             }
 
             let suggestion_path = format!("{}{}", remote_path_prefix, name);
-            let suggestion = format!(
-                "blit://{}:{}{}",
-                remote.host, remote.port, suggestion_path
-            );
+            let suggestion = format!("blit://{}:{}{}", remote.host, remote.port, suggestion_path);
 
             if kind == 1 {
                 // Directory
@@ -1690,7 +927,9 @@ pub mod client {
         payload.push(0);
         write_frame_any(&mut stream, frame::START, &payload).await?;
         let (typ, _resp) = read_frame_any(&mut stream).await?;
-        if typ != frame::OK { anyhow::bail!("daemon error starting remove"); }
+        if typ != frame::OK {
+            anyhow::bail!("daemon error starting remove");
+        }
 
         // Send RemoveTreeReq
         let rel = path.to_string_lossy();
@@ -1699,7 +938,9 @@ pub mod client {
         pl.extend_from_slice(rel.as_bytes());
         write_frame_any(&mut stream, frame::REMOVE_TREE_REQ, &pl).await?;
         let (t, resp) = read_frame_any(&mut stream).await?;
-        if t != frame::REMOVE_TREE_RESP { anyhow::bail!("bad response to remove"); }
+        if t != frame::REMOVE_TREE_RESP {
+            anyhow::bail!("bad response to remove");
+        }
         if resp.is_empty() || resp[0] != 0 {
             anyhow::bail!("remove failed: {}", String::from_utf8_lossy(&resp[1..]));
         }
@@ -1809,20 +1050,30 @@ pub mod client {
         let mut needed = std::collections::HashSet::new();
         let mut off = 0usize;
         if plneed.len() >= 4 {
-            let count = u32::from_le_bytes(plneed[off..off + 4].try_into()
-                .context("Invalid count bytes in NEED response")?) as usize;
+            let count = u32::from_le_bytes(
+                plneed[off..off + 4]
+                    .try_into()
+                    .context("Invalid count bytes in NEED response")?,
+            ) as usize;
             // Sanity check: limit to 1 million entries to prevent DoS
             const MAX_NEED_ENTRIES: usize = 1_000_000;
             if count > MAX_NEED_ENTRIES {
-                anyhow::bail!("NEED_LIST count exceeds maximum allowed ({}): {}", MAX_NEED_ENTRIES, count);
+                anyhow::bail!(
+                    "NEED_LIST count exceeds maximum allowed ({}): {}",
+                    MAX_NEED_ENTRIES,
+                    count
+                );
             }
             off += 4;
             for _ in 0..count {
                 if off + 2 > plneed.len() {
                     break;
                 }
-                let nlen = u16::from_le_bytes(plneed[off..off + 2].try_into()
-                    .context("Invalid name length bytes in NEED response")?) as usize;
+                let nlen = u16::from_le_bytes(
+                    plneed[off..off + 2]
+                        .try_into()
+                        .context("Invalid name length bytes in NEED response")?,
+                ) as usize;
                 off += 2;
                 if off + nlen > plneed.len() {
                     break;
@@ -1890,31 +1141,35 @@ pub mod client {
         }
 
         // Auto-tune workers/chunk if user hasn't overridden and based on simple heuristics
-        let overridden_workers = std::env::args().any(|a| a == "--net-workers" || a.starts_with("--net-workers="));
-        let overridden_chunk = std::env::args().any(|a| a == "--net-chunk-mb" || a.starts_with("--net-chunk-mb="));
-        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let overridden_workers = std::env::args()
+            .any(|a| a == "--net-workers" || a.starts_with("--net-workers="));
+        let overridden_chunk = std::env::args()
+            .any(|a| a == "--net-chunk-mb" || a.starts_with("--net-chunk-mb="));
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let mut eff_workers = args.net_workers;
         let mut eff_chunk_mb = args.net_chunk_mb;
         if !overridden_workers {
             let large_count = large_files.len().max(1);
             // Heuristic: scale workers with CPUs and available large files (bounded)
-            eff_workers = std::cmp::min(32, std::cmp::max(2, std::cmp::min(large_count, std::cmp::max(4, cpus / 2))));
+            eff_workers = std::cmp::min(large_count, std::cmp::max(4, cpus / 2)).clamp(2, 32);
         }
         if !overridden_chunk {
             eff_chunk_mb = if args.ludicrous_speed { 8 } else { 4 };
         }
 
+        let large_cap = large_files.len().max(1);
         let work = Arc::new(Mutex::new(large_files));
         let mut handles = vec![];
-        let worker_count = eff_workers.max(1).min(32);
-        let chunk_bytes: usize = (eff_chunk_mb.max(1).min(32)) * 1024 * 1024;
+        // Cap workers by number of large files to avoid idle START→DONE sessions
+        let worker_count = std::cmp::min(eff_workers.clamp(1, 32), large_cap);
+        let chunk_bytes: usize = eff_chunk_mb.clamp(1, 32) * 1024 * 1024;
         for _ in 0..worker_count {
             let work_clone = Arc::clone(&work);
             let host = host.to_string();
-            let port = port;
             let dest = dest.to_path_buf();
             let src_root = src_root.to_path_buf();
-            let chunk_bytes = chunk_bytes;
 
             let handle = tokio::spawn(async move {
                 let secure = true;
@@ -1982,7 +1237,13 @@ pub mod client {
                                 pls1.extend_from_slice(&(h1.as_bytes().len() as u16).to_le_bytes());
                                 pls1.extend_from_slice(h1.as_bytes());
                                 write_frame_any(&mut s, frame::DELTA_SAMPLE, &pls1).await?;
-                                let end_off = if fe.size > off0 { (off0 + granule64).min(fe.size).saturating_sub(sample as u64) } else { off0 };
+                                let end_off = if fe.size > off0 {
+                                    (off0 + granule64)
+                                        .min(fe.size)
+                                        .saturating_sub(sample as u64)
+                                } else {
+                                    off0
+                                };
                                 bf.seek(SeekFrom::Start(end_off))?;
                                 let n2 = bf.read(&mut buf0)?;
                                 let h2 = blake3::hash(&buf0[..n2]);
@@ -1997,25 +1258,38 @@ pub mod client {
                             // read need ranges
                             let (t_need, pl_need) = read_frame_any(&mut s).await?;
                             let mut need_ranges: Vec<(u64, u64)> = Vec::new();
-                            if t_need == frame::NEED_RANGES_START {
-                                if pl_need.len() >= 4 {
-                                    let _cnt = u32::from_le_bytes(pl_need[0..4].try_into()
-                                        .context("Invalid count bytes in NEEDRANGES")?) as usize;
+                            if t_need == frame::NEED_RANGES_START && pl_need.len() >= 4 {
+                                    let _cnt = u32::from_le_bytes(
+                                        pl_need[0..4]
+                                            .try_into()
+                                            .context("Invalid count bytes in NEEDRANGES")?,
+                                    ) as usize;
                                     loop {
                                         let (ti, pli) = read_frame_any(&mut s).await?;
                                         if ti == frame::NEED_RANGE {
                                             if pli.len() >= 16 {
-                                                let off = u64::from_le_bytes(pli[0..8].try_into()
-                                                    .context("Invalid offset bytes in NEEDRANGES")?);
-                                                let len = u64::from_le_bytes(pli[8..16].try_into()
-                                                    .context("Invalid length bytes in NEEDRANGES")?);
+                                                let off = u64::from_le_bytes(
+                                                    pli[0..8].try_into().context(
+                                                        "Invalid offset bytes in NEEDRANGES",
+                                                    )?,
+                                                );
+                                                let len = u64::from_le_bytes(
+                                                    pli[8..16].try_into().context(
+                                                        "Invalid length bytes in NEEDRANGES",
+                                                    )?,
+                                                );
                                                 need_ranges.push((off, len));
                                             }
-                                        } else if ti == frame::NEED_RANGES_END { break; } else { anyhow::bail!("unexpected frame in need list"); }
+                                        } else if ti == frame::NEED_RANGES_END {
+                                            break;
+                                        } else {
+                                            anyhow::bail!("unexpected frame in need list");
+                                        }
                                     }
-                                }
                             }
-                            if !need_ranges.is_empty() && (need_ranges.len() as u64) * granule64 < fe.size {
+                            if !need_ranges.is_empty()
+                                && (need_ranges.len() as u64) * granule64 < fe.size
+                            {
                                 let mut f2 = tokio::fs::File::open(&fe.path).await?;
                                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
                                 for (mut off, mut left) in need_ranges.into_iter() {
@@ -2024,7 +1298,9 @@ pub mod client {
                                         f2.seek(std::io::SeekFrom::Start(off)).await?;
                                         let want = (left as usize).min(b.len());
                                         let n = f2.read(&mut b[..want]).await?;
-                                        if n == 0 { break; }
+                                        if n == 0 {
+                                            break;
+                                        }
                                         let mut p = Vec::with_capacity(8 + n);
                                         p.extend_from_slice(&off.to_le_bytes());
                                         p.extend_from_slice(&b[..n]);
@@ -2053,11 +1329,24 @@ pub mod client {
                             while remaining > 0 {
                                 let to_read = (remaining as usize).min(buf.len());
                                 let n = f.read(&mut buf[..to_read]).await?;
-                                if n == 0 { break; }
-                                let ms = crate::protocol::timeouts::WRITE_BASE_MS + ((n as u64 + 1_048_575)/1_048_576) * crate::protocol::timeouts::PER_MB_MS;
+                                if n == 0 {
+                                    break;
+                                }
+                                let ms = crate::protocol::timeouts::WRITE_BASE_MS
+                                    + (n as u64).div_ceil(1_048_576)
+                                        * crate::protocol::timeouts::PER_MB_MS;
                                 match &mut s {
-                                    StreamAny::Plain(raw) => write_all_timed(raw, &buf[..n], ms).await?,
-                                    StreamAny::Tls(tls) => { use tokio::io::AsyncWriteExt; timeout(Duration::from_millis(ms), tls.write_all(&buf[..n])).await??; }
+                                    StreamAny::Plain(raw) => {
+                                        write_all_timed(raw, &buf[..n], ms).await?
+                                    }
+                                    StreamAny::Tls(tls) => {
+                                        use tokio::io::AsyncWriteExt;
+                                        timeout(
+                                            Duration::from_millis(ms),
+                                            tls.write_all(&buf[..n]),
+                                        )
+                                        .await??;
+                                    }
                                 }
                                 remaining -= n as u64;
                             }
@@ -2146,7 +1435,8 @@ pub mod client {
             pl.extend_from_slice(rels.as_bytes());
             pl.extend_from_slice(&fe.size.to_le_bytes());
             pl.extend_from_slice(&mtime.to_le_bytes());
-                    server::write_frame(&mut stream, frame::MANIFEST_ENTRY, &pl).await?; // ManifestEntry
+            server::write_frame(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
+            // ManifestEntry
         }
         server::write_frame(&mut stream, frame::MANIFEST_END, &[]).await?; // ManifestEnd
 
@@ -2163,7 +1453,7 @@ pub mod client {
                     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
                     let unpack_dest = dest_root.to_path_buf();
                     let unpacker = tokio::task::spawn_blocking(move || -> Result<()> {
-                        let mut reader = ChanReader {
+                        let reader = ChanReader {
                             rx,
                             buf: Vec::new(),
                             pos: 0,
@@ -2176,7 +1466,7 @@ pub mod client {
                     });
 
                     loop {
-                        let (ti, pli) = read_frame_any(&mut stream).await?;
+                        let (ti, pli) = server::read_frame(&mut stream).await?;
                         if ti == 9u8 {
                             // TarData
                             if tx.send(pli).await.is_err() {
@@ -2191,7 +1481,7 @@ pub mod client {
                     }
                     drop(tx);
                     unpacker.await??;
-                    write_frame_any(&mut stream, 2, b"OK").await?;
+                    server::write_frame(&mut stream, frame::OK, b"OK").await?;
                 }
                 4u8 => {
                     // FileStart
@@ -2204,11 +1494,17 @@ pub mod client {
                     }
                     let rel = std::str::from_utf8(&pl[2..2 + nlen])?;
                     let mut off = 2 + nlen;
-                    let size = u64::from_le_bytes(pl[off..off + 8].try_into()
-                        .context("Invalid size bytes in FILE_START")?);
+                    let size = u64::from_le_bytes(
+                        pl[off..off + 8]
+                            .try_into()
+                            .context("Invalid size bytes in FILE_START")?,
+                    );
                     off += 8;
-                    let mtime = i64::from_le_bytes(pl[off..off + 8].try_into()
-                        .context("Invalid mtime bytes in FILE_START")?);
+                    let mtime = i64::from_le_bytes(
+                        pl[off..off + 8]
+                            .try_into()
+                            .context("Invalid mtime bytes in FILE_START")?,
+                    );
                     let dst_path = dest_root.join(rel);
                     if let Some(parent) = dst_path.parent() {
                         tokio::fs::create_dir_all(parent).await?;
@@ -2267,7 +1563,7 @@ pub mod client {
                 }
                 frame::DONE => {
                     // Done
-                    write_frame_any(&mut stream, frame::OK, b"OK").await?;
+                    server::write_frame(&mut stream, frame::OK, b"OK").await?;
                     break;
                 }
                 _ => {}
@@ -2285,10 +1581,10 @@ pub mod client {
                     all_dirs.push(p);
                     continue;
                 }
-                if entry.file_type().is_file() || entry.file_type().is_symlink() {
-                    if !expected_paths.contains(&p) {
-                        tokio::fs::remove_file(&p).await.ok();
-                    }
+                if (entry.file_type().is_file() || entry.file_type().is_symlink())
+                    && !expected_paths.contains(&p)
+                {
+                    tokio::fs::remove_file(&p).await.ok();
                 }
             }
             all_dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));

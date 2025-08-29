@@ -1,6 +1,6 @@
 use normpath::PathExt;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 use windows::{
     core::PCWSTR,
     Win32::{
@@ -134,7 +134,7 @@ pub fn has_symlink_privilege() -> bool {
 }
 
 /// Recursively clears the read-only attribute from a path and all its contents.
-/// 
+///
 /// This is essential for Windows mirror deletions where files may have the
 /// read-only attribute set, preventing normal deletion operations.
 ///
@@ -154,7 +154,7 @@ pub fn clear_readonly_recursive(path: &Path) {
             perms.set_readonly(false);
             let _ = fs::set_permissions(path, perms);
         }
-        
+
         // Recursively process directories
         if metadata.is_dir() {
             if let Ok(entries) = fs::read_dir(path) {

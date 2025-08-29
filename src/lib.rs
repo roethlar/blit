@@ -9,12 +9,12 @@ pub mod fs_enum;
 pub mod logger;
 pub mod tar_stream;
 
+pub mod cli;
+pub mod net_async; // For blitd daemon server
 pub mod protocol;
 pub mod protocol_core;
-pub mod url;
-pub mod cli;
-pub mod net_async;  // For blitd daemon server
-pub mod tls;        // TLS encryption and TOFU verification
+pub mod tls;
+pub mod url; // TLS encryption and TOFU verification
 
 /// Library argument surface for network client helpers.
 /// This decouples library code from the binary's Clap struct.
@@ -37,4 +37,3 @@ pub struct Args {
 }
 #[cfg(windows)]
 pub mod win_fs;
-

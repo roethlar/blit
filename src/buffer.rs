@@ -2,13 +2,12 @@
 //! Simplified from buffer_sizing.rs
 
 use parking_lot::Mutex;
-use std::time::{Duration, Instant};
 use std::collections::VecDeque;
+use std::time::Duration;
 
 /// Throughput sample for adaptive tuning
 #[derive(Clone, Debug)]
 struct ThroughputSample {
-    timestamp: Instant,
     bytes: u64,
     duration: Duration,
 }
@@ -34,34 +33,30 @@ impl BufferSizer {
             target_throughput: 1_100_000_000, // 1.1 GB/s for 10GbE
         }
     }
-    
+
     /// Record a throughput sample for adaptive tuning
     pub fn record_throughput(&self, bytes: u64, duration: Duration) {
         let mut samples = self.throughput_samples.lock();
-        
+
         // Keep only recent samples (last 10)
         if samples.len() >= 10 {
             samples.pop_front();
         }
-        
-        samples.push_back(ThroughputSample {
-            timestamp: Instant::now(),
-            bytes,
-            duration,
-        });
+
+        samples.push_back(ThroughputSample { bytes, duration });
     }
-    
+
     /// Calculate current average throughput
     fn get_average_throughput(&self) -> Option<f64> {
         let samples = self.throughput_samples.lock();
-        
+
         if samples.is_empty() {
             return None;
         }
-        
+
         let total_bytes: u64 = samples.iter().map(|s| s.bytes).sum();
         let total_duration: Duration = samples.iter().map(|s| s.duration).sum();
-        
+
         if total_duration.as_secs_f64() > 0.0 {
             Some(total_bytes as f64 / total_duration.as_secs_f64())
         } else {
@@ -74,7 +69,7 @@ impl BufferSizer {
         use sysinfo::System;
         let mut sys = System::new_all();
         sys.refresh_memory();
-        
+
         // Use available memory (free + buffers/cache that can be reclaimed)
         // Fall back to 4GB if we can't get system info
         sys.available_memory().max(4 * 1024 * 1024 * 1024)
@@ -101,11 +96,11 @@ impl BufferSizer {
         } else {
             4 * 1024 * 1024 // 4MB for local
         };
-        
+
         // Adaptive tuning: if throughput is below target, increase buffer size
         if let Some(avg_throughput) = self.get_average_throughput() {
             let target = self.target_throughput as f64;
-            
+
             if avg_throughput < target * 0.8 {
                 // Below 80% of target: increase buffer significantly
                 base_size = (base_size as f64 * 1.5) as usize;
@@ -162,18 +157,21 @@ mod tests {
         assert!(mem >= 4 * 1024 * 1024 * 1024);
         // Should be less than 10TB (sanity check)
         assert!(mem < 10 * 1024 * 1024 * 1024 * 1024);
-        println!("Detected available memory: {:.2} GB", mem as f64 / (1024.0 * 1024.0 * 1024.0));
+        println!(
+            "Detected available memory: {:.2} GB",
+            mem as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
     }
 
     #[test]
     fn test_buffer_sizing_with_real_memory() {
         let sizer = BufferSizer::new();
-        
+
         // Test network buffer sizing
         let net_buf = sizer.calculate_buffer_size(1024 * 1024 * 1024, true);
         assert!(net_buf >= 256 * 1024); // At least 256KB
         assert!(net_buf <= 64 * 1024 * 1024); // At most 64MB
-        
+
         // Test local buffer sizing
         let local_buf = sizer.calculate_buffer_size(100 * 1024 * 1024, false);
         assert!(local_buf >= 64 * 1024); // At least 64KB

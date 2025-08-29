@@ -7,7 +7,7 @@ pub struct RemoteDest {
     pub host: String,
     pub port: u16,
     pub path: PathBuf,
-    pub tls: bool,  // true for blits://, false for blit://
+    pub tls: bool, // true for blits://, false for blit://
 }
 
 pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
@@ -18,7 +18,7 @@ pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
     let scheme_with_colon = &lower[..=scheme_end];
     let tls = match scheme_with_colon {
         "blit:" => false,
-        "blits:" => true,  // blits:// for TLS connections
+        "blits:" => true, // blits:// for TLS connections
         _ => return None,
     };
     let mut rest = &s_trim[scheme_end + 1..];

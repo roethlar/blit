@@ -105,7 +105,7 @@ pub fn tar_stream_transfer(
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .count();
-    
+
     // Dynamic channel sizing: scale based on file count
     // 16 chunks for <100 files, 32 for <1000, 64 for <10000, 128 for more
     let dynamic_buffer_size = match file_count {
@@ -114,7 +114,7 @@ pub fn tar_stream_transfer(
         1001..=10000 => 64,
         _ => 128.min(config.channel_buffer * 2), // Cap at 2x configured or 128
     };
-    
+
     // Use the smaller of dynamic and configured size to save memory
     let channel_buffer = dynamic_buffer_size.min(config.channel_buffer);
 
@@ -124,7 +124,9 @@ pub fn tar_stream_transfer(
     // Progress bar
     let progress = if show_progress {
         let pb = ProgressBar::new_spinner();
-        if let Ok(style) = ProgressStyle::default_spinner().template("{spinner:.green} [{elapsed_precise}] {msg}") {
+        if let Ok(style) =
+            ProgressStyle::default_spinner().template("{spinner:.green} [{elapsed_precise}] {msg}")
+        {
             pb.set_style(style);
         }
         pb.set_message("Streaming files via tar...");
@@ -238,7 +240,9 @@ pub fn tar_stream_transfer_list(
     // Progress bar
     let progress = if show_progress {
         let pb = ProgressBar::new_spinner();
-        if let Ok(style) = ProgressStyle::default_spinner().template("{spinner:.green} [{elapsed_precise}] {msg}") {
+        if let Ok(style) =
+            ProgressStyle::default_spinner().template("{spinner:.green} [{elapsed_precise}] {msg}")
+        {
             pb.set_style(style);
         }
         pb.set_message("Streaming selected files via tar...");

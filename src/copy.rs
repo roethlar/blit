@@ -197,7 +197,9 @@ pub fn parallel_copy_files(
         .map(|mutex| mutex.into_inner())
         .unwrap_or_else(|arc| {
             // Log when we fall back to cloning because Arc is still shared
-            eprintln!("Warning: Arc<CopyStats> still has multiple references, falling back to clone");
+            eprintln!(
+                "Warning: Arc<CopyStats> still has multiple references, falling back to clone"
+            );
             arc.lock().clone()
         })
 }

@@ -43,15 +43,15 @@ pub mod frame {
     pub const DELTA_DONE: u8 = 28;
     pub const FILE_RAW_START: u8 = 29;
     pub const SET_ATTR: u8 = 30;
-    
+
     // VERIFY batching protocol:
     // Client sends: VERIFY_REQ (path1), VERIFY_REQ (path2), ..., VERIFY_DONE
     // Server responds: VERIFY_HASH (status|algo|path1|hash1), VERIFY_HASH (status|algo|path2|hash2), ..., DONE
     // Status byte: 0=OK, 1=NOT_FOUND, 2=ERROR
     pub const VERIFY_REQ: u8 = 31;
     pub const VERIFY_HASH: u8 = 32;
-    pub const VERIFY_DONE: u8 = 33;  // Signals end of batch verification
-    
+    pub const VERIFY_DONE: u8 = 33; // Signals end of batch verification
+
     // Management frames
     // LIST protocol:
     // Client sends: LIST_REQ with path
@@ -61,6 +61,7 @@ pub mod frame {
     pub const LIST_RESP: u8 = 41;
     pub const REMOVE_TREE_REQ: u8 = 42;
     pub const REMOVE_TREE_RESP: u8 = 43;
+    pub const LIST_DONE: u8 = 44;
 }
 
 // Compression flags - RESERVED/IGNORED as of v3.1
@@ -68,45 +69,45 @@ pub mod frame {
 // These constants are kept only for wire protocol compatibility with older clients
 // New implementations should ignore these bits
 pub mod compress_flags {
-    pub const NONE: u8 = 0x00;          // No compression (always used in v3.1+)
-    pub const COMP_ZSTD: u8 = 0b00010000;  // Reserved (ignored)
-    pub const COMP_LZ4: u8 = 0b00100000;   // Reserved (ignored)
-    // Legacy TAR compression indicators - no longer used
-    pub const TAR_ZSTD: u8 = 0x01;      // Reserved (ignored)
-    pub const TAR_LZ4: u8 = 0x02;       // Reserved (ignored)
+    pub const NONE: u8 = 0x00; // No compression (always used in v3.1+)
+    pub const COMP_ZSTD: u8 = 0b00010000; // Reserved (ignored)
+    pub const COMP_LZ4: u8 = 0b00100000; // Reserved (ignored)
+                                         // Legacy TAR compression indicators - no longer used
+    pub const TAR_ZSTD: u8 = 0x01; // Reserved (ignored)
+    pub const TAR_LZ4: u8 = 0x02; // Reserved (ignored)
 }
 
 // Centralized timeout constants for consistent behavior across async/legacy paths
 pub mod timeouts {
     // Base timeout for frame header reads (ms)
     pub const FRAME_HEADER_MS: u64 = 300;
-    
+
     // Base timeout for writes (ms)
     pub const WRITE_BASE_MS: u64 = 500;
-    
+
     // Base timeout for reads (ms)
     pub const READ_BASE_MS: u64 = 300;
-    
+
     // Additional timeout per MB of data (ms)
     pub const PER_MB_MS: u64 = 1;
-    
+
     // Progress tick interval for UI updates (ms)
     pub const PROGRESS_TICK_MS: u64 = 250;
-    
+
     // Connection establishment timeout (ms)
     pub const CONNECT_MS: u64 = 200;
-    
+
     // Calculate write deadline based on payload size (ms)
     // 500ms base + 1ms per 1MB payload (ceil)
     pub fn write_deadline_ms(payload_len: usize) -> u64 {
-        let mb = (payload_len as u64 + 1_048_575) / 1_048_576;
+        let mb = (payload_len as u64).div_ceil(1_048_576);
         WRITE_BASE_MS + mb * PER_MB_MS
     }
-    
+
     // Calculate read deadline based on payload size (ms)
     // 300ms base + 1ms per 1MB payload (ceil)
     pub fn read_deadline_ms(payload_len: usize) -> u64 {
-        let mb = (payload_len as u64 + 1_048_575) / 1_048_576;
+        let mb = (payload_len as u64).div_ceil(1_048_576);
         READ_BASE_MS + mb * PER_MB_MS
     }
 }

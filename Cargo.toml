@@ -29,11 +29,13 @@ serde = { version = "1.0", features = ["derive"] } # (may be used elsewhere)
 serde_json = "1.0"
 toml = "0.8"
 tokio = { version = "1.35", features = ["full"] } # Asynchronous I/O
-quinn = "0.10" # QUIC transport for high-performance networking
+quinn = "0.11" # QUIC transport; aligns with rustls 0.22 and ring >= 0.17
 rustls = "0.22" # TLS support for secure connections
 rustls-pemfile = "2.0" # PEM file parsing for TLS certificates
 rcgen = "0.12" # Self-signed certificate generation
 tokio-rustls = "0.25" # Async TLS for tokio
+mdns-sd = "0.7"
+hostname = "0.3"
 chrono = { version = "0.4" }
 filetime = "0.2"
 bincode = "1.3"

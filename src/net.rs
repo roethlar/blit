@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 // Centralized protocol constants - Claude's enhanced approach
-use crate::protocol::{MAGIC, VERSION, MAX_FRAME_SIZE, frame};
-use crate::protocol_core;
 use crate::fs_enum;
+use crate::protocol::frame;
+use crate::protocol_core;
 #[cfg(windows)]
 use crate::win_fs;
 // Use library modules from the blit lib crate
@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 thread_local! {
     static MTIME_STORE: std::cell::RefCell<std::collections::HashMap<String, i64>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
-
 
 fn apply_preserved_mtime(path: &Path) -> Result<()> {
     use filetime::{set_file_mtime, FileTime};
@@ -47,8 +46,6 @@ fn preallocate_file_linux(file: &std::fs::File, size: u64) {
 #[cfg(not(target_os = "linux"))]
 fn preallocate_file_linux(_file: &std::fs::File, _size: u64) {}
 // MAGIC, VERSION, and MAX_FRAME_SIZE now imported from protocol module
-
-
 
 fn write_frame(stream: &mut TcpStream, t: u8, payload: &[u8]) -> Result<()> {
     let hdr = protocol_core::build_frame_header(t, payload.len() as u32);
@@ -255,7 +252,7 @@ fn tune_socket(stream: &TcpStream) {
                 &keepalive as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&keepalive) as libc::socklen_t,
             );
-            
+
             // Platform-specific keepalive tuning
             #[cfg(target_os = "linux")]
             {
@@ -284,7 +281,7 @@ fn tune_socket(stream: &TcpStream) {
                     std::mem::size_of_val(&keepcnt) as libc::socklen_t,
                 );
             }
-            
+
             // Set buffer sizes
             let sz: libc::c_int = 8 * 1024 * 1024;
             let p = &sz as *const _ as *const libc::c_void;
@@ -308,7 +305,7 @@ fn tune_socket(stream: &TcpStream) {
     {
         use std::os::windows::io::AsRawSocket;
         use windows::Win32::Networking::WinSock::{
-            setsockopt, SOCKET, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF, SO_KEEPALIVE,
+            setsockopt, SOCKET, SOL_SOCKET, SO_KEEPALIVE, SO_RCVBUF, SO_SNDBUF,
         };
         let s = SOCKET(stream.as_raw_socket() as usize);
         unsafe {
@@ -318,8 +315,13 @@ fn tune_socket(stream: &TcpStream) {
                 (&keepalive as *const u32) as *const u8,
                 std::mem::size_of_val(&keepalive),
             );
-            let _ = setsockopt(s, SOL_SOCKET as i32, SO_KEEPALIVE as i32, Some(bytes_keepalive));
-            
+            let _ = setsockopt(
+                s,
+                SOL_SOCKET as i32,
+                SO_KEEPALIVE as i32,
+                Some(bytes_keepalive),
+            );
+
             // Set buffer sizes
             let mut sz: i32 = 8 * 1024 * 1024;
             let bytes = std::slice::from_raw_parts(
@@ -348,7 +350,7 @@ fn tune_socket_sized(stream: &TcpStream, bytes: i32) {
                 &keepalive as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&keepalive) as libc::socklen_t,
             );
-            
+
             #[cfg(target_os = "linux")]
             {
                 let keepidle: libc::c_int = 60;
@@ -376,7 +378,7 @@ fn tune_socket_sized(stream: &TcpStream, bytes: i32) {
                     std::mem::size_of_val(&keepcnt) as libc::socklen_t,
                 );
             }
-            
+
             // Set custom buffer sizes
             let sz: libc::c_int = bytes as libc::c_int;
             let p = &sz as *const _ as *const libc::c_void;
@@ -400,7 +402,7 @@ fn tune_socket_sized(stream: &TcpStream, bytes: i32) {
     {
         use std::os::windows::io::AsRawSocket;
         use windows::Win32::Networking::WinSock::{
-            setsockopt, SOCKET, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF, SO_KEEPALIVE,
+            setsockopt, SOCKET, SOL_SOCKET, SO_KEEPALIVE, SO_RCVBUF, SO_SNDBUF,
         };
         let s = SOCKET(stream.as_raw_socket() as usize);
         unsafe {
@@ -410,8 +412,13 @@ fn tune_socket_sized(stream: &TcpStream, bytes: i32) {
                 (&keepalive as *const u32) as *const u8,
                 std::mem::size_of_val(&keepalive),
             );
-            let _ = setsockopt(s, SOL_SOCKET as i32, SO_KEEPALIVE as i32, Some(bytes_keepalive));
-            
+            let _ = setsockopt(
+                s,
+                SOL_SOCKET as i32,
+                SO_KEEPALIVE as i32,
+                Some(bytes_keepalive),
+            );
+
             // Set custom buffer sizes
             let mut sz: i32 = bytes;
             let bytes = std::slice::from_raw_parts(
@@ -554,7 +561,7 @@ fn handle_tar_stream(
     let mut reader = TarFrameReader::new(stream);
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
-    
+
     let mut archive = tar::Archive::new(&mut reader);
     archive.set_overwrite(true);
     let entries = archive.entries()?;
@@ -563,7 +570,7 @@ fn handle_tar_stream(
         file_count += fc;
         total_bytes += tb;
     }
-    
+
     // IMPORTANT: TarFrameReader owns TAR_END consumption - it reads frames until TAR_END
     // and sets done=true when TAR_END is encountered. We should NOT attempt to read
     // TAR_END again here as it's already been consumed by the reader.
@@ -580,21 +587,21 @@ fn process_tar_entry(
     let mut entry = res?;
     let et = entry.header().entry_type();
     let mut file_count = 0u64;
-   let mut total_bytes = 0u64;
-   
-   if et.is_block_special() || et.is_character_special() || et.is_fifo() {
-       // Skip special device/FIFO entries for safety
-       return Ok((0, 0));
-   }
-   
-   // On Windows, create symlinks explicitly to avoid tar crate failures when privileges are missing
     let mut total_bytes = 0u64;
-    
+
+    if et.is_block_special() || et.is_character_special() || et.is_fifo() {
+        // Skip special device/FIFO entries for safety
+        return Ok((0, 0));
+    }
+
+    // On Windows, create symlinks explicitly to avoid tar crate failures when privileges are missing
+    let mut total_bytes = 0u64;
+
     if et.is_block_special() || et.is_character_special() || et.is_fifo() || et.is_hard_link() {
         // Skip special device/FIFO/hard link entries for safety
         return Ok((0, 0));
     }
-    
+
     // On Windows, create symlinks explicitly to avoid tar crate failures when privileges are missing
     #[cfg(windows)]
     if et.is_symlink() {
@@ -622,10 +629,10 @@ fn process_tar_entry(
         }
         // If we couldn't handle symlink specially, fall back to default unpack
     }
-    
+
     // Unpack within base safely (allows files, dirs, symlinks, hardlinks)
     entry.unpack_in(base)?;
-    
+
     // Track created path under base without resolving symlinks to avoid false escapes
     let rel = entry.path()?.to_path_buf();
     use std::path::Component;
@@ -634,7 +641,7 @@ fn process_tar_entry(
             anyhow::bail!("tar entry contains parent component");
         }
     }
-    
+
     // Join under base and normalize out any CurDir components without resolving symlinks
     use std::path::Component::{CurDir, Normal, RootDir};
     let mut joined = PathBuf::from(base);
@@ -646,7 +653,7 @@ fn process_tar_entry(
             _ => { /* ParentDir already rejected above; others not expected on Unix */ }
         }
     }
-    
+
     // Update counters and preserve mtime on Windows for files
     if et.is_file() {
         if let Ok(sz) = entry.header().size() {
@@ -661,17 +668,13 @@ fn process_tar_entry(
         }
     }
     received.insert(joined);
-    
+
     Ok((file_count, total_bytes))
 }
 
 pub fn serve(bind: &str, root: &Path) -> Result<()> {
     let listener = TcpListener::bind(bind).with_context(|| format!("bind {}", bind))?;
-    eprintln!(
-        "blit daemon listening on {} root={}",
-        bind,
-        root.display()
-    );
+    eprintln!("blit daemon listening on {} root={}", bind, root.display());
     for conn in listener.incoming() {
         match conn {
             Ok(mut stream) => {
@@ -719,14 +722,14 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
     let mirror = (flags & 0b0000_0001) != 0;
     let pull = (flags & 0b0000_0010) != 0;
     let include_dirs = (flags & 0b0000_0100) != 0;
-    
+
     // Extract compression flags from bits 4-5 (ignored, compression removed)
     let _client_compress = (flags >> 4) & 0b11;
     let dest_rel = PathBuf::from(dest);
     let base = normalize_under_root(root, &dest_rel)?;
     fs::create_dir_all(&base).ok();
     eprintln!("start dest={} mirror={}", base.display(), mirror);
-    
+
     // Send OK with no compression flags (compression removed)
     let ok_flags = 0u8;
     write_frame(stream, frame::OK, &[ok_flags])?;
@@ -777,11 +780,16 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                                 anyhow::bail!("bad MANIFEST_ENTRY file fields");
                             }
                             let off = 3 + nlen;
-                            let size = u64::from_le_bytes(pl2[off..off + 8].try_into()
-                                .context("Invalid size bytes in manifest entry")?);
-                            let mtime =
-                                i64::from_le_bytes(pl2[off + 8..off + 16].try_into()
-                                .context("Invalid mtime bytes in manifest entry")?);
+                            let size = u64::from_le_bytes(
+                                pl2[off..off + 8]
+                                    .try_into()
+                                    .context("Invalid size bytes in manifest entry")?,
+                            );
+                            let mtime = i64::from_le_bytes(
+                                pl2[off + 8..off + 16]
+                                    .try_into()
+                                    .context("Invalid mtime bytes in manifest entry")?,
+                            );
                             let mut need = true;
                             if let Ok(md) = std::fs::metadata(&dst) {
                                 if md.is_file() {
@@ -811,8 +819,7 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                             if pl2.len() < off + 2 + tlen {
                                 anyhow::bail!("bad MANIFEST_ENTRY symlink target len");
                             }
-                            let target =
-                                std::str::from_utf8(&pl2[off + 2..off + 2 + tlen])
+                            let target = std::str::from_utf8(&pl2[off + 2..off + 2 + tlen])
                                 .context("Invalid UTF-8 in symlink target")
                                 .unwrap_or_else(|_| "");
                             let mut need = true;
@@ -1128,11 +1135,17 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                 }
                 let rel = std::str::from_utf8(&pl[2..2 + nlen]).context("utf8 path")?;
                 let mut off = 2 + nlen;
-                let size = u64::from_le_bytes(pl[off..off + 8].try_into()
-                    .context("Invalid size bytes in FILE_START")?);
+                let size = u64::from_le_bytes(
+                    pl[off..off + 8]
+                        .try_into()
+                        .context("Invalid size bytes in FILE_START")?,
+                );
                 off += 8;
-                let mtime = i64::from_le_bytes(pl[off..off + 8].try_into()
-                    .context("Invalid mtime bytes in FILE_START")?);
+                let mtime = i64::from_le_bytes(
+                    pl[off..off + 8]
+                        .try_into()
+                        .context("Invalid mtime bytes in FILE_START")?,
+                );
                 let relp = PathBuf::from(rel);
                 let dst_path = normalize_under_root(&base, &relp)?;
                 if let Some(parent) = dst_path.parent() {
@@ -1193,11 +1206,17 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                 }
                 let rel = std::str::from_utf8(&pl[2..2 + nlen]).context("utf8 path")?;
                 let mut off = 2 + nlen;
-                let size = u64::from_le_bytes(pl[off..off + 8].try_into()
-                    .context("Invalid size bytes in FILE_START")?);
+                let size = u64::from_le_bytes(
+                    pl[off..off + 8]
+                        .try_into()
+                        .context("Invalid size bytes in FILE_START")?,
+                );
                 off += 8;
-                let mtime = i64::from_le_bytes(pl[off..off + 8].try_into()
-                    .context("Invalid mtime bytes in FILE_START")?);
+                let mtime = i64::from_le_bytes(
+                    pl[off..off + 8]
+                        .try_into()
+                        .context("Invalid mtime bytes in FILE_START")?,
+                );
                 let relp = PathBuf::from(rel);
                 let dst_path = normalize_under_root(&base, &relp)?;
                 if let Some(parent) = dst_path.parent() {
@@ -1227,17 +1246,29 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                 }
                 let rel = std::str::from_utf8(&pl[2..2 + nlen]).context("utf8 path")?;
                 let mut off = 2 + nlen;
-                let size = u64::from_le_bytes(pl[off..off + 8].try_into()
-                    .context("Invalid size bytes in FILE_START")?);
+                let size = u64::from_le_bytes(
+                    pl[off..off + 8]
+                        .try_into()
+                        .context("Invalid size bytes in FILE_START")?,
+                );
                 off += 8;
-                let mtime = i64::from_le_bytes(pl[off..off + 8].try_into()
-                    .context("Invalid mtime bytes in FILE_START")?);
+                let mtime = i64::from_le_bytes(
+                    pl[off..off + 8]
+                        .try_into()
+                        .context("Invalid mtime bytes in FILE_START")?,
+                );
                 off += 8;
-                let granule = u32::from_le_bytes(pl[off..off + 4].try_into()
-                    .context("Invalid granule bytes in NEED")?) as u64;
+                let granule = u32::from_le_bytes(
+                    pl[off..off + 4]
+                        .try_into()
+                        .context("Invalid granule bytes in NEED")?,
+                ) as u64;
                 off += 4;
-                let sample = u32::from_le_bytes(pl[off..off + 4].try_into()
-                    .context("Invalid sample bytes in NEED")?) as usize;
+                let sample = u32::from_le_bytes(
+                    pl[off..off + 4]
+                        .try_into()
+                        .context("Invalid sample bytes in NEED")?,
+                ) as usize;
                 let relp = PathBuf::from(rel);
                 let dst_path = normalize_under_root(&base, &relp)?;
                 if let Some(parent) = dst_path.parent() {
@@ -1267,10 +1298,16 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                 if pl.len() < 8 + 2 {
                     anyhow::bail!("bad DELTA_SAMPLE");
                 }
-                let off = u64::from_le_bytes(pl[0..8].try_into()
-                    .context("Invalid offset bytes in DELTA")?);
-                let hlen = u16::from_le_bytes(pl[8..10].try_into()
-                    .context("Invalid hash length bytes in DELTA")?) as usize;
+                let off = u64::from_le_bytes(
+                    pl[0..8]
+                        .try_into()
+                        .context("Invalid offset bytes in DELTA")?,
+                );
+                let hlen = u16::from_le_bytes(
+                    pl[8..10]
+                        .try_into()
+                        .context("Invalid hash length bytes in DELTA")?,
+                ) as usize;
                 if pl.len() < 10 + hlen {
                     anyhow::bail!("bad DELTA_SAMPLE hash len");
                 }
@@ -1343,8 +1380,11 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                 if pl.len() < 8 {
                     anyhow::bail!("bad DELTA_DATA");
                 }
-                let off = u64::from_le_bytes(pl[0..8].try_into()
-                    .context("Invalid offset bytes in DELTA_DATA")?);
+                let off = u64::from_le_bytes(
+                    pl[0..8]
+                        .try_into()
+                        .context("Invalid offset bytes in DELTA_DATA")?,
+                );
                 if let Some(ds) = delta_state.as_ref() {
                     use std::io::{Seek, SeekFrom, Write};
                     let mut f = File::options().read(true).write(true).open(&ds.dst_path)?;
@@ -1378,11 +1418,17 @@ fn handle_conn(stream: &mut TcpStream, root: &Path) -> Result<()> {
                 }
                 let rel = std::str::from_utf8(&pl[3..3 + nlen]).context("utf8 path")?;
                 let mut off = 3 + nlen;
-                let size = u64::from_le_bytes(pl[off..off + 8].try_into()
-                    .context("Invalid size bytes in FILE_START")?);
+                let size = u64::from_le_bytes(
+                    pl[off..off + 8]
+                        .try_into()
+                        .context("Invalid size bytes in FILE_START")?,
+                );
                 off += 8;
-                let mtime = i64::from_le_bytes(pl[off..off + 8].try_into()
-                    .context("Invalid mtime bytes in FILE_START")?);
+                let mtime = i64::from_le_bytes(
+                    pl[off..off + 8]
+                        .try_into()
+                        .context("Invalid mtime bytes in FILE_START")?,
+                );
                 let relp = PathBuf::from(rel);
                 let dst_path = normalize_under_root(&base, &relp)?;
                 if let Some(parent) = dst_path.parent() {
@@ -1567,12 +1613,14 @@ pub fn client_start(
     if args.ludicrous_speed || args.never_tell_me_the_odds {
         flags |= 0b0000_1000; // speed profile hint
     }
-    
+
     // No compression flags (compression removed)
-    
+
     payload.push(flags);
     {
-        let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+        let mut s = stream
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
         write_frame(&mut s, frame::START, &payload)?;
         let (typ, resp) = read_frame(&mut s)?;
         if typ != frame::OK {
@@ -1675,12 +1723,16 @@ pub fn client_start(
     let sent_files = Arc::new(Mutex::new(0u64));
     let sent_bytes = Arc::new(Mutex::new(0u64));
     // Track last observed byte count for rate computation
-    let mut last_bytes = *sent_bytes.lock().map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
+    let mut last_bytes = *sent_bytes
+        .lock()
+        .map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
 
     // Manifest handshake: send inventory (files + symlinks + directories), receive need list
     // Build and send manifest
     {
-        let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+        let mut s = stream
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
         write_frame(&mut s, frame::MANIFEST_START, &[])?;
         use std::time::UNIX_EPOCH;
         // Files
@@ -1748,18 +1800,28 @@ pub fn client_start(
         let mut need = std::collections::HashSet::new();
         if plneed.len() >= 4 {
             let mut off = 0usize;
-            let cnt = u32::from_le_bytes(plneed[off..off + 4].try_into()
-                .context("Invalid count bytes in NEED response")?) as usize;
+            let cnt = u32::from_le_bytes(
+                plneed[off..off + 4]
+                    .try_into()
+                    .context("Invalid count bytes in NEED response")?,
+            ) as usize;
             // Sanity check: limit to 1 million entries to prevent DoS
             const MAX_NEED_ENTRIES: usize = 1_000_000;
             if cnt > MAX_NEED_ENTRIES {
-                anyhow::bail!("NEED_LIST count exceeds maximum allowed ({}): {}", MAX_NEED_ENTRIES, cnt);
+                anyhow::bail!(
+                    "NEED_LIST count exceeds maximum allowed ({}): {}",
+                    MAX_NEED_ENTRIES,
+                    cnt
+                );
             }
             off += 4;
             let mut parsed = 0usize;
             while off + 2 <= plneed.len() && parsed < cnt {
-                let nlen = u16::from_le_bytes(plneed[off..off + 2].try_into()
-                    .context("Invalid name length bytes in NEED response")?) as usize;
+                let nlen = u16::from_le_bytes(
+                    plneed[off..off + 2]
+                        .try_into()
+                        .context("Invalid name length bytes in NEED response")?,
+                ) as usize;
                 off += 2;
                 if off + nlen > plneed.len() {
                     break;
@@ -1793,9 +1855,11 @@ pub fn client_start(
     // If any small files, stream them via tar frames first (unless --no-tar)
     if !args.no_tar && !small_files.is_empty() {
         // No compression (compression removed)
-        
-        let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
-        
+
+        let mut s = stream
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+
         write_frame(&mut s, frame::TAR_START, &[])?;
         struct FrameWriter<'a> {
             stream: &'a mut TcpStream,
@@ -1881,15 +1945,21 @@ pub fn client_start(
         }
         // Update counters to include tar-streamed files/bytes
         {
-            let mut sf = sent_files.lock().map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
+            let mut sf = sent_files
+                .lock()
+                .map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
             *sf += small_files.len() as u64;
         }
         {
             let bytes: u64 = small_files.iter().map(|e| e.size).sum();
-            let mut sb = sent_bytes.lock().map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
+            let mut sb = sent_bytes
+                .lock()
+                .map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
             *sb += bytes;
             if !args.progress && last_tick.elapsed() >= tick {
-                let sf = sent_files.lock().map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
+                let sf = sent_files
+                    .lock()
+                    .map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
                 let current_bytes = *sb;
                 let rate = (current_bytes - last_bytes) as f64
                     / last_tick.elapsed().as_secs_f64()
@@ -1919,10 +1989,14 @@ pub fn client_start(
         pl.extend_from_slice(rels.as_bytes());
         pl.extend_from_slice(&(targ.len() as u16).to_le_bytes());
         pl.extend_from_slice(targ.as_bytes());
-        let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+        let mut s = stream
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
         write_frame(&mut s, frame::SYMLINK, &pl)?;
         drop(s);
-        let mut sf = sent_files.lock().map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
+        let mut sf = sent_files
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
         *sf += 1;
         files_sent += 1;
         let now = SystemTime::now()
@@ -2021,7 +2095,9 @@ pub fn client_start(
 
             loop {
                 let job_opt = {
-                    let mut q = work.lock().map_err(|e| anyhow!("Failed to lock work queue: {}", e))?;
+                    let mut q = work
+                        .lock()
+                        .map_err(|e| anyhow!("Failed to lock work queue: {}", e))?;
                     q.pop()
                 };
                 let (fe, chunk) = match job_opt {
@@ -2106,10 +2182,16 @@ pub fn client_start(
                             let (ti, pli) = read_frame(&mut s)?;
                             if ti == frame::NEED_RANGE {
                                 if pli.len() >= 16 {
-                                    let off = u64::from_le_bytes(pli[0..8].try_into()
-                                        .context("Invalid offset bytes in NEEDRANGES")?);
-                                    let len = u64::from_le_bytes(pli[8..16].try_into()
-                                        .context("Invalid length bytes in NEEDRANGES")?);
+                                    let off = u64::from_le_bytes(
+                                        pli[0..8]
+                                            .try_into()
+                                            .context("Invalid offset bytes in NEEDRANGES")?,
+                                    );
+                                    let len = u64::from_le_bytes(
+                                        pli[8..16]
+                                            .try_into()
+                                            .context("Invalid length bytes in NEEDRANGES")?,
+                                    );
                                     need_ranges.push((off, len));
                                 }
                             } else if ti == frame::NEED_RANGES_END {
@@ -2139,7 +2221,9 @@ pub fn client_start(
                                 write_frame(&mut s, frame::DELTA_DATA, &p)?;
                                 off += n as u64;
                                 left -= n as u64;
-                                let mut sb = sent_bytes.lock().map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
+                                let mut sb = sent_bytes
+                                    .lock()
+                                    .map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
                                 *sb += n as u64;
                             }
                         }
@@ -2161,7 +2245,9 @@ pub fn client_start(
                                 anyhow::bail!("hash mismatch for {}", rels);
                             }
                         }
-                        let mut sf = sent_files.lock().map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
+                        let mut sf = sent_files
+                            .lock()
+                            .map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
                         *sf += 1;
                         if progress {
                             let saved = 100.0 - (total_need_bytes as f64 / fe.size as f64 * 100.0);
@@ -2210,7 +2296,9 @@ pub fn client_start(
                         pla.extend_from_slice(&mode.to_le_bytes());
                         write_frame(&mut s, frame::SET_ATTR, &pla)?;
                     }
-                    let mut sb = sent_bytes.lock().map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
+                    let mut sb = sent_bytes
+                        .lock()
+                        .map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
                     *sb += fe.size;
                     drop(sb);
                     if progress {
@@ -2242,7 +2330,9 @@ pub fn client_start(
                         pl.push(0);
                         pl.extend_from_slice(&buf[..n]);
                         write_frame(&mut s, frame::PFILE_DATA, &pl)?;
-                        let mut sb = sent_bytes.lock().map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
+                        let mut sb = sent_bytes
+                            .lock()
+                            .map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
                         *sb += n as u64;
                     }
 
@@ -2281,7 +2371,9 @@ pub fn client_start(
                         anyhow::bail!("hash mismatch for {}", rels);
                     }
                 }
-                let mut sf = sent_files.lock().map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
+                let mut sf = sent_files
+                    .lock()
+                    .map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
                 *sf += 1;
                 if progress {
                     println!("{} → {} ({} bytes)", fe.path.display(), dest_rel, fe.size);
@@ -2300,7 +2392,9 @@ pub fn client_start(
 
     // (large files handled via data pool above)
     let mut buf = vec![0u8; 1024 * 1024];
-    let mut last_bytes = *sent_bytes.lock().map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
+    let mut last_bytes = *sent_bytes
+        .lock()
+        .map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
     for fe in &[] as &[fs_enum::FileEntry] {
         let rel = fe.path.strip_prefix(src_root).unwrap_or(&fe.path);
         let dest_rel = rel.to_string_lossy();
@@ -2317,7 +2411,9 @@ pub fn client_start(
         pl.extend_from_slice(&mtime.to_le_bytes());
 
         let (t, _r) = {
-            let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+            let mut s = stream
+                .lock()
+                .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
             write_frame(&mut s, frame::FILE_START, &pl)?;
             read_frame(&mut s)?
         };
@@ -2332,13 +2428,19 @@ pub fn client_start(
                 break;
             }
             {
-                let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+                let mut s = stream
+                    .lock()
+                    .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
                 write_frame(&mut s, frame::FILE_DATA, &buf[..n])?;
             }
-            let mut sb = sent_bytes.lock().map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
+            let mut sb = sent_bytes
+                .lock()
+                .map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
             *sb += n as u64;
             if !args.progress && last_tick.elapsed() >= tick {
-                let sf = sent_files.lock().map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
+                let sf = sent_files
+                    .lock()
+                    .map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
                 let current_bytes = *sb;
                 let rate = (current_bytes - last_bytes) as f64
                     / last_tick.elapsed().as_secs_f64()
@@ -2358,7 +2460,9 @@ pub fn client_start(
         }
 
         let (t2, _r2) = {
-            let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+            let mut s = stream
+                .lock()
+                .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
             write_frame(&mut s, frame::FILE_END, &[])?;
             read_frame(&mut s)?
         };
@@ -2366,7 +2470,9 @@ pub fn client_start(
             anyhow::bail!("server FILE_END error");
         }
 
-        let mut sf = sent_files.lock().map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
+        let mut sf = sent_files
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
         *sf += 1;
         if args.progress {
             println!("{} → {} ({} bytes)", fe.path.display(), dest_rel, fe.size);
@@ -2375,7 +2481,9 @@ pub fn client_start(
 
     // DONE
     {
-        let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+        let mut s = stream
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
         write_frame(&mut s, frame::DONE, &[])?;
         let (t3, _r3) = read_frame(&mut s)?;
         if t3 != frame::OK {
@@ -2386,8 +2494,12 @@ pub fn client_start(
         // Clear the carriage-returned spinner/status line and any trailing characters
         print!("\r\x1b[K");
         let _ = stdout().flush();
-        let sf = sent_files.lock().map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
-        let sb = sent_bytes.lock().map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
+        let sf = sent_files
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock sent_files: {}", e))?;
+        let sb = sent_bytes
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock sent_bytes: {}", e))?;
         println!("✓ sent {} files, {:.2} MB", *sf, *sb as f64 / 1_048_576.0);
     }
     Ok(())
@@ -2431,7 +2543,9 @@ pub fn client_pull(
     }
     payload.push(flags);
     {
-        let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+        let mut s = stream
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
         write_frame(&mut s, frame::START, &payload)?;
         let (typ, resp) = read_frame(&mut s)?;
         if typ != frame::OK {
@@ -2503,13 +2617,17 @@ pub fn client_pull(
     let mut expected: HSet<PathBuf> = HSet::new();
     loop {
         let (t, pl) = {
-            let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+            let mut s = stream
+                .lock()
+                .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
             read_frame(&mut s)?
         };
         match t {
             x if x == frame::TAR_START => {
                 // Ignore compression flag from payload (compression removed)
-                let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+                let mut s = stream
+                    .lock()
+                    .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
                 let (fc, fb) = handle_tar_stream(&mut s, dest_root, &mut expected)?;
                 files_recv = files_recv.saturating_add(fc);
                 bytes_recv = bytes_recv.saturating_add(fb);
@@ -2592,11 +2710,17 @@ pub fn client_pull(
                 }
                 let rel = std::str::from_utf8(&pl[2..2 + nlen]).context("utf8 path")?;
                 let mut off = 2 + nlen;
-                let size = u64::from_le_bytes(pl[off..off + 8].try_into()
-                    .context("Invalid size bytes in FILE_START")?);
+                let size = u64::from_le_bytes(
+                    pl[off..off + 8]
+                        .try_into()
+                        .context("Invalid size bytes in FILE_START")?,
+                );
                 off += 8;
-                let mtime = i64::from_le_bytes(pl[off..off + 8].try_into()
-                    .context("Invalid mtime bytes in FILE_START")?);
+                let mtime = i64::from_le_bytes(
+                    pl[off..off + 8]
+                        .try_into()
+                        .context("Invalid mtime bytes in FILE_START")?,
+                );
                 let dst_path = dest_root.join(rel);
                 if let Some(parent) = dst_path.parent() {
                     std::fs::create_dir_all(parent).ok();
@@ -2612,7 +2736,9 @@ pub fn client_pull(
                 let mut written = 0u64;
                 loop {
                     let (t2, pl2) = {
-                        let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+                        let mut s = stream
+                            .lock()
+                            .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
                         read_frame(&mut s)?
                     };
                     if t2 == frame::FILE_DATA {
@@ -2650,7 +2776,9 @@ pub fn client_pull(
                 expected.insert(dst_path);
             }
             x if x == frame::DONE => {
-                let mut s = stream.lock().map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
+                let mut s = stream
+                    .lock()
+                    .map_err(|e| anyhow!("Failed to lock stream: {}", e))?;
                 write_frame(&mut s, frame::OK, b"OK")?;
                 break;
             }
