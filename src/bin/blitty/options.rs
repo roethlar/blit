@@ -44,15 +44,17 @@ pub struct OptionsState {
 
 impl OptionsState {
     pub fn with_safe_defaults() -> Self {
-        let mut s = Self::default();
-        s.include_empty = true;
-        // Use auto-tuning by default (0 means auto for performance knobs)
-        s.threads = 0;
-        s.net_workers = 0;
-        s.net_chunk_mb = 0;
-        s.mode = "copy".to_string();
-        s.recent_hosts = Vec::new();
-        s
+        // Use struct literal to avoid field_reassign_with_default
+        Self {
+            include_empty: true,
+            // auto-tuning knobs: 0 means auto
+            threads: 0,
+            net_workers: 0,
+            net_chunk_mb: 0,
+            mode: "copy".to_string(),
+            recent_hosts: Vec::new(),
+            ..Default::default()
+        }
     }
 }
 
@@ -187,7 +189,7 @@ pub fn build_blit_args(
     args
 }
 
-pub const OPTIONS_COUNT: usize = 8; // keep in sync with UI list
+// NOTE: Keep the Options list length in sync with UI when adding new options.
 
 pub fn toggle_option(opts: &mut OptionsState, idx: usize) {
     match idx {
@@ -313,7 +315,7 @@ mod tests {
         );
         assert_eq!(args[0], "copy");
         assert!(args.contains(&"--empty-dirs".to_string()));
-        assert!(args.ends_with(&vec!["/src".to_string(), "/dst".to_string()]));
+        assert!(args.ends_with(&["/src".to_string(), "/dst".to_string()]));
     }
 
     #[test]

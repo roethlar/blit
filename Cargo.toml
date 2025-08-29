@@ -69,7 +69,9 @@ opt-level = 3
 strip = true
 
 [features]
-default = []
+default = ["api_client","server"]
+api_client = []
+server = ["api_client"]
 
 [[bin]]
 name = "blit"

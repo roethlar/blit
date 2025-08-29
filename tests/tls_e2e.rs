@@ -1,3 +1,4 @@
+#![cfg(feature = "api_client")]
 use anyhow::Result;
 use blit::{net_async, tls, Args};
 use std::io::Write;
@@ -63,10 +64,7 @@ async fn tls_push_pull_basic() -> Result<()> {
     }
 
     // Build client args
-    let mut args = Args::default();
-    args.empty_dirs = true;
-    args.net_workers = 2;
-    args.net_chunk_mb = 2;
+    let args = Args { empty_dirs: true, net_workers: 2, net_chunk_mb: 2, ..Default::default() };
 
     // Push client src -> server:dest
     let dest_on_server = std::path::Path::new("dest");
@@ -145,6 +143,7 @@ where
     Ok((typ, payload))
 }
 
+#[allow(dead_code)]
 async fn write_frame<S>(stream: &mut S, t: u8, payload: &[u8]) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,

@@ -31,7 +31,7 @@ if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != CYGWIN* && "$(uname -s)" != *N
 fi
 
 echo "[3/6] Starting async daemon on port $PORT"
-target/debug/blit daemon "$ROOT" "$PORT" >/dev/null 2>&1 &
+target/debug/blitd --root "$ROOT" --bind "127.0.0.1:${PORT}" >/dev/null 2>&1 &
 echo $! > scripts/smoketests/local/daemon.pid
 sleep 0.7
 

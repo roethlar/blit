@@ -6,19 +6,15 @@
 //! - Direct dispatch based on file size
 //! - No complex abstractions
 
-mod buffer;
-mod copy;
-mod fs_enum;
-mod logger;
-mod net;
-mod net_async;
-mod protocol;
-mod protocol_core;
-mod tar_stream;
-mod tls;
-mod url;
+use blit::buffer::BufferSizer;
+use blit::copy::{chunked_copy_file, file_needs_copy, mmap_copy_file, parallel_copy_files, CopyStats};
 #[cfg(windows)]
-mod win_fs;
+use blit::copy::windows_copyfile;
+use blit::fs_enum::{categorize_files, enumerate_directory_filtered, enumerate_directory_deref_filtered, CopyJob, FileEntry, FileFilter};
+use blit::logger::{Logger, NoopLogger, TextLogger};
+use blit::net_async;
+use blit::tar_stream::{tar_stream_transfer_list, TarConfig};
+use blit::url;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -28,16 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::buffer::BufferSizer;
-use crate::copy::{
-    chunked_copy_file, file_needs_copy, mmap_copy_file, parallel_copy_files, windows_copyfile,
-    CopyStats,
-};
-use crate::fs_enum::{
-    categorize_files, enumerate_directory_filtered, CopyJob, FileEntry, FileFilter,
-};
-use crate::logger::{Logger, NoopLogger, TextLogger};
-use crate::tar_stream::{tar_stream_transfer_list, TarConfig};
+
 // TUI removed - use blitty binary instead
 use serde::Serialize;
 
@@ -284,12 +271,10 @@ fn main() -> Result<()> {
                         remote_src.port,
                         &remote_src.path,
                     ))?;
+                } else if src.is_file() {
+                    let _ = std::fs::remove_file(src);
                 } else {
-                    if src.is_file() {
-                        let _ = std::fs::remove_file(src);
-                    } else {
-                        let _ = std::fs::remove_dir_all(src);
-                    }
+                    let _ = std::fs::remove_dir_all(src);
                 }
                 return Ok(());
             }
@@ -360,11 +345,8 @@ fn main() -> Result<()> {
         }
     } else {
         // In ludicrous modes, suppress logging overhead by default
-        if args.ludicrous_speed || args.never_tell_me_the_odds {
-            Arc::new(NoopLogger)
-        } else {
-            Arc::new(NoopLogger)
-        }
+        let _ = args; // same logger in all modes for now
+        Arc::new(NoopLogger)
     };
 
     let start = Instant::now();
@@ -405,7 +387,7 @@ fn main() -> Result<()> {
     }
 
     // Detect if this is a network transfer
-    let is_network = is_network_path(&dest_path);
+    let _is_network = is_network_path(&dest_path);
 
     // Simple activity indicator (no performance impact)
     let show_activity = !(args.verbose || args.progress); // Only show simple indicator if not verbose or progress
@@ -479,20 +461,14 @@ fn main() -> Result<()> {
         println!("Enumerating files...");
     }
 
-    // Decide empty-dir behavior (Robocopy semantics: --mir implies including empties). --update matches this.
-    let include_empty_dirs = if delete_extra || args.update {
-        if args.subdirs || args.no_empty_dirs {
-            if args.verbose {
-                println!("Note: --mir implies --empty-dirs; including empty directories.");
-            }
-        }
-        true
-    } else if args.subdirs || args.no_empty_dirs {
-        false
-    } else if args.empty_dirs {
+    // Decide empty-dir behavior (Robocopy semantics: --mir/--update include empties)
+    if (args.subdirs || args.no_empty_dirs) && args.verbose {
+        println!("Note: --mir implies --empty-dirs; including empty directories.");
+    }
+    let _include_empty_dirs = if delete_extra || args.update {
         true
     } else {
-        true
+        args.empty_dirs || !(args.subdirs || args.no_empty_dirs)
     };
 
     // Build filter from CLI arguments
@@ -501,7 +477,6 @@ fn main() -> Result<()> {
         exclude_dirs: args.exclude_dirs.clone(),
         min_size: None,
         max_size: None,
-        include_empty_dirs,
     };
 
     if args.verbose {
@@ -520,7 +495,7 @@ fn main() -> Result<()> {
     let preserve_links = args.sl;
 
     let initial_entries = if !preserve_links {
-        crate::fs_enum::enumerate_directory_deref_filtered(&src_path, &filter)
+        enumerate_directory_deref_filtered(&src_path, &filter)
     } else {
         enumerate_directory_filtered(&src_path, &filter)
     }
@@ -531,7 +506,6 @@ fn main() -> Result<()> {
         .into_iter()
         .map(|entry| CopyJob {
             entry,
-            start_offset: 0,
         })
         .collect();
 
@@ -568,10 +542,7 @@ fn main() -> Result<()> {
             .filter(|job| {
                 let src = &job.entry.path;
                 let dst = compute_destination(src, &src_path, &dest_path);
-                match file_needs_copy(src, &dst, args.checksum) {
-                    Ok(needs_copy) => needs_copy,
-                    Err(_) => true, // Copy if we can't determine (file might not exist)
-                }
+                file_needs_copy(src, &dst, args.checksum).unwrap_or(true)
             })
             .collect()
     } else {
@@ -924,7 +895,7 @@ fn run_local(
     src_path: &Path,
     dest_path: &Path,
     mirror: bool,
-    include_empty: bool,
+    _include_empty: bool,
     args: &Args,
 ) -> Result<()> {
     // The main function already implements the full local copy pipeline.
@@ -940,11 +911,10 @@ fn run_local(
         exclude_dirs: vec![],
         min_size: None,
         max_size: None,
-        include_empty_dirs: include_empty,
     };
     let preserve_links = args.sl;
     let initial_entries = if !preserve_links {
-        crate::fs_enum::enumerate_directory_deref_filtered(src_path, &filter)
+        enumerate_directory_deref_filtered(src_path, &filter)
     } else {
         enumerate_directory_filtered(src_path, &filter)
     }?;
@@ -952,7 +922,6 @@ fn run_local(
         .into_iter()
         .map(|entry| CopyJob {
             entry,
-            start_offset: 0,
         })
         .collect();
     let (small, medium, large) = categorize_files(copy_jobs);
@@ -982,18 +951,17 @@ fn run_local(
     // Large files chunked or mmap
     for job in &large {
         let dst = compute_destination(&job.entry.path, src_path, dest_path);
-        let bytes = if !false && cfg!(unix) {
-            mmap_copy_file(&job.entry.path, &dst)?
-        } else {
-            chunked_copy_file(
-                &job.entry.path,
-                &dst,
-                &BufferSizer::new(),
-                false,
-                None,
-                &*logger,
-            )?
-        };
+        #[cfg(unix)]
+        let bytes = mmap_copy_file(&job.entry.path, &dst)?;
+        #[cfg(not(unix))]
+        let bytes = chunked_copy_file(
+            &job.entry.path,
+            &dst,
+            &BufferSizer::new(),
+            false,
+            None,
+            &*logger,
+        )?;
         total_files_copied += 1;
         total_bytes += bytes;
     }
@@ -1060,7 +1028,7 @@ fn is_network_path(_path: &Path) -> bool {
 }
 
 /// Determine if tar streaming would be beneficial with dynamic threshold
-fn should_use_tar(small_files: &[CopyJob], is_network: bool) -> bool {
+fn should_use_tar(small_files: &[CopyJob], _is_network: bool) -> bool {
     let count = small_files.len();
 
     // Quick analysis (O(1) operations only)
@@ -1094,26 +1062,22 @@ fn should_use_tar(small_files: &[CopyJob], is_network: bool) -> bool {
 }
 
 /// Copy a single file
-fn copy_single_file(src: &Path, dst: &Path, is_network: bool, verbose: bool) -> Result<()> {
+fn copy_single_file(src: &Path, dst: &Path, _is_network: bool, verbose: bool) -> Result<()> {
     if verbose {
         println!("Copying single file...");
     }
 
     let buffer_sizer = BufferSizer::new();
-    let bytes = if !false
-    /* local only */
-    {
-        // Use Windows CopyFileW for local copies
-        windows_copyfile(src, dst)?
-    } else {
-        copy::copy_file(
-            src,
-            dst,
-            &buffer_sizer,
-            false, /* local only */
-            &crate::logger::NoopLogger,
-        )?
-    };
+    #[cfg(windows)]
+    let bytes = windows_copyfile(src, dst)?;
+    #[cfg(not(windows))]
+    let bytes = blit::copy::copy_file(
+        src,
+        dst,
+        &buffer_sizer,
+        false, /* local only */
+        &NoopLogger,
+    )?;
 
     println!("Copied {} bytes", bytes);
     Ok(())
@@ -1242,24 +1206,23 @@ fn handle_mirror_deletion(
             if verbose {
                 if !files_to_delete.is_empty() {
                     println!("\n--- Files to delete ---");
-                    for (_i, path) in files_to_delete.iter().enumerate() {
-                        if _i < 10 {
-                            println!("  {}", path.display());
-                        } else if _i == 10 {
-                            println!("  ... and {} more files", files_to_delete.len() - 10);
-                            break;
-                        }
+                    for path in files_to_delete.iter().take(10) {
+                        println!("  {}", path.display());
+                    }
+                    if files_to_delete.len() > 10 {
+                        println!("  ... and {} more files", files_to_delete.len() - 10);
                     }
                 }
                 if !dirs_to_delete.is_empty() {
                     println!("\n--- Directories to delete ---");
-                    for (_i, path) in dirs_to_delete.iter().enumerate() {
-                        if _i < 10 {
-                            println!("  {}", path.display());
-                        } else if _i == 10 {
-                            println!("  ... and {} more directories", dirs_to_delete.len() - 10);
-                            break;
-                        }
+                    for path in dirs_to_delete.iter().take(10) {
+                        println!("  {}", path.display());
+                    }
+                    if dirs_to_delete.len() > 10 {
+                        println!(
+                            "  ... and {} more directories",
+                            dirs_to_delete.len() - 10
+                        );
                     }
                 }
             }
@@ -1274,7 +1237,7 @@ fn handle_mirror_deletion(
     let mut deleted_dirs = 0u64;
 
     // Delete files first
-    for (_i, path) in files_to_delete.iter().enumerate() {
+    for path in files_to_delete.iter() {
         // Simple deletion without progress display
 
         // Clear read-only recursively on Windows before attempting deletion
@@ -1298,7 +1261,7 @@ fn handle_mirror_deletion(
     dirs_to_delete.sort();
     dirs_to_delete.reverse(); // Delete deepest first
 
-    for (_i, path) in dirs_to_delete.iter().enumerate() {
+    for path in dirs_to_delete.iter() {
         // Simple deletion without progress display
 
         // Clear read-only recursively on Windows before attempting deletion
@@ -1338,7 +1301,9 @@ fn merge_stats(total: &mut CopyStats, other: CopyStats) {
 // Server/daemon hosting code moved to blitd binary
 // This binary (blit) is the client sync tool (local and network operations)
 
-fn client_push(remote: url::RemoteDest, src_root: &Path, args: &crate::Args) -> Result<()> {
+fn convert_args_to_lib(a: &Args) -> blit::Args { blit::Args { mirror: a.mirror, delete: a.delete, empty_dirs: a.empty_dirs, ludicrous_speed: a.ludicrous_speed, progress: a.progress, verbose: a.verbose, exclude_files: a.exclude_files.clone(), exclude_dirs: a.exclude_dirs.clone(), net_workers: a.net_workers, net_chunk_mb: a.net_chunk_mb, checksum: a.checksum, force_tar: a.force_tar, no_tar: a.no_tar, never_tell_me_the_odds: a.never_tell_me_the_odds } }
+
+fn client_push(remote: url::RemoteDest, src_root: &Path, args: &Args) -> Result<()> {
     if !src_root.exists() {
         anyhow::bail!("Source does not exist: {:?}", src_root);
     }
@@ -1346,26 +1311,26 @@ fn client_push(remote: url::RemoteDest, src_root: &Path, args: &crate::Args) -> 
         .enable_all()
         .build()
         .context("build tokio runtime for client push")?;
-    rt.block_on(net_async::client::push(
+    rt.block_on(crate::net_async::client::push(
         &remote.host,
         remote.port,
         &remote.path,
         src_root,
-        args,
+        &convert_args_to_lib(args),
     ))
 }
 
-fn client_pull(remote: url::RemoteDest, dest_root: &Path, args: &crate::Args) -> Result<()> {
+fn client_pull(remote: url::RemoteDest, dest_root: &Path, args: &Args) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tokio runtime for client pull")?;
-    rt.block_on(net_async::client::pull(
+    rt.block_on(crate::net_async::client::pull(
         &remote.host,
         remote.port,
         &remote.path,
         dest_root,
-        args,
+        &convert_args_to_lib(args),
     ))
 }
 
@@ -1387,14 +1352,12 @@ fn verify_trees(src: &Path, dest: &Path, checksum: bool) -> Result<VerifySummary
 }
 
 fn verify_local_vs_local(src: &Path, dest: &Path, checksum: bool) -> Result<VerifySummary> {
-    use crate::fs_enum::enumerate_directory_filtered;
-    use std::collections::{HashMap, HashSet};
+        use std::collections::{HashMap, HashSet};
     let filter = FileFilter {
         exclude_files: vec![],
         exclude_dirs: vec![],
         min_size: None,
         max_size: None,
-        include_empty_dirs: true,
     };
     let left = enumerate_directory_filtered(src, &filter)?;
     let right = enumerate_directory_filtered(dest, &filter)?;
@@ -1433,14 +1396,13 @@ fn verify_local_vs_local(src: &Path, dest: &Path, checksum: bool) -> Result<Veri
     for k in keys {
         match (left_map.get(&k), right_map.get(&k)) {
             (Some(l), Some(r)) => {
-                let mut differs = false;
-                if checksum {
+                let differs = if checksum {
                     let lh = hash_file(&l.path)?;
                     let rh = hash_file(&r.path)?;
-                    differs = lh != rh;
+                    lh != rh
                 } else {
-                    differs = l.size != r.size;
-                }
+                    l.size != r.size
+                };
                 if differs {
                     changed += 1;
                     if sample.len() < 50 {
@@ -1506,7 +1468,6 @@ fn verify_local_vs_remote(
         exclude_dirs: vec![],
         min_size: None,
         max_size: None,
-        include_empty_dirs: true,
     };
     let left = enumerate_directory_filtered(src, &filter)?;
     let mut local_map: HashMap<String, FileEntry> = HashMap::new();
@@ -1629,7 +1590,6 @@ fn verify_remote_vs_local(
         exclude_dirs: vec![],
         min_size: None,
         max_size: None,
-        include_empty_dirs: true,
     };
     let right = enumerate_directory_filtered(dest, &filter)?;
     let mut local_map: HashMap<String, FileEntry> = HashMap::new();

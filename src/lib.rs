@@ -1,20 +1,31 @@
-//! Blit Library
-//!
-//! High-performance file synchronization library with delta algorithm support
-
-pub mod buffer;
-pub mod checksum;
-pub mod copy;
-pub mod fs_enum;
-pub mod logger;
-pub mod tar_stream;
-
+#[cfg(any(feature = "api_client", feature = "server"))]
 pub mod cli;
-pub mod net_async; // For blitd daemon server
+// Blit Library
+//
+// High-performance file synchronization library with delta algorithm support
+
+// Expose only client API when feature is enabled. By default, lib is minimal
+// so the main binary can compile without pulling unused code.
+#[cfg(feature = "api_client")]
+pub mod net_async; // client+server; bins gate server-only usage
+#[cfg(feature = "api_client")]
 pub mod protocol;
+#[cfg(feature = "api_client")]
 pub mod protocol_core;
+#[cfg(feature = "api_client")]
 pub mod tls;
-pub mod url; // TLS encryption and TOFU verification
+#[cfg(feature = "api_client")]
+pub mod url; // TLS helpers and URL parsing for client
+#[cfg(feature = "api_client")]
+pub mod buffer;
+#[cfg(feature = "api_client")]
+pub mod fs_enum;
+#[cfg(feature = "api_client")]
+pub mod copy;
+#[cfg(feature = "api_client")]
+pub mod logger;
+#[cfg(feature = "api_client")]
+pub mod tar_stream;
 
 /// Library argument surface for network client helpers.
 /// This decouples library code from the binary's Clap struct.
@@ -35,5 +46,4 @@ pub struct Args {
     pub no_tar: bool,
     pub never_tell_me_the_odds: bool,
 }
-#[cfg(windows)]
-pub mod win_fs;
+// (win_fs and other internals are not exported by lib)

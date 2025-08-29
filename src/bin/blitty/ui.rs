@@ -1,5 +1,5 @@
 use super::{
-    app::{AppState, Focus, Mode, Pane, UiMsg},
+    app::{AppState, Focus, Mode, Pane},
     remote,
     theme::Theme,
 };
@@ -135,9 +135,9 @@ pub fn draw(f: &mut Frame, app: &AppState) {
     };
 
     // First line: status and settings
-    let check = if is_ascii_mode() { "Y" } else { "✓" };
-    let cross = if is_ascii_mode() { "N" } else { "✗" };
-    let status_parts = vec![format!("{} {}", mode_icon, mode_str(app.mode))];
+    let _check = if is_ascii_mode() { "Y" } else { "✓" };
+    let _cross = if is_ascii_mode() { "N" } else { "✗" };
+    let status_parts = [format!("{} {}", mode_icon, mode_str(app.mode))];
 
     let src_dst = format!(
         "SRC:{} → DST:{}",
@@ -179,6 +179,8 @@ pub fn draw(f: &mut Frame, app: &AppState) {
         " Type value • [Enter] save • [Esc] cancel"
     } else if app.ui_mode == super::app::UiMode::Options {
         " [↑/↓] move  [Space/Enter] toggle  [Esc] close"
+    } else if app.ui_mode == super::app::UiMode::Busy {
+        " Working… • [C] Cancel"
     } else {
         " [Tab]switch [↑↓]nav [Space]select [Enter]go [Esc]back [Backspace]swap [F2]connect [Ctrl+G]transfer [h]elp [q]uit"
     };
@@ -201,6 +203,39 @@ pub fn draw(f: &mut Frame, app: &AppState) {
             .style(ratatui::style::Style::default().bg(Theme::BG())),
     );
     f.render_widget(p, chunks[3]);
+
+    // Busy overlay
+    if app.ui_mode == super::app::UiMode::Busy {
+        let area = centered_rect(50, 20, f.size());
+        let overlay = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Working…",
+                ratatui::style::Style::default()
+                    .fg(Theme::PINK())
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(app.status.clone()),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press C to cancel",
+                ratatui::style::Style::default().fg(Theme::COMMENT()),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    " Busy ",
+                    ratatui::style::Style::default()
+                        .fg(Theme::PINK())
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ))
+                .style(ratatui::style::Style::default().bg(Theme::BG()).fg(Theme::FG())),
+        );
+        f.render_widget(Clear, area);
+        f.render_widget(overlay, area);
+    }
 
     // Toast notifications
     if let Some((msg, _)) = &app.toast {
@@ -402,12 +437,10 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                 } else {
                     "✓"
                 }
+            } else if is_ascii_mode() {
+                "off"
             } else {
-                if is_ascii_mode() {
-                    "off"
-                } else {
-                    "✗"
-                }
+                "✗"
             }
         };
 
@@ -907,7 +940,7 @@ pub fn current_options_logical_index() -> usize {
 pub fn is_ascii_mode() -> bool {
     // Check if we should use ASCII mode (for non-UTF8 terminals)
     std::env::var("BLIT_ASCII").is_ok()
-        || std::env::var("TERM").map_or(false, |t| t.contains("dumb"))
+        || std::env::var("TERM").is_ok_and(|t| t.contains("dumb"))
 }
 
 fn make_breadcrumb(path: &Path, max_len: usize) -> String {
@@ -971,17 +1004,17 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
 
     // Prominent source/destination display for header
     let src_display = match &app.src {
-        Some(PathSpec::Local(path)) => format!("📂 {}", make_breadcrumb(&path, 25)),
+        Some(PathSpec::Local(path)) => format!("📂 {}", make_breadcrumb(path, 25)),
         Some(PathSpec::Remote { host, port, path }) => {
-            format!("🌐 {}:{}{}", host, port, make_breadcrumb(&path, 20))
+            format!("🌐 {}:{}{}", host, port, make_breadcrumb(path, 20))
         }
         None => "❌ No source selected".to_string(),
     };
 
     let dest_display = match &app.dest {
-        Some(PathSpec::Local(path)) => format!("📁 {}", make_breadcrumb(&path, 25)),
+        Some(PathSpec::Local(path)) => format!("📁 {}", make_breadcrumb(path, 25)),
         Some(PathSpec::Remote { host, port, path }) => {
-            format!("🌐 {}:{}{}", host, port, make_breadcrumb(&path, 20))
+            format!("🌐 {}:{}{}", host, port, make_breadcrumb(path, 20))
         }
         None => "❌ No destination selected".to_string(),
     };
@@ -1110,13 +1143,7 @@ fn draw_pane(
                 } else {
                     "[T]"
                 }
-            } else {
-                if is_source {
-                    "📤"
-                } else {
-                    "📥"
-                }
-            };
+            } else if is_source { "📤" } else { "📥" };
             let breadcrumb = make_breadcrumb(cwd, 40);
             let label = if is_source { "Source" } else { "Target" };
             let title = format!(" {} {}: {} ", icon, label, breadcrumb);
@@ -1135,13 +1162,7 @@ fn draw_pane(
                 } else {
                     "[T]"
                 }
-            } else {
-                if is_source {
-                    "📤"
-                } else {
-                    "📥"
-                }
-            };
+            } else if is_source { "📤" } else { "📥" };
             let breadcrumb = make_breadcrumb(cwd, 30);
             // Avoid duplicating :port if host already includes it
             let host_port = if host.contains(':') {
@@ -1180,8 +1201,7 @@ fn draw_pane(
                     } else {
                         "    "
                     }
-                } else {
-                    if e.name == ".." {
+                    } else if e.name == ".." {
                         "⬆ "
                     } else if e.is_dir {
                         "📁 "
@@ -1189,8 +1209,7 @@ fn draw_pane(
                         "🔗 "
                     } else {
                         "📄 "
-                    }
-                };
+                    };
 
                 let name_with_icon = format!("{}{}", icon, e.name);
 
@@ -1341,6 +1360,9 @@ pub fn request_remote_dir(
     port: u16,
     path: PathBuf,
 ) {
+    // Enter Busy mode during initial connect/listing
+    app.ui_mode = super::app::UiMode::Busy;
+    app.status = format!("Connecting to {}:{}...", host, port);
     let _ = app.tx_ui.send(super::app::UiMsg::Loading { pane });
     remote::request_remote_dir(&app.tx_ui, pane, host, port, path);
 }
@@ -1382,76 +1404,6 @@ pub fn move_down(app: &mut super::app::AppState) {
     }
 }
 
-pub fn move_page_up(app: &mut super::app::AppState) {
-    let page = 10usize;
-    let pane = if app.focus == Focus::Left {
-        &mut app.left
-    } else {
-        &mut app.right
-    };
-    match pane {
-        Pane::Local { selected, .. } | Pane::Remote { selected, .. } => {
-            *selected = selected.saturating_sub(page);
-        }
-    }
-}
-
-pub fn move_page_down(app: &mut super::app::AppState) {
-    let page = 10usize;
-    let pane = if app.focus == Focus::Left {
-        &mut app.left
-    } else {
-        &mut app.right
-    };
-    match pane {
-        Pane::Local {
-            entries, selected, ..
-        }
-        | Pane::Remote {
-            entries, selected, ..
-        } => {
-            let max = entries.len().saturating_sub(1);
-            let mut idx = selected.saturating_add(page);
-            if idx > max {
-                idx = max;
-            }
-            *selected = idx;
-        }
-    }
-}
-
-pub fn move_home(app: &mut super::app::AppState) {
-    let pane = if app.focus == Focus::Left {
-        &mut app.left
-    } else {
-        &mut app.right
-    };
-    match pane {
-        Pane::Local { selected, .. } | Pane::Remote { selected, .. } => {
-            *selected = 0;
-        }
-    }
-}
-
-pub fn move_end(app: &mut super::app::AppState) {
-    let pane = if app.focus == Focus::Left {
-        &mut app.left
-    } else {
-        &mut app.right
-    };
-    match pane {
-        Pane::Local {
-            entries, selected, ..
-        }
-        | Pane::Remote {
-            entries, selected, ..
-        } => {
-            if !entries.is_empty() {
-                *selected = entries.len() - 1;
-            }
-        }
-    }
-}
 
 pub fn enter(app: &mut super::app::AppState) {
     let focused_pane = if app.focus == Focus::Left {
@@ -1510,8 +1462,8 @@ pub fn enter(app: &mut super::app::AppState) {
             entries,
             selected,
             cwd,
-            host,
-            port,
+            host: _,
+            port: _,
         } => {
             if *selected >= entries.len() {
                 return;
@@ -1542,16 +1494,14 @@ pub fn enter(app: &mut super::app::AppState) {
             let c = cwd.clone();
             request_remote_dir(app, super::app::Focus::Left, h, p, c);
         }
-    } else {
-        if let Pane::Remote {
-            host, port, cwd, ..
-        } = &app.right
-        {
-            let h = host.clone();
-            let p = *port;
-            let c = cwd.clone();
-            request_remote_dir(app, super::app::Focus::Right, h, p, c);
-        }
+    } else if let Pane::Remote {
+        host, port, cwd, ..
+    } = &app.right
+    {
+        let h = host.clone();
+        let p = *port;
+        let c = cwd.clone();
+        request_remote_dir(app, super::app::Focus::Right, h, p, c);
     }
 }
 
@@ -1759,23 +1709,6 @@ pub fn create_new_folder(app: &mut super::app::AppState) {
     app.input_buffer.clear();
 }
 
-pub fn toggle_remote_right(app: &mut super::app::AppState) {
-    // This function is now only called when toggling OFF remote
-    // The R key in app.rs directly sets InputMode::ServerInput
-    match &mut app.right {
-        Pane::Remote { .. } => {
-            let cwd = std::env::current_dir().unwrap_or(PathBuf::from("/"));
-            app.right = Pane::Local {
-                cwd: cwd.clone(),
-                entries: read_local_dir(&cwd),
-                selected: 0,
-            };
-        }
-        Pane::Local { .. } => {
-            // Do nothing - server input is handled by the input mode
-        }
-    }
-}
 
 pub fn toggle_help(app: &mut super::app::AppState) {
     app.help_visible = !app.help_visible;
@@ -1879,11 +1812,7 @@ pub fn get_windows_drives() -> Vec<Entry> {
     drives
 }
 
-#[cfg(not(windows))]
-pub fn get_windows_drives() -> Vec<Entry> {
-    // Not applicable on non-Windows systems
-    vec![]
-}
+// Non-Windows builds do not expose get_windows_drives
 
 pub fn refresh_panes(app: &mut super::app::AppState) {
     // Refresh left pane
@@ -1917,34 +1846,10 @@ pub fn refresh_panes(app: &mut super::app::AppState) {
     }
 }
 
-pub fn pane_cwd(app: &AppState) -> PathSpec {
-    match app.focus {
-        Focus::Left => match &app.left {
-            Pane::Local { cwd, .. } => PathSpec::Local(cwd.clone()),
-            Pane::Remote {
-                host, port, cwd, ..
-            } => PathSpec::Remote {
-                host: host.clone(),
-                port: *port,
-                path: cwd.clone(),
-            },
-        },
-        Focus::Right => match &app.right {
-            Pane::Local { cwd, .. } => PathSpec::Local(cwd.clone()),
-            Pane::Remote {
-                host, port, cwd, ..
-            } => PathSpec::Remote {
-                host: host.clone(),
-                port: *port,
-                path: cwd.clone(),
-            },
-        },
-    }
-}
 
 pub fn go_up(app: &mut super::app::AppState) {
     // Extract the info we need before borrowing
-    let (is_remote, host_opt, port_opt, parent_path) = {
+    let (_is_remote, host_opt, port_opt, parent_path) = {
         let pane = if app.focus == Focus::Left {
             &app.left
         } else {
@@ -1984,7 +1889,7 @@ pub fn go_up(app: &mut super::app::AppState) {
                 *cwd = parent.clone();
                 *selected = 0;
                 if let (Some(h), Some(p)) = (host_opt, port_opt) {
-                    request_remote_dir(app, app.focus.clone(), h, p, parent);
+                    request_remote_dir(app, app.focus, h, p, parent);
                 }
             }
         }

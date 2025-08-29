@@ -3,7 +3,7 @@ use std::sync::mpsc::Sender;
 
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+// no tokio::io imports needed here; StreamAny defines read_exact
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
@@ -68,7 +68,7 @@ async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec
         let tls = timeout(Duration::from_millis(2000), cx.connect(server_name, tcp))
             .await
             .map_err(|_| anyhow::anyhow!("TLS handshake timeout"))??;
-        StreamAny::Tls(tls)
+        StreamAny::Tls(Box::new(tls))
     };
 
     // Build LIST_REQ payload
@@ -163,7 +163,7 @@ async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec
 
 enum StreamAny {
     Plain(TcpStream),
-    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 impl StreamAny {
     async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {

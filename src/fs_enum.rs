@@ -15,28 +15,15 @@ pub struct FileEntry {
 #[derive(Debug, Clone)]
 pub struct CopyJob {
     pub entry: FileEntry,
-    pub start_offset: u64,
 }
 
 /// File filter options (robocopy-style compatibility)
+#[derive(Default)]
 pub struct FileFilter {
     pub exclude_files: Vec<String>,
     pub exclude_dirs: Vec<String>,
     pub min_size: Option<u64>,
     pub max_size: Option<u64>,
-    pub include_empty_dirs: bool,
-}
-
-impl Default for FileFilter {
-    fn default() -> Self {
-        Self {
-            exclude_files: Vec::new(),
-            exclude_dirs: Vec::new(),
-            min_size: None,
-            max_size: None,
-            include_empty_dirs: true, // Default to /E behavior
-        }
-    }
 }
 
 impl FileFilter {
@@ -147,11 +134,6 @@ pub fn enumerate_directory_filtered(root: &Path, filter: &FileFilter) -> Result<
     Ok(entries)
 }
 
-/// Backward compatibility - enumerate directory without filtering
-#[cfg(not(windows))]
-pub fn enumerate_directory(root: &Path) -> Result<Vec<FileEntry>> {
-    enumerate_directory_filtered(root, &FileFilter::default())
-}
 
 /// Windows implementation: use WalkDir without following reparse points.
 #[cfg(windows)]
@@ -184,20 +166,12 @@ pub fn enumerate_directory_filtered(root: &Path, filter: &FileFilter) -> Result<
                     });
                 }
             }
-        } else if entry.file_type().is_dir() && filter.include_empty_dirs {
-            // Optionally include empty directories: we record them as entries with size 0
-            // Detection of emptiness is deferred to mirror logic; we still enumerate files here.
-            // No action needed; directory creation is handled elsewhere.
         }
     }
 
     Ok(entries)
 }
 
-#[cfg(windows)]
-pub fn enumerate_directory(root: &Path) -> Result<Vec<FileEntry>> {
-    enumerate_directory_filtered(root, &FileFilter::default())
-}
 
 /// Categorize files by size for optimal copy strategy
 pub fn categorize_files(entries: Vec<CopyJob>) -> (Vec<CopyJob>, Vec<CopyJob>, Vec<CopyJob>) {

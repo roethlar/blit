@@ -33,7 +33,6 @@ pub enum UiMsg {
         entries: Vec<ui::Entry>,
     },
     Error(String),
-    Toast(String),
     TransferComplete {
         success: bool,
         message: String,
@@ -65,7 +64,6 @@ pub enum UiMode {
     NewFolderInput,
     Options,
     Busy,
-    ConfirmMove,
     ConfirmTransfer, // SAFETY: Require explicit confirmation for transfers (Y/N)
     ConfirmTyped,    // SAFETY: Require typing a keyword (e.g., "delete" or "move")
     TextInput,       // Generic text entry for Options editing
@@ -335,13 +333,16 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                         }
                     }
                     app.loading_pane = None;
+                    if app.ui_mode == UiMode::Busy {
+                        app.ui_mode = UiMode::Normal;
+                    }
                 }
                 UiMsg::Error(err) => {
                     app.error = Some(err);
                     app.loading_pane = None;
-                }
-                UiMsg::Toast(msg) => {
-                    app.toast = Some((msg, std::time::Instant::now()));
+                    if app.ui_mode == UiMode::Busy {
+                        app.ui_mode = UiMode::Normal;
+                    }
                 }
                 UiMsg::TransferComplete { success, message } => {
                     app.running = false;
@@ -402,8 +403,7 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
         terminal.draw(|f| ui::draw(f, &app))?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
-            match event::read()? {
-                Event::Key(k) => {
+            if let Event::Key(k) = event::read()? {
                     let code = k.code;
                     let modifiers = k.modifiers;
 
@@ -921,14 +921,48 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                                     app.status = "Transfer already in progress".to_string();
                                 }
                             }
+                            // Verify (V): run a verify between src and dest (checksum based on options)
+                            (KeyCode::Char('v'), _) => {
+                                if app.src.is_some() && app.dest.is_some() && !app.running {
+                                    let src_s = ui::pathspec_to_string(app.src.as_ref().unwrap());
+                                    let dst_s = ui::pathspec_to_string(app.dest.as_ref().unwrap());
+                                    let mut argv = vec!["verify".into(), src_s, dst_s];
+                                    if app.options.checksum {
+                                        argv.push("--checksum".into());
+                                    }
+                                    app.pending_args = Some(argv);
+                                    app.ui_mode = UiMode::Busy;
+                                    app.status = "Verifying…".to_string();
+                                    start_transfer(&mut app);
+                                } else {
+                                    app.status = "Select Source/Target first".to_string();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Busy mode: only allow cancel
+                    if app.ui_mode == UiMode::Busy {
+                        match code {
+                            KeyCode::Char('c') | KeyCode::Esc => {
+                                // Cancel running child if any
+                                if let Some(handle) = &app.child {
+                                    if let Ok(mut opt) = handle.lock() {
+                                        if let Some(mut child) = opt.take() {
+                                            let _ = child.kill();
+                                        }
+                                    }
+                                }
+                                app.running = false;
+                                app.ui_mode = UiMode::Normal;
+                                app.status = "Operation cancelled".to_string();
+                            }
                             _ => {}
                         }
                     }
                 }
-                _ => {}
             }
         }
-    }
 
     // Terminal cleanup handled by TerminalGuard
     terminal.show_cursor()?;
@@ -1009,7 +1043,7 @@ fn start_transfer(app: &mut AppState) {
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
             let br = BufReader::new(r);
-            for line in br.lines().flatten() {
+            for line in br.lines().map_while(Result::ok) {
                 let _ = txc.send(line);
             }
         });
@@ -1023,7 +1057,7 @@ fn start_transfer(app: &mut AppState) {
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
             let br = BufReader::new(err);
-            for line in br.lines().flatten() {
+            for line in br.lines().map_while(Result::ok) {
                 let _ = txc.send(format!("[err] {}", line));
             }
         });

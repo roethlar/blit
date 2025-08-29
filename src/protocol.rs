@@ -61,26 +61,14 @@ pub mod frame {
     pub const LIST_RESP: u8 = 41;
     pub const REMOVE_TREE_REQ: u8 = 42;
     pub const REMOVE_TREE_RESP: u8 = 43;
-    pub const LIST_DONE: u8 = 44;
 }
 
-// Compression flags - RESERVED/IGNORED as of v3.1
-// Compression was removed entirely to achieve 10GbE saturation
-// These constants are kept only for wire protocol compatibility with older clients
-// New implementations should ignore these bits
-pub mod compress_flags {
-    pub const NONE: u8 = 0x00; // No compression (always used in v3.1+)
-    pub const COMP_ZSTD: u8 = 0b00010000; // Reserved (ignored)
-    pub const COMP_LZ4: u8 = 0b00100000; // Reserved (ignored)
-                                         // Legacy TAR compression indicators - no longer used
-    pub const TAR_ZSTD: u8 = 0x01; // Reserved (ignored)
-    pub const TAR_LZ4: u8 = 0x02; // Reserved (ignored)
-}
+// Note: Compression flags intentionally removed; current protocol is uncompressed.
 
 // Centralized timeout constants for consistent behavior across async/legacy paths
 pub mod timeouts {
     // Base timeout for frame header reads (ms)
-    pub const FRAME_HEADER_MS: u64 = 300;
+    pub const FRAME_HEADER_MS: u64 = 1500;
 
     // Base timeout for writes (ms)
     pub const WRITE_BASE_MS: u64 = 500;

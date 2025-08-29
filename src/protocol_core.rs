@@ -139,16 +139,18 @@ pub fn clear_readonly_recursive(path: &Path) {
     win_fs::clear_readonly_recursive(path);
 }
 
-/// Create directory with parent creation
-pub fn ensure_dir_exists(path: &Path) -> Result<()> {
+    /// Create directory with parent creation
+    #[cfg(test)]
+    pub fn ensure_dir_exists(path: &Path) -> Result<()> {
     if !path.exists() {
         std::fs::create_dir_all(path)?;
     }
     Ok(())
 }
 
-/// Create parent directory if needed
-pub fn ensure_parent_exists(path: &Path) -> Result<()> {
+    /// Create parent directory if needed
+    #[cfg(test)]
+    pub fn ensure_parent_exists(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir_exists(parent)?;
     }

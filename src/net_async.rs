@@ -4,16 +4,15 @@
 //! stubs and a basic async server accept loop to start iterating toward the
 //! TODO.md P0 goal of refactoring network I/O to Tokio.
 
-use anyhow::{Context, Result};
-use std::time::Instant;
 
-#[allow(dead_code)]
+#[cfg(feature = "server")]
 pub mod server {
-    use super::*;
+    use anyhow::{Context, Result};
+    use std::time::Instant;
     use crate::protocol::frame;
     use std::path::{Path, PathBuf};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     use tokio::time::{timeout, Duration};
 
     // MAGIC and VERSION imported from crate::protocol
@@ -43,19 +42,7 @@ pub mod server {
         }
     }
 
-    #[inline]
-    async fn write_all_timed(stream: &mut TcpStream, buf: &[u8], ms: u64) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-        match timeout(Duration::from_millis(ms), async {
-            stream.write_all(buf).await
-        })
-        .await
-        {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(e.into()),
-            Err(_) => anyhow::bail!("write timeout ({} ms)", ms),
-        }
-    }
+    // note: server write_all_timed removed; frame helpers cover timed IO
 
     pub(crate) async fn write_frame_timed<S>(
         stream: &mut S,
@@ -287,36 +274,14 @@ pub async fn serve_with_tls(
                     let _speed = (flags & 0b0000_1000) != 0;
                     write_frame(&mut stream, frame::OK, b"OK").await?;
 
-                    // Connection-scoped state with counters
-                    struct DeltaState {
-                        dst_path: PathBuf,
-                        file_size: u64,
-                        mtime: i64,
-                        granule: u64,
-                        sample: usize,
-                        need_ranges: Vec<(u64, u64)>,
-                    }
                     struct Connection {
-                        expected_paths: std::collections::HashSet<PathBuf>,
                         needed: std::collections::HashSet<String>,
                         client_present: std::collections::HashSet<String>,
-                        p_files:
-                            std::collections::HashMap<u8, (PathBuf, std::fs::File, u64, u64, i64)>,
-                        bytes_sent: u64,
-                        bytes_received: u64,
-                        files_sent: u64,
-                        files_received: u64,
                         verify_batch: Vec<String>,
                     }
                     let mut conn = Connection {
-                        expected_paths: std::collections::HashSet::new(),
                         needed: std::collections::HashSet::new(),
                         client_present: std::collections::HashSet::new(),
-                        p_files: std::collections::HashMap::new(),
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        files_sent: 0,
-                        files_received: 0,
                         verify_batch: Vec::new(),
                     };
                     loop {
@@ -550,9 +515,7 @@ pub async fn serve_with_tls(
     }
 }
 
-#[allow(dead_code)]
 pub mod client {
-    use super::*;
     use crate::protocol::frame;
     use crate::url;
     use anyhow::{Context, Result};
@@ -1092,7 +1055,6 @@ pub mod client {
             exclude_dirs: args.exclude_dirs.clone(),
             min_size: None,
             max_size: None,
-            include_empty_dirs: true,
         };
         let all_files = crate::fs_enum::enumerate_directory_filtered(src_root, &filter)?;
         let files_needed: Vec<_> = all_files
@@ -1387,7 +1349,7 @@ pub mod client {
         dest_root: &Path,
         args: &crate::Args,
     ) -> Result<()> {
-        let mut stream = connect(host, port).await?;
+        let mut stream = connect_secure(host, port, true).await?;
 
         // START payload: path on server (src) + flags (mirror + pull + include_empty_dirs)
         let src_s = src.to_string_lossy();
@@ -1403,20 +1365,19 @@ pub mod client {
         }
         payload.push(flags);
 
-        server::write_frame(&mut stream, 1, &payload).await?;
-        let (typ, resp) = server::read_frame(&mut stream).await?;
+        write_frame_any(&mut stream, 1, &payload).await?;
+        let (typ, resp) = read_frame_any(&mut stream).await?;
         if typ != 2u8 {
             anyhow::bail!("daemon error: {}", String::from_utf8_lossy(&resp));
         }
 
         // Send manifest of local destination to allow delta
-        server::write_frame(&mut stream, frame::MANIFEST_START, &[]).await?; // ManifestStart
+        write_frame_any(&mut stream, frame::MANIFEST_START, &[]).await?; // ManifestStart
         let filter = crate::fs_enum::FileFilter {
             exclude_files: args.exclude_files.clone(),
             exclude_dirs: args.exclude_dirs.clone(),
             min_size: None,
             max_size: None,
-            include_empty_dirs: true,
         };
         let entries = crate::fs_enum::enumerate_directory_filtered(dest_root, &filter)?;
         use std::time::UNIX_EPOCH;
@@ -1435,18 +1396,18 @@ pub mod client {
             pl.extend_from_slice(rels.as_bytes());
             pl.extend_from_slice(&fe.size.to_le_bytes());
             pl.extend_from_slice(&mtime.to_le_bytes());
-            server::write_frame(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
+            write_frame_any(&mut stream, frame::MANIFEST_ENTRY, &pl).await?;
             // ManifestEntry
         }
-        server::write_frame(&mut stream, frame::MANIFEST_END, &[]).await?; // ManifestEnd
+        write_frame_any(&mut stream, frame::MANIFEST_END, &[]).await?; // ManifestEnd
 
-        let (_tneed, _plneed) = server::read_frame(&mut stream).await?;
+        let (_tneed, _plneed) = read_frame_any(&mut stream).await?;
 
         let mut expected_paths = HashSet::new();
         let mut current_file: Option<(tokio::fs::File, std::path::PathBuf, u64, i64)> = None;
 
         loop {
-            let (t, pl) = server::read_frame(&mut stream).await?;
+            let (t, pl) = read_frame_any(&mut stream).await?;
             match t {
                 8u8 => {
                     // TarStart
@@ -1466,7 +1427,7 @@ pub mod client {
                     });
 
                     loop {
-                        let (ti, pli) = server::read_frame(&mut stream).await?;
+                        let (ti, pli) = read_frame_any(&mut stream).await?;
                         if ti == 9u8 {
                             // TarData
                             if tx.send(pli).await.is_err() {
@@ -1481,7 +1442,7 @@ pub mod client {
                     }
                     drop(tx);
                     unpacker.await??;
-                    server::write_frame(&mut stream, frame::OK, b"OK").await?;
+                    write_frame_any(&mut stream, frame::OK, b"OK").await?;
                 }
                 4u8 => {
                     // FileStart
@@ -1563,7 +1524,7 @@ pub mod client {
                 }
                 frame::DONE => {
                     // Done
-                    server::write_frame(&mut stream, frame::OK, b"OK").await?;
+                    write_frame_any(&mut stream, frame::OK, b"OK").await?;
                     break;
                 }
                 _ => {}

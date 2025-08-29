@@ -5,7 +5,8 @@ mode=${1:-async} # async|classic
 
 echo "Building (release)"
 cargo build --release >/dev/null
-bin="$(pwd)/target/release/blit"
+bin_blit="$(pwd)/target/release/blit"
+bin_blitd="$(pwd)/target/release/blitd"
 
 BASE_DIR="scripts/smoketests/linux"
 mkdir -p "$BASE_DIR"
@@ -58,7 +59,7 @@ wait_for_daemon() {
 # Test 1: Push to daemon
 port=$(find_free_port)
 echo "Starting daemon on port $port for push test..."
-"$bin" daemon --root "$dst" --port "$port" >"$logdir/daemon1.log" 2>&1 & spid=$!
+"$bin_blitd" --root "$dst" --bind "127.0.0.1:$port" --never-tell-me-the-odds >"$logdir/daemon1.log" 2>&1 & spid=$!
 trap 'kill $spid 2>/dev/null || true' EXIT
 
 if ! wait_for_daemon "$logdir/daemon1.log" "$port"; then
@@ -68,7 +69,7 @@ if ! wait_for_daemon "$logdir/daemon1.log" "$port"; then
 fi
 
 echo "Pushing files to daemon..."
-"$bin" "$src" "blit://127.0.0.1:$port/" --mir >"$logdir/push.log" 2>&1 || {
+"$bin_blit" "$src" "blit://127.0.0.1:$port/" --mir --never-tell-me-the-odds >"$logdir/push.log" 2>&1 || {
     echo "ERROR: Push failed"
     cat "$logdir/push.log" >&2
     exit 1
@@ -86,7 +87,7 @@ wait $spid 2>/dev/null || true
 # Use a different port range to avoid conflicts
 port2=$(($(find_free_port) + 10))
 echo "Starting daemon on port $port2 for pull test..."
-"$bin" daemon --root "$src" --port "$port2" >"$logdir/daemon2.log" 2>&1 & spid2=$!
+"$bin_blitd" --root "$src" --bind "127.0.0.1:$port2" --never-tell-me-the-odds >"$logdir/daemon2.log" 2>&1 & spid2=$!
 trap 'kill $spid2 2>/dev/null || true' EXIT
 
 if ! wait_for_daemon "$logdir/daemon2.log" "$port2"; then
@@ -96,7 +97,7 @@ if ! wait_for_daemon "$logdir/daemon2.log" "$port2"; then
 fi
 
 echo "Pulling files from daemon..."
-"$bin" "blit://127.0.0.1:$port2/" "$pull" --mir >"$logdir/pull.log" 2>&1 || {
+"$bin_blit" "blit://127.0.0.1:$port2/" "$pull" --mir --never-tell-me-the-odds >"$logdir/pull.log" 2>&1 || {
     echo "ERROR: Pull failed"
     cat "$logdir/pull.log" >&2
     exit 1

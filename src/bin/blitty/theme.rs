@@ -7,7 +7,6 @@ struct Colors {
     comment: Color,
     cyan: Color,
     green: Color,
-    orange: Color,
     pink: Color,
     purple: Color,
     red: Color,
@@ -28,7 +27,6 @@ impl ThemeData {
                 comment: Color::Rgb(98, 114, 164),
                 cyan: Color::Rgb(139, 233, 253),
                 green: Color::Rgb(80, 250, 123),
-                orange: Color::Rgb(255, 184, 108),
                 pink: Color::Rgb(255, 121, 198),
                 purple: Color::Rgb(189, 147, 249),
                 red: Color::Rgb(255, 85, 85),
@@ -45,7 +43,6 @@ impl ThemeData {
                 comment: Color::Rgb(101, 123, 131),
                 cyan: Color::Rgb(42, 161, 152),
                 green: Color::Rgb(133, 153, 0),
-                orange: Color::Rgb(203, 75, 22),
                 pink: Color::Rgb(211, 54, 130),
                 purple: Color::Rgb(108, 113, 196),
                 red: Color::Rgb(220, 50, 47),
@@ -62,7 +59,6 @@ impl ThemeData {
                 comment: Color::Rgb(146, 131, 116),
                 cyan: Color::Rgb(142, 192, 124),
                 green: Color::Rgb(184, 187, 38),
-                orange: Color::Rgb(254, 128, 25),
                 pink: Color::Rgb(251, 73, 52),
                 purple: Color::Rgb(189, 174, 147),
                 red: Color::Rgb(204, 36, 29),
@@ -79,7 +75,6 @@ static mut CURRENT_THEME: ThemeData = ThemeData {
         comment: Color::Rgb(98, 114, 164),
         cyan: Color::Rgb(139, 233, 253),
         green: Color::Rgb(80, 250, 123),
-        orange: Color::Rgb(255, 184, 108),
         pink: Color::Rgb(255, 121, 198),
         purple: Color::Rgb(189, 147, 249),
         red: Color::Rgb(255, 85, 85),
@@ -98,12 +93,14 @@ pub fn set_theme(theme_name: &str) {
     }
 }
 
-pub fn get_current_colors() -> Colors {
+#[allow(private_interfaces)]
+pub(crate) fn get_current_colors() -> Colors {
     unsafe { CURRENT_THEME.colors }
 }
 
 pub struct Theme;
 
+#[allow(non_snake_case)]
 impl Theme {
     pub fn BG() -> Color {
         get_current_colors().bg
@@ -120,9 +117,6 @@ impl Theme {
     pub fn GREEN() -> Color {
         get_current_colors().green
     }
-    pub fn ORANGE() -> Color {
-        get_current_colors().orange
-    }
     pub fn PINK() -> Color {
         get_current_colors().pink
     }
@@ -136,19 +130,7 @@ impl Theme {
         get_current_colors().yellow
     }
 
-    pub fn header(focused: bool) -> Style {
-        if focused {
-            Style::default()
-                .fg(Self::FG())
-                .bg(Self::BG())
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default()
-                .fg(Self::FG())
-                .bg(Self::BG())
-                .add_modifier(Modifier::BOLD)
-        }
-    }
+    // header styling not used; removed
 
     pub fn dir() -> Style {
         Style::default().fg(Self::CYAN())
@@ -164,7 +146,5 @@ impl Theme {
             .fg(Self::PINK())
             .add_modifier(Modifier::REVERSED | Modifier::BOLD)
     }
-    pub fn status() -> Style {
-        Style::default().fg(Self::FG())
-    }
+    // status style not used; removed
 }

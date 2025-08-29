@@ -8,7 +8,6 @@ use std::sync::Mutex;
 pub trait Logger: Send + Sync {
     fn start(&self, _src: &Path, _dst: &Path) {}
     fn copy_done(&self, _src: &Path, _dst: &Path, _bytes: u64) {}
-    fn delete(&self, _path: &Path) {}
     fn error(&self, _context: &str, _path: &Path, _msg: &str) {}
     fn done(&self, _files: u64, _bytes: u64, _seconds: f64) {}
 }
@@ -53,9 +52,6 @@ impl Logger for TextLogger {
             dst.display(),
             bytes
         ));
-    }
-    fn delete(&self, path: &Path) {
-        self.line(&format!("DELETE path={}", path.display()));
     }
     fn error(&self, context: &str, path: &Path, msg: &str) {
         self.line(&format!(
