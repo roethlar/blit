@@ -1,6 +1,6 @@
 [package]
 name = "blit"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["Blit Contributors"]
 description = "High-performance file synchronization with fast mirror/copy/move"

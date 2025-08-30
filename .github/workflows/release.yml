@@ -1,10 +1,11 @@
-name: CI
+name: Release
 on:
   push:
-  pull_request:
+    tags:
+      - 'v*.*.*'
 
 jobs:
-  build-matrix:
+  build-and-release:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -14,8 +15,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -24,10 +23,6 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: fmt
-        run: cargo fmt --all
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
       - name: build
         run: cargo build --release
       - name: package (Linux/macOS)
@@ -35,7 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          ver=$(grep -m1 '^version\s*=\s*"' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          ver=$(echo '${{ github.ref_name }}' | sed -E 's/^v//')
           os=$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
           [ "$os" = "darwin" ] && os="macos"
           arch=$(uname -m)
@@ -47,7 +42,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ver = (Select-String -Path Cargo.toml -Pattern '^[ ]*version[ ]*=[ ]*"' -List).Line -replace '.*"([^"]+)".*','$1'
+          $ver = '${{ github.ref_name }}' -replace '^v',''
           $os = 'windows'
           $arch = $env:PROCESSOR_ARCHITECTURE
           New-Item -ItemType Directory -Force -Path dist,pkg | Out-Null
@@ -58,19 +53,9 @@ jobs:
           $zip = "dist\blit-v$ver-$os-$arch.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
           Compress-Archive -Path pkg\* -DestinationPath $zip
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
         with:
-          name: blit-${{ matrix.os }}
-          path: dist/*
-
-  smokes-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Plaintext smoke
-        run: bash scripts/smoke-linux.sh
-      - name: TLS smoke
-        run: bash scripts/smoke-tls.sh
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
