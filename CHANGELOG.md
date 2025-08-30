@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1 — 2025-08-29
+- Network: Fixed TLS pull phase alignment (START→OK→MANIFEST→NEED_LIST/stream→DONE/OK) to remove early EOFs.
+- Security: Consistent secure/plaintext selection across all client connect paths (push workers, pull, list, verify, remove_tree) using URL scheme and `--never-tell-me-the-odds`.
+- Server: Implemented plaintext pull; TLS/PLAINTEXT handlers consolidated; graceful shutdown now emits TLS close_notify.
+- Defaults: mDNS advertisement disabled by default (`--no-mdns` now defaults to true).
+- DX: Added `scripts/smoke-tls.sh` and a CI workflow that runs fmt, clippy (deny warnings), build, plaintext + TLS smokes.
+- Docs: README updated for separate `blitd` daemon, URL schemes (`blits://` for TLS), and new smokes/CI.
+
 ## 1.0.0 — 2025-08-27 (Blit)
 - Project rename: RoboSync → Blit.
 - New binary names: `blit` (CLI), `blitd` (daemon), `blitty` (TUI).

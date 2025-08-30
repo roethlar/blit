@@ -31,7 +31,7 @@ pub struct DaemonOpts {
     pub never_tell_me_the_odds: bool,
 
     /// Disable mDNS/DNS-SD advertisement of the service
-    #[arg(long = "no-mdns")]
+    #[arg(long = "no-mdns", default_value_t = true)]
     pub no_mdns: bool,
 
     /// Friendly mDNS instance name (defaults to hostname)

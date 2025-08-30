@@ -194,7 +194,32 @@ pub mod server {
                     let unpack_root = base_dir.clone();
                     let unpacker = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                         struct ChanReader { rx: tokio::sync::mpsc::Receiver<Vec<u8>>, buf: Vec<u8>, pos: usize, done: bool }
-                        impl std::io::Read for ChanReader { fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> { if self.done { return Ok(0);} if self.pos>=self.buf.len(){ match self.rx.blocking_recv(){ Some(chunk)=>{ self.buf=chunk; self.pos=0;}, None=>{ self.done=true; return Ok(0);} } } let n=out.len().min(self.buf.len()-self.pos); if n>0 { out[..n].copy_from_slice(&self.buf[self.pos..self.pos+n]); self.pos+=n; } Ok(n) } }
+                        impl std::io::Read for ChanReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.done {
+            return Ok(0);
+        }
+        if self.pos >= self.buf.len() {
+            match self.rx.blocking_recv() {
+                Some(chunk) => {
+                    self.buf = chunk;
+                    self.pos = 0;
+                }
+                None => {
+                    self.done = true;
+                    return Ok(0);
+                }
+            }
+        }
+        let avail = self.buf.len().saturating_sub(self.pos);
+        let n = out.len().min(avail);
+        if n > 0 {
+            out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+            self.pos += n;
+        }
+        Ok(n)
+    }
+}
                         let mut ar = tar::Archive::new(ChanReader{ rx, buf: Vec::new(), pos: 0, done: false });
                         ar.set_overwrite(true);
                         ar.unpack(&unpack_root)?; Ok(()) });
@@ -293,7 +318,15 @@ pub mod client {
                 }
             }
         }
-    }
+    
+        async fn shutdown(&mut self) {
+            use tokio::io::AsyncWriteExt;
+            match self {
+                StreamAny::Plain(s) => { let _ = s.shutdown().await; }
+                StreamAny::Tls(s) => { let _ = s.shutdown().await; }
+            }
+        }
+}
 
     // List a remote directory (non-recursive). Returns (name, is_dir).
     pub async fn list_dir(
@@ -1060,7 +1093,8 @@ pub mod client {
         if t_ok != frame::OK {
             anyhow::bail!("server did not ack final DONE");
         }
-
+        // Graceful close (sends TLS close_notify when applicable)
+        stream.shutdown().await;
         Ok(())
     }
 
@@ -1250,6 +1284,7 @@ pub mod client {
                 frame::DONE => {
                     // Done
                     write_frame_any(&mut stream, frame::OK, b"OK").await?;
+                    stream.shutdown().await;
                     break;
                 }
                 _ => {}

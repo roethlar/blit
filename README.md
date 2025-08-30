@@ -1,10 +1,10 @@
-# Blit 3.1.0 (formerly RoboSync)
+# Blit — Fast, Secure File Sync (CLI + Daemon + TUI)
 
 Fast local and remote sync with an async-first daemon, rsync-style delta, and robocopy-style ergonomics. Linux and macOS supported; Windows builds are experimental (see Platform Support).
 
-3.1 highlights:
-- Async daemon is the default server, started with the `daemon` subcommand.
-- Direction-agnostic verbs: `mirror`, `copy`, `move` with URL inference (`blit://host:port/path`).
+Highlights:
+- 
+- Direction‑agnostic verbs: `mirror`, `copy`, `move` with URL inference (`blits://host:port/path`)
 - Async small-file TAR bundling to reduce frame overhead and boost throughput.
 - Accurate file/byte counters including tar-bundled files.
 - TUI shell (feature-gated) with Dracula theme preview.
@@ -21,11 +21,11 @@ Blit v3 uses a compact daemon protocol with a manifest handshake so only changed
 
 ## Quick Start
 
-Build:
+Build all binaries:
 
 ```bash
 cargo build --release
-# Binary: target/release/blit
+# Binaries: target/release/blit, target/release/blitd, target/release/blitty
 ```
 
 Local copy (direction-agnostic verbs):
@@ -44,20 +44,20 @@ blit move /src /dst -v
 Daemon and remote paths:
 
 ```bash
-# Start async daemon (default server) with flags
-blit daemon --root /srv/root --port 9031
+# Start daemon (TLS secure by default; generates self‑signed on first run)
+target/release/blitd --root /srv/root --bind 0.0.0.0:9031
 
-# Or use defaults (current directory on port 9031)
-blit daemon
+# Mirror local → remote (TLS)
+target/release/blit /data blits://server:9031/backup --mir -v
 
-# Legacy classic server (temporary fallback)
-blit --serve-legacy --bind 0.0.0.0:9031 --root /srv/root
+# Mirror remote → local (TLS)
+target/release/blit blits://server:9031/data /backup --mir -v
 
-# Mirror local → remote (direction inferred by blit://)
-blit mirror /data blit://server:9031/backup -v
-
-# Mirror remote → local
-blit mirror blit://server:9031/data /backup -v
+# Plaintext for trusted LAN benchmarking ONLY
+# 1) Start daemon with security disabled
+target/release/blitd --root /srv/root --bind 0.0.0.0:9031 --never-tell-me-the-odds
+# 2) Use blit:// and optionally --never-tell-me-the-odds on the client
+target/release/blit /data blit://server:9031/backup --mir --never-tell-me-the-odds
 ```
 
 Verify examples:
@@ -77,14 +77,14 @@ Common recipes:
 
 ```bash
 # Mirror local data to a server path
-blit mirror /data blit://server:9031/backup -v
+blit mirror /data blits://server:9031/backup -v
 
 # High-throughput LAN push
-blit mirror /big blit://server:9031/big --net-workers 8 --net-chunk-mb 8 --ludicrous-speed -v
+blit mirror /big blits://server:9031/big --net-workers 8 --net-chunk-mb 8 --ludicrous-speed -v
 
 # Pull and verify quickly (size+mtime)
-blit mirror blit://server:9031/dataset /local/dataset -v && \
-  blit verify blit://server:9031/dataset /local/dataset --limit 20
+blit mirror blits://server:9031/dataset /local/dataset -v && \
+  blit verify blits://server:9031/dataset /local/dataset --limit 20
 ```
 
 Notes:
@@ -97,16 +97,15 @@ Notes:
 Subcommands:
 
 ```text
-blit daemon <ROOT> <PORT>
 blit mirror <SRC> <DEST>
 blit copy   <SRC> <DEST>
 blit move   <SRC> <DEST>
 blit verify <SRC> <DEST> [--checksum] [--json] [--csv <file>] [--limit N]
-blit shell [blit://host:port[/path]]   # feature: tui
+blitty --remote blits://host:9031/     # optional TUI client
 ```
 
 Direction inference:
-- If either side uses `blit://host:port/path`, that side is remote.
+- If either side uses `blit://` or `blits://`, that side is remote.
 - Remote→remote is not supported in this release.
 
 Common options:
@@ -122,7 +121,7 @@ Common options:
 - `--never-tell-me-the-odds`: DISABLE ALL SECURITY - unencrypted, unsafe mode (trusted LAN benchmarks only)
 
 Daemon options (secure by default):
-- `--bind` and `--root`: server binding and directory (default bind: `0.0.0.0:9031`, current dir). TLS with TOFU is enabled by default.  
+- `--bind` and `--root`: server binding and directory (default bind: `0.0.0.0:9031`, current dir). TLS with TOFU is enabled by default.
 - `--tls-cert` / `--tls-key`: custom TLS certificate (auto-generates self-signed if not provided)
 - `--never-tell-me-the-odds`: explicitly disable all security for benchmarks (NOT recommended)
 
@@ -131,12 +130,11 @@ Performance tuning:
 - `--net-chunk-mb <MB>`: network I/O chunk size for large files (default: 4; 1–32 MB).
 - `--ludicrous-speed`: also enables low-latency socket mode (TCP_NODELAY) and larger defaults.
 
-## TUI Shell (Preview)
+## TUI (blitty)
 
-- Enabled by default (no feature flags required).
-- Dracula theme, dual-pane (local/local by default).
-- Toggle right pane remote with `F2` to connect (defaults to port `9031` with TLS). Navigation with arrows/Enter, pick src/dest with Space in respective panes.
-- Run transfer with `g` (mirror/copy/move based on current mode). Shows a spinner and last few lines of output; press `x` to cancel a running transfer. Remote→remote transfers are not supported.
+- - Dual‑pane UI (local/local by default). Toggle right pane to remote and connect to `blits://host:9031`.
+- Navigation with arrows/Enter; select paths and run transfers (mirror/copy/move). Press `x` to cancel.
+- The unsafe `--never-tell-me-the-odds` is CLI‑only — not exposed in the UI.
 
 ## Best Practices
 
@@ -222,7 +220,7 @@ On Linux distributions that use systemd, you can run the Blit daemon as a servic
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin blit || true
 sudo mkdir -p /srv/blit_root
 sudo chown -R blit:blit /srv/blit_root
-sudo install -m 0755 target/release/blit /usr/local/bin/blit
+sudo install -m 0755 target/release/blitd /usr/local/bin/blitd
 ```
 
 2) Create the unit file at `/etc/systemd/system/blit.service`:
@@ -236,7 +234,7 @@ Wants=network-online.target
 [Service]
 User=blit
 Group=blit
-ExecStart=/usr/local/bin/blit daemon --root /srv/blit_root --port 9031
+ExecStart=/usr/local/bin/blitd --root /srv/blit_root --bind 0.0.0.0:9031
 Restart=on-failure
 RestartSec=2s
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -298,6 +296,17 @@ Tips:
 - For maximum performance on a single host, build there (native). For portability, use v2 or MUSL.
 
 ## CI
+
+GitHub Actions builds, lints, and runs smokes on every push/PR.
+- Workflow: `.github/workflows/ci.yml`
+- Steps: cargo fmt (check), clippy (deny warnings), build, plaintext smoke, TLS smoke
+
+## Smoke Tests
+
+- Plaintext (unsafe): `scripts/smoke-linux.sh`
+- TLS: `scripts/smoke-tls.sh`
+
+Both scripts build release binaries, start daemons, run push and pull, and verify trees.
 
 GitHub Actions builds artifacts for Linux (GNU), Linux (MUSL static), macOS, and Windows (MSVC).
 

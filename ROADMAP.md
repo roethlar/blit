@@ -1,4 +1,4 @@
-# RoboSync Roadmap (Customer-Facing)
+# Blit Roadmap (Customer-Facing)
 
 This roadmap focuses on high-impact performance and stability items customers care about. Developer task details live in `TODO.md`.
 
@@ -13,14 +13,14 @@ Deliver a fast, reliable sync tool that:
 
 ## Rename Notice (2025-08-27)
 
-The project has been renamed going forward:
+The project has been renamed:
 - CLI: blit
 - Daemon: blitd
 - TUI: blitty
 - URL scheme: blit://
 
 This roadmap retains historical "RoboSync" references to avoid rewriting history; new releases and code use the Blit naming.
-## 3.1: Performance & Stability Parity
+## 1.x: Performance & Stability Parity
 
 Goal: Core feature parity across Linux/macOS and Windows, with production-ready performance.
 
@@ -58,7 +58,7 @@ Outcome: “Supported on Windows” across core scenarios once CI passes.
 ## 3.2: Throughput & Transport Options
 
 - Transport
-  - Optional QUIC via `quinn` for high-RTT scenarios.
+  - Optional QUIC via `quinn` for high‑RTT scenarios (behind a flag).
   - Stream multiplexing improvements for large parallelism on a single connection.
 
 - Performance tuning
