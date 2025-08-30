@@ -1,0 +1,7 @@
+error: unexpected argument '--root' found
+
+  tip: to pass '--root' as a value, use '-- --root'
+
+Usage: blit <SOURCE> [DESTINATION]
+
+For more information, try '--help'.

@@ -1,0 +1,8 @@
+Starting RoboSync daemon:
+  Root: scripts/smoketests/linux/run-1756298837-2057081/src
+  Port: 9040
+  Bind: 0.0.0.0:9040
+robosync async daemon listening on 0.0.0.0:9040 root=scripts/smoketests/linux/run-1756298837-2057081/src
+async conn from 127.0.0.1:58862
+async connection error: early eof
+async conn from 127.0.0.1:58866

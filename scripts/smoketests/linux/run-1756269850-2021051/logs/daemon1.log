@@ -1,0 +1,9 @@
+Starting RoboSync daemon:
+  Root: scripts/smoketests/linux/run-1756269850-2021051/dst
+  Port: 9030
+  Bind: 0.0.0.0:9030
+robosync async daemon listening on 0.0.0.0:9030 root=scripts/smoketests/linux/run-1756269850-2021051/dst
+async conn from 127.0.0.1:43666
+async connection error: early eof
+async conn from 127.0.0.1:43678
+async connection error: frame header timeout (300 ms)

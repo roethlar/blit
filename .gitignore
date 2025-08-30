@@ -45,4 +45,3 @@ Thumbs.db
 
 # Smoke test artifacts
 scripts/smoke_tmp/
-scripts/smoketests/

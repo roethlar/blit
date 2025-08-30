@@ -1,0 +1,9 @@
+robosync async daemon listening on 0.0.0.0:9030 root=scripts/smoketests/linux/run-1756265592-1994889/dst
+async conn from 127.0.0.1:41740
+async connection error: early eof
+async conn from 127.0.0.1:41742
+async conn from 127.0.0.1:41758
+async conn from 127.0.0.1:41760
+Connection summary: files_sent=0, bytes_sent=0, files_received=0, bytes_received=0, elapsed_ms=0
+Connection summary: files_sent=0, bytes_sent=0, files_received=0, bytes_received=0, elapsed_ms=0
+Connection summary: files_sent=

@@ -1,0 +1,16 @@
+Starting Blit daemon:
+  Root: /mnt/home/sourcecode/github/robosync/scripts/smoketests/linux/run-1756515012-332843/src
+  Bind: 127.0.0.1:9040
+  Security: 🚨 DISABLED (DANGEROUS MODE)
+🚨 DANGER: --never-tell-me-the-odds DISABLES ALL SECURITY!
+   • No encryption (all data transmitted in plain text)
+   • No authentication (anyone can connect)
+   • No verification (corrupted data may not be detected)
+   • Only use on completely trusted networks for benchmarks
+mDNS advertise error: parsing of ip addr failed, reason: invalid IPv4 address syntax
+🚨 Starting UNENCRYPTED server - no security features enabled
+blit async daemon listening on 127.0.0.1:9040 (plaintext mode)
+async conn from 127.0.0.1:48980
+async connection error: early eof
+async conn from 127.0.0.1:48986
+async connection error: frame header timeout (1500 ms)

@@ -1,0 +1,2 @@
+[client] connect_secure to 127.0.0.1:9040 secure=false (scheme)
+[client] using PLAINTEXT to 127.0.0.1:9040

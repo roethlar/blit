@@ -1,0 +1,14 @@
+Starting Blit daemon:
+  Root: /mnt/home/sourcecode/github/robosync/scripts/smoketests/linux/run-1756511086-302191/dst
+  Bind: 127.0.0.1:9030
+  Security: 🔒 TLS enabled (secure by default)
+mDNS advertise error: parsing of ip addr failed, reason: invalid IPv4 address syntax
+Setting up TLS configuration...
+Using self-signed certificate at: /home/michael/.config/blit/server-cert.pem
+blit async daemon (TLS) listening on 127.0.0.1:9030 root=/mnt/home/sourcecode/github/robosync/scripts/smoketests/linux/run-1756511086-302191/dst
+async TLS conn from 127.0.0.1:33940
+TLS handshake failed with 127.0.0.1:33940: received corrupt message of type InvalidContentType
+async TLS conn from 127.0.0.1:33948
+async TLS conn from 127.0.0.1:33962
+TLS session finished in 0 ms
+TLS session finished in 263 ms

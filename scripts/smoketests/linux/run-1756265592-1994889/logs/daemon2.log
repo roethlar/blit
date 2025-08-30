@@ -1,0 +1,4 @@
+robosync async daemon listening on 0.0.0.0:9040 root=scripts/smoketests/linux/run-1756265592-1994889/src
+async conn from 127.0.0.1:35866
+async connection error: early eof
+async conn from 127.0.0.1:35872

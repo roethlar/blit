@@ -1,0 +1,5 @@
+[client] connect_secure to 127.0.0.1:9030 secure=false (scheme)
+[client] using PLAINTEXT to 127.0.0.1:9030
+[client] connect_secure to 127.0.0.1:9030 secure=true (scheme)
+[client] using TLS to 127.0.0.1:9030
+Error: TLS handshake failed (server may be running in unsafe mode): Connection reset by peer (os error 104)

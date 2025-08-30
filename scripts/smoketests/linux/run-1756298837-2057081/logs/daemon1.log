@@ -1,0 +1,13 @@
+Starting RoboSync daemon:
+  Root: scripts/smoketests/linux/run-1756298837-2057081/dst
+  Port: 9030
+  Bind: 0.0.0.0:9030
+robosync async daemon listening on 0.0.0.0:9030 root=scripts/smoketests/linux/run-1756298837-2057081/dst
+async conn from 127.0.0.1:33932
+async connection error: early eof
+async conn from 127.0.0.1:33948
+async conn from 127.0.0.1:33964
+async conn from 127.0.0.1:33966
+Connection summary: files_sent=0, bytes_sent=0, files_received=0, bytes_received=0, elapsed_ms=0
+Connection summary: files_sent=0, bytes_sent=0, files_received=0, bytes_received=0, elapsed_ms=0
+Connection summary: files_sent=
