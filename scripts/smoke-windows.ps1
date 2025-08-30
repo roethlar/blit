@@ -12,8 +12,10 @@ $cfg = if ($Release) { 'release' } else { 'debug' }
 Write-Host "Building ($cfg)..."
 if ($Release) { cargo build --release } else { cargo build }
 
-$bin = Join-Path $root "target\$cfg\blit.exe"
-if (-not (Test-Path $bin)) { throw "Binary not found at $bin" }
+$binCli = Join-Path $root "target\$cfg\blit.exe"
+$binD   = Join-Path $root "target\$cfg\blitd.exe"
+if (-not (Test-Path $binCli)) { throw "CLI binary not found at $binCli" }
+if (-not (Test-Path $binD))   { throw "Daemon binary not found at $binD" }
 
 $tmp = Join-Path $env:TEMP ("blit-smoke-" + [Guid]::NewGuid().Guid)
 $src = Join-Path $tmp 'src'
@@ -39,11 +41,10 @@ $srcMtime = (Get-Item (Join-Path $src 'a.txt')).LastWriteTimeUtc
 
 # Push test (client -> daemon)
 $port = 9031
-$serveArgs = if ($Async) { @('--serve-async') } else { @('--serve') }
-$p1 = Start-Process -FilePath $bin -ArgumentList @($serveArgs + @('--bind',"127.0.0.1:$port",'--root', $dst)) -WindowStyle Hidden -PassThru
+$p1 = Start-Process -FilePath $binD -ArgumentList @('--root', $dst, '--bind', "127.0.0.1:$port") -WindowStyle Hidden -PassThru
 Start-Sleep -Seconds 2
 try {
-  & $bin $src ("blit://127.0.0.1:$port/") --mir | Out-Null
+  & $binCli $src ("blit://127.0.0.1:$port/") --mir | Out-Null
   if (-not (Test-Path (Join-Path $dst 'a.txt'))) { throw 'push: a.txt missing at destination' }
   if (-not (Test-Path (Join-Path $dst 'sub' 'b.txt'))) { throw 'push: sub/b.txt missing at destination' }
   # Verify read-only attribute mirrored and mtime within tolerance
@@ -57,10 +58,10 @@ try {
 
 # Pull test (daemon -> client)
 $port2 = 9032
-$p2 = Start-Process -FilePath $bin -ArgumentList @($serveArgs + @('--bind',"127.0.0.1:$port2",'--root', $src)) -WindowStyle Hidden -PassThru
+$p2 = Start-Process -FilePath $binD -ArgumentList @('--root', $src, '--bind', "127.0.0.1:$port2") -WindowStyle Hidden -PassThru
 Start-Sleep -Seconds 2
 try {
-  & $bin ("blit://127.0.0.1:$port2/") $pull --mir | Out-Null
+  & $binCli ("blit://127.0.0.1:$port2/") $pull --mir | Out-Null
   if (-not (Test-Path (Join-Path $pull 'a.txt'))) { throw 'pull: a.txt missing at destination' }
   if (-not (Test-Path (Join-Path $pull 'sub' 'b.txt'))) { throw 'pull: sub/b.txt missing at destination' }
   # Verify read-only and mtime on pull
@@ -72,4 +73,4 @@ try {
   if ($p2 -and -not $p2.HasExited) { $p2 | Stop-Process -Force }
 }
 
-if ($Async) { Write-Host 'Async smoke tests OK (push and pull)' } else { Write-Host 'Classic smoke tests OK (push and pull)' }
+Write-Host 'Windows smoke tests OK (push and pull)'
