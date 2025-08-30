@@ -324,14 +324,12 @@ fn main() -> Result<()> {
 
     // On Windows, check for symlink creation privilege if --sl is used
     #[cfg(windows)]
-    if args.sl {
-        if !blit::win_fs::has_symlink_privilege() {
-            eprintln!("ERROR: To create symbolic links on Windows, this program must be run as an administrator.");
-            eprintln!(
-                "Please re-run from an elevated command prompt (e.g., 'Run as administrator')."
-            );
-            std::process::exit(1);
-        }
+    if args.sl && !blit::win_fs::has_symlink_privilege() {
+        eprintln!("ERROR: To create symbolic links on Windows, this program must be run as an administrator.");
+        eprintln!(
+            "Please re-run from an elevated command prompt (e.g., 'Run as administrator')."
+        );
+        std::process::exit(1);
     }
 
     // Server mode removed - use blitd binary instead
@@ -1068,6 +1066,7 @@ fn copy_single_file(src: &Path, dst: &Path, _is_network: bool, verbose: bool) ->
         println!("Copying single file...");
     }
 
+    #[cfg(not(windows))]
     let buffer_sizer = BufferSizer::new();
     #[cfg(windows)]
     let bytes = windows_copyfile(src, dst)?;
