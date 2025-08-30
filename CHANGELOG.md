@@ -6,7 +6,7 @@
 - Server: Implemented plaintext pull; TLS/PLAINTEXT handlers consolidated; graceful shutdown now emits TLS close_notify.
 - Defaults: mDNS advertisement disabled by default (`--no-mdns` now defaults to true).
 - DX: Added `scripts/smoke-tls.sh` and a CI workflow that runs fmt, clippy (deny warnings), build, plaintext + TLS smokes.
-- Docs: README updated for separate `blitd` daemon, URL schemes (`blits://` for TLS), and new smokes/CI.
+- Docs: README updated for separate `blitd` daemon, unified `blit://` (TLS by default), and new smokes/CI.
 
 ## 1.0.0 — 2025-08-27 (Blit)
 - Project rename: RoboSync → Blit.

@@ -47,3 +47,7 @@ pub struct Args {
     pub never_tell_me_the_odds: bool,
 }
 // (win_fs and other internals are not exported by lib)
+
+// Windows-specific helpers (symlink privilege, read-only clearing)
+#[cfg(windows)]
+pub mod win_fs;

@@ -16,7 +16,7 @@ pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
     let scheme_end = lower.find(':')?;
     let scheme_with_colon = &lower[..=scheme_end];
     match scheme_with_colon {
-        "blit:" | "blits:" => (),
+        "blit:" => (),
         _ => return None,
     };
     let mut rest = &s_trim[scheme_end + 1..];

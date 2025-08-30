@@ -1272,6 +1272,7 @@ pub mod client {
                         anyhow::bail!("bad SYMLINK len");
                     }
                     let rel = std::str::from_utf8(&pl[4..4 + nlen])?;
+                    #[cfg(unix)]
                     let target = std::str::from_utf8(&pl[4 + nlen..])?;
                     let dst_path = dest_root.join(rel);
                     if let Some(parent) = dst_path.parent() {
