@@ -57,6 +57,8 @@ fn main() -> Result<()> {
         if let Err(e) = advertise_mdns(&opts) {
             eprintln!("mDNS advertise error: {}", e);
         }
+    } else {
+        println!("  mDNS: disabled (enable with '--no-mdns=false' or set '--mdns-name')");
     }
 
     // Run the async server directly - no more shelling out
@@ -112,10 +114,27 @@ fn advertise_mdns(opts: &DaemonOpts) -> Result<()> {
     });
     let host_name = format!("{}.local.", instance.replace(' ', "-"));
 
-    // TXT records
+    // Determine IP address to advertise: prefer bound IP; if 0.0.0.0, pick primary local IPv4
+    fn pick_local_ipv4() -> Option<String> {
+        use std::net::{SocketAddr, UdpSocket};
+        let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+        let _ = sock.connect("8.8.8.8:80").ok()?;
+        let addr: SocketAddr = sock.local_addr().ok()?;
+        Some(addr.ip().to_string())
+    }
+    let addr_s = match opts.bind.rsplit_once(':').map(|(h, _)| h) {
+        Some("0.0.0.0") | None => pick_local_ipv4().unwrap_or_else(|| "127.0.0.1".to_string()),
+        Some("::") => "::1".to_string(),
+        Some(other) => other.to_string(),
+    };
+
+    // TXT records (advertise whether TLS is enabled)
     let mut props = std::collections::HashMap::new();
     props.insert("ver".to_string(), env!("CARGO_PKG_VERSION").to_string());
-    props.insert("tls".to_string(), "1".to_string());
+    props.insert(
+        "tls".to_string(),
+        if opts.never_tell_me_the_odds { "0".to_string() } else { "1".to_string() },
+    );
 
     let mdns = ServiceDaemon::new()?;
     let service_type = "_blit._tcp.local.";
@@ -123,7 +142,7 @@ fn advertise_mdns(opts: &DaemonOpts) -> Result<()> {
         service_type,
         &instance,
         &host_name,
-        host_name.clone(),
+        addr_s,
         port,
         props,
     )?;

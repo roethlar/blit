@@ -46,29 +46,126 @@ pub fn request_remote_dir(
         }
     });
 }
+
+/// Create a directory on the remote server under the given base path.
+pub fn request_remote_mkdir(
+    tx_ui: &Sender<UiMsg>,
+    host: String,
+    port: u16,
+    base: PathBuf,
+    name: String,
+) {
+    let tx = tx_ui.clone();
+    RUNTIME.spawn(async move {
+        let res = mkdir_remote_async(&host, port, &base, &name).await;
+        if let Err(e) = res {
+            let _ = tx.send(UiMsg::Error(format!(
+                "Failed to create folder on {}:{}: {}",
+                host, port, e
+            )));
+        }
+    });
+}
+
+async fn mkdir_remote_async(host: &str, port: u16, base: &Path, name: &str) -> Result<()> {
+    use tokio::time::{timeout, Duration};
+    let addr = format!("{}:{}", host, port);
+    // Connect TCP
+    let tcp = timeout(Duration::from_millis(5000), TcpStream::connect(&addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+    // Try TLS first; fall back to plaintext if handshake fails
+    let mut stream_any: StreamAny = {
+        let cfg = blit::tls::build_client_config_tofu(host, port);
+        let cx = TlsConnector::from(Arc::new(cfg));
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| anyhow::anyhow!("Invalid server name for TLS: {}", host))?;
+        match timeout(Duration::from_millis(5000), cx.connect(server_name, tcp)).await {
+            Ok(Ok(tls)) => StreamAny::Tls(Box::new(tls)),
+            _ => {
+                // Plaintext fallback with a fresh socket
+                let tcp2 = timeout(Duration::from_millis(1000), TcpStream::connect(&addr))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+                StreamAny::Plain(tcp2)
+            }
+        }
+    };
+
+    // START payload: base path on server
+    let base_s = base.to_string_lossy();
+    let mut payload = Vec::with_capacity(2 + base_s.len() + 1);
+    payload.extend_from_slice(&(base_s.len() as u16).to_le_bytes());
+    payload.extend_from_slice(base_s.as_bytes());
+    payload.push(0);
+    let hdr = protocol_core::build_frame_header(protocol::frame::START, payload.len() as u32);
+    stream_any.write_all(&hdr).await?;
+    stream_any.write_all(&payload).await?;
+    // Read OK
+    let mut resp_hdr = [0u8; 11];
+    timeout(Duration::from_millis(5000), stream_any.read_exact(&mut resp_hdr))
+        .await
+        .map_err(|_| anyhow::anyhow!("Response timeout"))??;
+    let (t_ok, len) = protocol_core::parse_frame_header(&resp_hdr)?;
+    if t_ok != protocol::frame::OK {
+        return Err(anyhow::anyhow!("Daemon did not ACK START"));
+    }
+    if len > 0 {
+        let mut skip = vec![0u8; len as usize];
+        let _ = stream_any.read_exact(&mut skip).await;
+    }
+
+    // Send MKDIR name
+    let mut pl = Vec::with_capacity(2 + name.len());
+    pl.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    pl.extend_from_slice(name.as_bytes());
+    let hdr2 = protocol_core::build_frame_header(protocol::frame::MKDIR, pl.len() as u32);
+    stream_any.write_all(&hdr2).await?;
+    stream_any.write_all(&pl).await?;
+    // Read OK
+    let mut resp2 = [0u8; 11];
+    timeout(Duration::from_millis(5000), stream_any.read_exact(&mut resp2))
+        .await
+        .map_err(|_| anyhow::anyhow!("MKDIR response timeout"))??;
+    let (t2, len2) = protocol_core::parse_frame_header(&resp2)?;
+    if t2 != protocol::frame::OK {
+        return Err(anyhow::anyhow!("MKDIR failed"));
+    }
+    if len2 > 0 {
+        let mut skip = vec![0u8; len2 as usize];
+        let _ = stream_any.read_exact(&mut skip).await;
+    }
+
+    // Graceful DONE
+    let hdr3 = protocol_core::build_frame_header(protocol::frame::DONE, 0);
+    stream_any.write_all(&hdr3).await?;
+    let mut resp3 = [0u8; 11];
+    let _ = timeout(Duration::from_millis(5000), stream_any.read_exact(&mut resp3)).await;
+    Ok(())
+}
 /// Async LIST request.
 async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec<Entry>> {
     use tokio::time::{timeout, Duration};
     let addr = format!("{}:{}", host, port);
-    // Use TLS by default unless BLIT_UNSAFE is set
-    let use_unsafe = std::env::var("BLIT_UNSAFE").ok().as_deref() == Some("1");
-    // Establish connection
+    // Establish connection (try TLS, then fallback to plaintext)
     // First, connect TCP
-    let tcp = timeout(Duration::from_millis(2000), TcpStream::connect(&addr))
+    let tcp = timeout(Duration::from_millis(5000), TcpStream::connect(&addr))
         .await
         .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
-    let mut stream_any: StreamAny = if use_unsafe {
-        StreamAny::Plain(tcp)
-    } else {
-        // Secure by default: TLS with TOFU
-    let cfg = blit::tls::build_client_config_tofu(host, port);
+    let mut stream_any: StreamAny = {
+        let cfg = blit::tls::build_client_config_tofu(host, port);
         let cx = TlsConnector::from(Arc::new(cfg));
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|_| anyhow::anyhow!("Invalid server name for TLS: {}", host))?;
-        let tls = timeout(Duration::from_millis(2000), cx.connect(server_name, tcp))
-            .await
-            .map_err(|_| anyhow::anyhow!("TLS handshake timeout"))??;
-        StreamAny::Tls(Box::new(tls))
+        match timeout(Duration::from_millis(5000), cx.connect(server_name, tcp)).await {
+            Ok(Ok(tls)) => StreamAny::Tls(Box::new(tls)),
+            _ => {
+                let tcp2 = timeout(Duration::from_millis(1000), TcpStream::connect(&addr))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+                StreamAny::Plain(tcp2)
+            }
+        }
     };
 
     // Build LIST_REQ payload
@@ -86,7 +183,7 @@ async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec
     // Read and validate response header
     let mut resp_hdr = [0u8; 11];
     timeout(
-        Duration::from_millis(1000),
+        Duration::from_millis(5000),
         stream_any.read_exact(&mut resp_hdr),
     )
     .await
@@ -111,7 +208,7 @@ async fn read_remote_dir_async(host: &str, port: u16, path: &Path) -> Result<Vec
     // Read LIST_RESP payload
     let mut payload = vec![0u8; payload_len];
     timeout(
-        Duration::from_millis(1000),
+        Duration::from_millis(5000),
         stream_any.read_exact(&mut payload),
     )
     .await

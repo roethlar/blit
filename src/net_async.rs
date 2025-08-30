@@ -226,6 +226,65 @@ pub mod server {
                     loop { let (ti, pl2) = read_frame(stream).await?; if ti == fids::TAR_DATA { tx.send(pl2).await.ok(); } else if ti == fids::TAR_END { break; } else { anyhow::bail!("unexpected frame during tar: {}", ti); } }
                     drop(tx); unpacker.await??; write_frame(stream, frame::OK, b"TAR_OK").await?;
                 }
+                // Prepare/resize file and set mtime (idempotent). Payload: nlen u16 | name | size u64 | mtime i64
+                fids::SET_ATTR => {
+                    use std::io::Write as _;
+                    if payload.len() < 2 + 8 + 8 { anyhow::bail!("bad SET_ATTR"); }
+                    let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                    if payload.len() < 2 + nlen + 8 + 8 { anyhow::bail!("bad SET_ATTR len"); }
+                    let name = std::str::from_utf8(&payload[2..2+nlen]).unwrap_or("");
+                    let mut off = 2 + nlen;
+                    let size = u64::from_le_bytes(payload[off..off+8].try_into().unwrap());
+                    off += 8;
+                    let mtime = i64::from_le_bytes(payload[off..off+8].try_into().unwrap());
+                    let dst = base_dir.join(name);
+                    if let Some(parent) = dst.parent() { std::fs::create_dir_all(parent).ok(); }
+                    let f = std::fs::OpenOptions::new().create(true).write(true).open(&dst)
+                        .with_context(|| format!("open {}", dst.display()))?;
+                    f.set_len(size).context("set file length")?;
+                    let ft = filetime::FileTime::from_unix_time(mtime, 0);
+                    let _ = filetime::set_file_mtime(&dst, ft);
+                    write_frame(stream, frame::OK, b"OK").await?;
+                }
+                // Parallel range write. Payload: nlen u16 | name | off u64 | len u32 | raw bytes follow
+                fids::PFILE_START => {
+                    if payload.len() < 2 + 8 + 4 { anyhow::bail!("bad PFILE_START"); }
+                    let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                    if payload.len() < 2 + nlen + 8 + 4 { anyhow::bail!("bad PFILE_START len"); }
+                    let name = std::str::from_utf8(&payload[2..2+nlen]).unwrap_or("");
+                    let mut offp = 2 + nlen;
+                    let off = u64::from_le_bytes(payload[offp..offp+8].try_into().unwrap());
+                    offp += 8;
+                    let mut remaining = u32::from_le_bytes(payload[offp..offp+4].try_into().unwrap()) as u64;
+                    let dst = base_dir.join(name);
+                    // Open for write
+                    let f = std::fs::OpenOptions::new().write(true).open(&dst)
+                        .with_context(|| format!("open {}", dst.display()))?;
+                    // Read raw body and write at offset
+                    use tokio::io::AsyncReadExt as _;
+                    #[cfg(unix)]
+                    use std::os::unix::fs::FileExt;
+                    #[cfg(windows)]
+                    use std::os::windows::fs::FileExt as WinFileExt;
+                    let mut buf = vec![0u8; 4 * 1024 * 1024];
+                    let mut cursor = off;
+                    while remaining > 0 {
+                        let to = remaining.min(buf.len() as u64) as usize;
+                        let n = stream.read(&mut buf[..to]).await?;
+                        if n == 0 { anyhow::bail!("eof during pfile range"); }
+                        #[cfg(unix)]
+                        {
+                            f.write_at(&buf[..n], cursor).context("write_at")?;
+                        }
+                        #[cfg(windows)]
+                        {
+                            let _ = f.seek_write(&buf[..n], cursor).map_err(|e| anyhow::anyhow!(e))?;
+                        }
+                        cursor += n as u64;
+                        remaining -= n as u64;
+                    }
+                    write_frame(stream, frame::OK, b"OK").await?;
+                }
                 fids::FILE_RAW_START => {
                     if payload.len() < 2 + 8 + 8 { anyhow::bail!("bad FILE_RAW_START"); }
                     let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
@@ -825,13 +884,14 @@ pub mod client {
 
         if !small_files.is_empty() {
             write_frame_any(&mut stream, frame::TAR_START, &[]).await?; // TarStart
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+            // Deeper buffer for better pipelining over higher latency
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let tar_task_src_root = src_root.to_path_buf();
             let tar_task = tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut w = crate::net_async::client::TarChanWriter {
                     tx,
-                    buf: Vec::with_capacity(1024 * 1024),
-                    cap: 1024 * 1024,
+                    buf: Vec::with_capacity(2 * 1024 * 1024),
+                    cap: 2 * 1024 * 1024,
                 };
                 {
                     let mut builder = tar::Builder::new(&mut w);
@@ -869,11 +929,12 @@ pub mod client {
         let mut eff_chunk_mb = args.net_chunk_mb;
         if !overridden_workers {
             let large_count = large_files.len().max(1);
-            // Heuristic: scale workers with CPUs and available large files (bounded)
-            eff_workers = std::cmp::min(large_count, std::cmp::max(4, cpus / 2)).clamp(2, 32);
+            // Aggressive default to target 10GbE; cap by available work and 32 overall
+            eff_workers = std::cmp::min(large_count, std::cmp::max(8, cpus)).clamp(2, 32);
         }
         if !overridden_chunk {
-            eff_chunk_mb = if args.ludicrous_speed { 8 } else { 4 };
+            // Bigger chunks reduce syscall/record overhead
+            eff_chunk_mb = if args.ludicrous_speed { 16 } else { 8 };
         }
 
         let large_cap = large_files.len().max(1);
@@ -911,168 +972,92 @@ pub mod client {
                         q.pop()
                     };
                     if let Some(fe) = job {
+                        // For very large files, split into parallel ranges across workers
                         let rel = fe.path.strip_prefix(&src_root).unwrap_or(&fe.path);
                         let rels = rel.to_string_lossy();
                         let md = std::fs::metadata(&fe.path)?;
+                        let size = md.len();
                         let mtime = md
                             .modified()?
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs() as i64;
-                        // Try delta for large files (>= 100MB); fallback to raw if ranges are empty
-                        let mut used_delta = false;
-                        if fe.size >= 104_857_600 {
-                            let granule: u32 = 8 * 1024 * 1024;
-                            let sample: u32 = 64 * 1024;
-                            let mut pl0 = Vec::with_capacity(2 + rels.len() + 8 + 8 + 4 + 4);
-                            pl0.extend_from_slice(&(rels.len() as u16).to_le_bytes());
-                            pl0.extend_from_slice(rels.as_bytes());
-                            pl0.extend_from_slice(&fe.size.to_le_bytes());
-                            pl0.extend_from_slice(&mtime.to_le_bytes());
-                            pl0.extend_from_slice(&granule.to_le_bytes());
-                            pl0.extend_from_slice(&sample.to_le_bytes());
-                            write_frame_any(&mut s, frame::DELTA_START, &pl0).await?;
-                            // send samples for each granule: start, mid, end
-                            let granule64 = granule as u64;
-                            let mut bf = std::fs::File::open(&fe.path)?;
-                            let mut buf0 = vec![0u8; sample as usize];
-                            let mut off0: u64 = 0;
-                            use std::io::{Read as _, Seek, SeekFrom};
-                            while off0 < fe.size {
-                                bf.seek(SeekFrom::Start(off0))?;
-                                let n0 = bf.read(&mut buf0)?;
-                                let h0 = blake3::hash(&buf0[..n0]);
-                                let mut pls = Vec::with_capacity(8 + 2 + h0.as_bytes().len());
-                                pls.extend_from_slice(&off0.to_le_bytes());
-                                pls.extend_from_slice(&(h0.as_bytes().len() as u16).to_le_bytes());
-                                pls.extend_from_slice(h0.as_bytes());
-                                write_frame_any(&mut s, frame::DELTA_SAMPLE, &pls).await?;
-                                let mid = off0.saturating_add((granule64 / 2).min(fe.size - off0));
-                                bf.seek(SeekFrom::Start(mid))?;
-                                let n1 = bf.read(&mut buf0)?;
-                                let h1 = blake3::hash(&buf0[..n1]);
-                                let mut pls1 = Vec::with_capacity(8 + 2 + h1.as_bytes().len());
-                                pls1.extend_from_slice(&mid.to_le_bytes());
-                                pls1.extend_from_slice(&(h1.as_bytes().len() as u16).to_le_bytes());
-                                pls1.extend_from_slice(h1.as_bytes());
-                                write_frame_any(&mut s, frame::DELTA_SAMPLE, &pls1).await?;
-                                let end_off = if fe.size > off0 {
-                                    (off0 + granule64)
-                                        .min(fe.size)
-                                        .saturating_sub(sample as u64)
-                                } else {
-                                    off0
-                                };
-                                bf.seek(SeekFrom::Start(end_off))?;
-                                let n2 = bf.read(&mut buf0)?;
-                                let h2 = blake3::hash(&buf0[..n2]);
-                                let mut pls2 = Vec::with_capacity(8 + 2 + h2.as_bytes().len());
-                                pls2.extend_from_slice(&end_off.to_le_bytes());
-                                pls2.extend_from_slice(&(h2.as_bytes().len() as u16).to_le_bytes());
-                                pls2.extend_from_slice(h2.as_bytes());
-                                write_frame_any(&mut s, frame::DELTA_SAMPLE, &pls2).await?;
-                                off0 = off0.saturating_add(granule64);
-                            }
-                            write_frame_any(&mut s, frame::DELTA_END, &[]).await?;
-                            // read need ranges
-                            let (t_need, pl_need) = read_frame_any(&mut s).await?;
-                            let mut need_ranges: Vec<(u64, u64)> = Vec::new();
-                            if t_need == frame::NEED_RANGES_START && pl_need.len() >= 4 {
-                                    let _cnt = u32::from_le_bytes(
-                                        pl_need[0..4]
-                                            .try_into()
-                                            .context("Invalid count bytes in NEEDRANGES")?,
-                                    ) as usize;
-                                    loop {
-                                        let (ti, pli) = read_frame_any(&mut s).await?;
-                                        if ti == frame::NEED_RANGE {
-                                            if pli.len() >= 16 {
-                                                let off = u64::from_le_bytes(
-                                                    pli[0..8].try_into().context(
-                                                        "Invalid offset bytes in NEEDRANGES",
-                                                    )?,
-                                                );
-                                                let len = u64::from_le_bytes(
-                                                    pli[8..16].try_into().context(
-                                                        "Invalid length bytes in NEEDRANGES",
-                                                    )?,
-                                                );
-                                                need_ranges.push((off, len));
-                                            }
-                                        } else if ti == frame::NEED_RANGES_END {
-                                            break;
-                                        } else {
-                                            anyhow::bail!("unexpected frame in need list");
-                                        }
-                                    }
-                            }
-                            if !need_ranges.is_empty()
-                                && (need_ranges.len() as u64) * granule64 < fe.size
-                            {
-                                let mut f2 = tokio::fs::File::open(&fe.path).await?;
-                                use tokio::io::{AsyncReadExt, AsyncSeekExt};
-                                for (mut off, mut left) in need_ranges.into_iter() {
-                                    let mut b = vec![0u8; 4 * 1024 * 1024];
-                                    while left > 0 {
-                                        f2.seek(std::io::SeekFrom::Start(off)).await?;
-                                        let want = (left as usize).min(b.len());
-                                        let n = f2.read(&mut b[..want]).await?;
-                                        if n == 0 {
-                                            break;
-                                        }
-                                        let mut p = Vec::with_capacity(8 + n);
-                                        p.extend_from_slice(&off.to_le_bytes());
-                                        p.extend_from_slice(&b[..n]);
-                                        write_frame_any(&mut s, frame::DELTA_DATA, &p).await?;
-                                        off += n as u64;
-                                        left -= n as u64;
-                                    }
+
+                        if size >= 256 * 1024 * 1024 {
+                            // Pre-create file via SET_ATTR on a fresh control START
+                            let mut ctrl = connect_secure(&host, port, secure).await?;
+                            let mut pl = Vec::with_capacity(2 + rels.len() + 8 + 8);
+                            pl.extend_from_slice(&(rels.len() as u16).to_le_bytes());
+                            pl.extend_from_slice(rels.as_bytes());
+                            pl.extend_from_slice(&size.to_le_bytes());
+                            pl.extend_from_slice(&mtime.to_le_bytes());
+                            // New session for control
+                            let dest_s = dest.to_string_lossy();
+                            let mut sp = Vec::with_capacity(2 + dest_s.len() + 1);
+                            sp.extend_from_slice(&(dest_s.len() as u16).to_le_bytes());
+                            sp.extend_from_slice(dest_s.as_bytes());
+                            sp.push(0);
+                            write_frame_any(&mut ctrl, frame::START, &sp).await?;
+                            let (_t, _r) = read_frame_any(&mut ctrl).await?;
+                            write_frame_any(&mut ctrl, frame::SET_ATTR, &pl).await?;
+                            let (_tok, _pl) = read_frame_any(&mut ctrl).await?;
+                            write_frame_any(&mut ctrl, frame::DONE, &[]).await?;
+                            let _ = read_frame_any(&mut ctrl).await?;
+
+                            // Build ranges and send via PFILE on this worker connection
+                            let mut off0 = 0u64;
+                            let stride = chunk_bytes as u64;
+                            let mut f = std::fs::File::open(&fe.path)?;
+                            use std::io::Read as _;
+                            let mut buf = vec![0u8; chunk_bytes];
+                            while off0 < size {
+                                let len = std::cmp::min(stride, size - off0) as usize;
+                                // Read from disk
+                                let mut rd = 0usize;
+                                while rd < len {
+                                    let n = f.read(&mut buf[rd..len])?;
+                                    if n == 0 { break; }
+                                    rd += n;
                                 }
-                                write_frame_any(&mut s, frame::DELTA_DONE, &[]).await?;
+                                if rd == 0 { break; }
+                                // Send header + raw bytes
+                                let mut ph = Vec::with_capacity(2 + rels.len() + 8 + 4);
+                                ph.extend_from_slice(&(rels.len() as u16).to_le_bytes());
+                                ph.extend_from_slice(rels.as_bytes());
+                                ph.extend_from_slice(&off0.to_le_bytes());
+                                ph.extend_from_slice(&(rd as u32).to_le_bytes());
+                                write_frame_any(&mut s, frame::PFILE_START, &ph).await?;
+                                match &mut s {
+                                    StreamAny::Plain(raw) => { raw.write_all(&buf[..rd]).await?; }
+                                    StreamAny::Tls(tls) => { use tokio::io::AsyncWriteExt; tls.write_all(&buf[..rd]).await?; }
+                                }
                                 let (_tok, _plk) = read_frame_any(&mut s).await?;
-                                used_delta = true;
+                                off0 += rd as u64;
                             }
-                        }
-                        if !used_delta {
-                            // Fallback: raw full file
+                        } else {
+                            // Fallback: raw single-stream file on this connection
                             let mut pl_raw = Vec::with_capacity(2 + rels.len() + 8 + 8);
                             pl_raw.extend_from_slice(&(rels.len() as u16).to_le_bytes());
                             pl_raw.extend_from_slice(rels.as_bytes());
-                            pl_raw.extend_from_slice(&fe.size.to_le_bytes());
+                            pl_raw.extend_from_slice(&size.to_le_bytes());
                             pl_raw.extend_from_slice(&mtime.to_le_bytes());
                             write_frame_any(&mut s, frame::FILE_RAW_START, &pl_raw).await?;
                             let mut f = tokio::fs::File::open(&fe.path).await?;
                             use tokio::io::AsyncReadExt;
                             let mut buf = vec![0u8; chunk_bytes];
-                            let mut remaining = fe.size;
+                            let mut remaining = size;
                             while remaining > 0 {
                                 let to_read = (remaining as usize).min(buf.len());
                                 let n = f.read(&mut buf[..to_read]).await?;
-                                if n == 0 {
-                                    break;
-                                }
-                                let ms = crate::protocol::timeouts::WRITE_BASE_MS
-                                    + (n as u64).div_ceil(1_048_576)
-                                        * crate::protocol::timeouts::PER_MB_MS;
+                                if n == 0 { break; }
                                 match &mut s {
-                                    StreamAny::Plain(raw) => {
-                                        write_all_timed(raw, &buf[..n], ms).await?
-                                    }
-                                    StreamAny::Tls(tls) => {
-                                        use tokio::io::AsyncWriteExt;
-                                        timeout(
-                                            Duration::from_millis(ms),
-                                            tls.write_all(&buf[..n]),
-                                        )
-                                        .await??;
-                                    }
+                                    StreamAny::Plain(raw) => { raw.write_all(&buf[..n]).await?; }
+                                    StreamAny::Tls(tls) => { use tokio::io::AsyncWriteExt; tls.write_all(&buf[..n]).await?; }
                                 }
                                 remaining -= n as u64;
                             }
                         }
-                    } else {
-                        break;
-                    }
+                    } else { break; }
                 }
                 write_frame_any(&mut s, frame::DONE, &[]).await?; // Done
                 let (t_ok, _) = read_frame_any(&mut s).await?;
@@ -1170,7 +1155,7 @@ pub mod client {
             match t {
                 8u8 => {
                     // TarStart
-                    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+                    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                     let unpack_dest = dest_root.to_path_buf();
                     let unpacker = tokio::task::spawn_blocking(move || -> Result<()> {
                         let reader = ChanReader {

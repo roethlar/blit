@@ -68,22 +68,22 @@ pub mod frame {
 // Centralized timeout constants for consistent behavior across async/legacy paths
 pub mod timeouts {
     // Base timeout for frame header reads (ms)
-    pub const FRAME_HEADER_MS: u64 = 3000;
+    pub const FRAME_HEADER_MS: u64 = 15000;
 
     // Base timeout for writes (ms)
-    pub const WRITE_BASE_MS: u64 = 500;
+    pub const WRITE_BASE_MS: u64 = 5000;
 
     // Base timeout for reads (ms)
-    pub const READ_BASE_MS: u64 = 300;
+    pub const READ_BASE_MS: u64 = 5000;
 
     // Additional timeout per MB of data (ms)
-    pub const PER_MB_MS: u64 = 1;
+    pub const PER_MB_MS: u64 = 2;
 
     // Progress tick interval for UI updates (ms)
     pub const PROGRESS_TICK_MS: u64 = 250;
 
     // Connection establishment timeout (ms)
-    pub const CONNECT_MS: u64 = 200;
+    pub const CONNECT_MS: u64 = 2000;
 
     // Calculate write deadline based on payload size (ms)
     // 500ms base + 1ms per 1MB payload (ceil)

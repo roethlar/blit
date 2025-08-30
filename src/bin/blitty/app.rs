@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -225,6 +225,8 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut app = AppState::new(remote);
+    // Apply theme at startup for consistent visuals
+    super::theme::set_theme(&app.theme_name);
     // Load persisted options (best-effort)
     app.options =
         options::load_options().unwrap_or_else(|_| options::OptionsState::with_safe_defaults());
@@ -404,6 +406,8 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
 
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(k) = event::read()? {
+                    // Process only key presses to avoid doubled input on Windows
+                    if k.kind != KeyEventKind::Press { continue; }
                     let code = k.code;
                     let modifiers = k.modifiers;
 
@@ -417,6 +421,48 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                     if app.ui_mode == UiMode::ServerInput {
                         // Handle server input mode - only accept text input keys
                         match code {
+                            KeyCode::Char('1')
+                            | KeyCode::Char('2')
+                            | KeyCode::Char('3')
+                            | KeyCode::Char('4')
+                            | KeyCode::Char('5')
+                            | KeyCode::Char('6')
+                            | KeyCode::Char('7')
+                            | KeyCode::Char('8')
+                            | KeyCode::Char('9') => {
+                                // Quick connect to discovered host by index
+                                let idx = match code {
+                                    KeyCode::Char('1') => 0,
+                                    KeyCode::Char('2') => 1,
+                                    KeyCode::Char('3') => 2,
+                                    KeyCode::Char('4') => 3,
+                                    KeyCode::Char('5') => 4,
+                                    KeyCode::Char('6') => 5,
+                                    KeyCode::Char('7') => 6,
+                                    KeyCode::Char('8') => 7,
+                                    _ => 8,
+                                };
+                                if let Some(d) = app.discovered.get(idx).cloned() {
+                                    let cwd = std::path::PathBuf::from("/");
+                                    app.right = Pane::Remote {
+                                        host: d.host.clone(),
+                                        port: d.port,
+                                        cwd: cwd.clone(),
+                                        entries: vec![],
+                                        selected: 0,
+                                    };
+                                    ui::request_remote_dir(
+                                        &mut app,
+                                        Focus::Right,
+                                        d.host.clone(),
+                                        d.port,
+                                        cwd,
+                                    );
+                                    app.status =
+                                        format!("Connecting to {}:{}...", d.host, d.port);
+                                    app.ui_mode = UiMode::Normal;
+                                }
+                            }
                             KeyCode::Enter => {
                                 ui::process_server_input(&mut app);
                                 app.ui_mode = UiMode::Normal;
@@ -650,6 +696,22 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                                     }
                                 }
                             }
+                            KeyCode::F(4) => {
+                                // Quick theme switch inside Options
+                                fn next_theme(cur: &str) -> &'static str {
+                                    match cur {
+                                        "Dracula" => "SolarizedDark",
+                                        "SolarizedDark" => "Gruvbox",
+                                        _ => "Dracula",
+                                    }
+                                }
+                                app.theme_name = next_theme(&app.theme_name).to_string();
+                                super::theme::set_theme(&app.theme_name);
+                                app.toast = Some((
+                                    format!("Theme: {}", app.theme_name),
+                                    std::time::Instant::now(),
+                                ));
+                            }
                             KeyCode::Left => {
                                 let logical = super::ui::current_options_logical_index();
                                 if logical == 50 {
@@ -858,6 +920,15 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                             (KeyCode::Backspace, _) => {
                                 ui::swap_panes(&mut app);
                             }
+                            // New folder in Target (right) pane
+                            (KeyCode::Char('n'), _) => {
+                                if matches!(app.focus, Focus::Right) {
+                                    app.input_buffer.clear();
+                                    app.ui_mode = UiMode::NewFolderInput;
+                                } else {
+                                    app.status = "Switch to Target pane (Tab) to create a folder".to_string();
+                                }
+                            }
                             // Connection dialog
                             (KeyCode::F(2), _) => {
                                 app.ui_mode = UiMode::ServerInput;
@@ -899,22 +970,10 @@ pub fn run(remote: Option<RemoteDest>) -> Result<()> {
                                         &dest,
                                     );
                                     app.pending_args = Some(argv);
-                                    // Determine if typed confirmation is required
-                                    if matches!(app.mode, Mode::Mirror) {
-                                        app.confirm_required_input = Some("delete".to_string());
-                                        app.ui_mode = UiMode::ConfirmTyped;
-                                        app.status = "Type 'delete' to confirm mirror deletions, or Esc to cancel".to_string();
-                                    } else if matches!(app.mode, Mode::Move) {
-                                        app.confirm_required_input = Some("move".to_string());
-                                        app.ui_mode = UiMode::ConfirmTyped;
-                                        app.status = "Type 'move' to confirm move (source removal), or Esc to cancel".to_string();
-                                    } else {
-                                        app.confirm_required_input = None;
-                                        app.ui_mode = UiMode::ConfirmTransfer;
-                                        app.status =
-                                            "Press Y to confirm transfer, or Esc to cancel"
-                                                .to_string();
-                                    }
+                                    // Simple confirmation for all modes: Y/N only
+                                    app.confirm_required_input = None;
+                                    app.ui_mode = UiMode::ConfirmTransfer;
+                                    app.status = "Press Y to confirm transfer, or Esc to cancel".to_string();
                                 } else if app.src.is_none() || app.dest.is_none() {
                                     app.status = "Select source (Space in left pane) and destination (Space in right pane) first".to_string();
                                 } else if app.running {

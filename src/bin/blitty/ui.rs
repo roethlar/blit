@@ -164,25 +164,25 @@ pub fn draw(f: &mut Frame, app: &AppState) {
         format!("  Ready │ {} │ {}", status_parts.join(" "), src_dst)
     };
 
-    // Second line: command keys with better visual separation
+    // Second line: command keys with better visual separation (always show essentials)
     let keys = if get_show_help(app) {
-        " Press [h] to close help"
+        " Press [H] to close help"
     } else if app.ui_mode == super::app::UiMode::ServerInput {
-        " Type server address • [Enter] connect • [Esc] cancel"
+        " Type server address • [Enter] connect • [Esc] cancel • [H] help"
     } else if app.ui_mode == super::app::UiMode::NewFolderInput {
-        " Type folder name • [Enter] create • [Esc] cancel"
+        " Type folder name • [Enter] create • [Esc] cancel • [H] help"
     } else if app.ui_mode == super::app::UiMode::ConfirmTransfer {
-        " ⚠️  Confirm: [Y]es execute • [N]/[Esc] cancel"
+        " ⚠️  Confirm: [Y]es execute • [N]/[Esc] cancel • [H] help"
     } else if app.ui_mode == super::app::UiMode::ConfirmTyped {
-        " Type confirmation text and press Enter • [Esc] cancel"
+        " Type confirmation text • [Esc] cancel • [H] help"
     } else if app.ui_mode == super::app::UiMode::TextInput {
-        " Type value • [Enter] save • [Esc] cancel"
+        " Type value • [Enter] save • [Esc] cancel • [H] help"
     } else if app.ui_mode == super::app::UiMode::Options {
-        " [↑/↓] move  [Space/Enter] toggle  [Esc] close"
+        " [↑/↓] move • [Space/Enter] toggle • [Ctrl+←/→] tabs • [F4] theme • [Esc] close • [H] help"
     } else if app.ui_mode == super::app::UiMode::Busy {
-        " Working… • [C] Cancel"
+        " Working… • [C] Cancel • [H] help"
     } else {
-        " [Tab]switch [↑↓]nav [Space]select [Enter]go [Esc]back [Backspace]swap [F2]connect [Ctrl+G]transfer [h]elp [q]uit"
+        " [Tab] Switch • [↑/↓] Move • [Enter] Open • [Space] Select • [N] New-Folder • [Backspace] Swap • [F2] Connect • [Ctrl+G] Transfer • [H] Help • [Q] Quit"
     };
 
     let status_lines = vec![
@@ -203,6 +203,8 @@ pub fn draw(f: &mut Frame, app: &AppState) {
             .style(ratatui::style::Style::default().bg(Theme::BG())),
     );
     f.render_widget(p, chunks[3]);
+
+    // No blocking overlays; header and toolbar provide guidance
 
     // Busy overlay
     if app.ui_mode == super::app::UiMode::Busy {
@@ -289,6 +291,7 @@ pub fn draw(f: &mut Frame, app: &AppState) {
             Line::from("  Backspace  Swap panes (Source/Target)"),
             Line::from("  Enter      Enter directory"),
             Line::from("  Ctrl+G     Start transfer"),
+            Line::from("  N          New folder in Target pane"),
             Line::from("  Esc        Abort transfer / go back"),
             Line::from(""),
             Line::from(Span::styled(
@@ -350,7 +353,7 @@ pub fn draw(f: &mut Frame, app: &AppState) {
         f.render_widget(help_widget, area);
     }
 
-    // Server input overlay with proper background
+    // Server input overlay with proper background and discovered hosts
     if app.ui_mode == super::app::UiMode::ServerInput {
         let area = centered_rect(50, 12, f.size());
 
@@ -365,7 +368,7 @@ pub fn draw(f: &mut Frame, app: &AppState) {
             format!("{}█", app.input_buffer)
         };
 
-        let input_text = vec![
+        let mut input_text = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "Enter server address (host:port):",
@@ -382,23 +385,43 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                 ),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "Enter",
-                    ratatui::style::Style::default()
-                        .fg(Theme::PINK())
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-                Span::raw(" to connect, "),
-                Span::styled(
-                    "Esc",
-                    ratatui::style::Style::default()
-                        .fg(Theme::PINK())
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-                Span::raw(" to cancel"),
-            ]),
         ];
+
+        // Discovered hosts list with numeric shortcuts 1..9
+        if !app.discovered.is_empty() {
+            input_text.push(Line::from(Span::styled(
+                "Discovered servers:",
+                ratatui::style::Style::default().fg(Theme::CYAN()),
+            )));
+            for (i, d) in app.discovered.iter().take(9).enumerate() {
+                input_text.push(Line::from(Span::styled(
+                    format!("  [{}] {}:{} — {}", i + 1, d.host, d.port, d.name),
+                    ratatui::style::Style::default().fg(Theme::FG()),
+                )));
+            }
+            input_text.push(Line::from(""));
+            input_text.push(Line::from(Span::styled(
+                "Tip: Press number to connect to a discovered server",
+                ratatui::style::Style::default().fg(Theme::COMMENT()),
+            )));
+        }
+
+        input_text.push(Line::from(vec![
+            Span::styled(
+                "Enter",
+                ratatui::style::Style::default()
+                    .fg(Theme::PINK())
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::raw(" to connect, "),
+            Span::styled(
+                "Esc",
+                ratatui::style::Style::default()
+                    .fg(Theme::PINK())
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::raw(" to cancel"),
+        ]));
 
         let input_block = Paragraph::new(input_text)
             .alignment(ratatui::layout::Alignment::Center)
@@ -938,7 +961,16 @@ pub fn current_options_logical_index() -> usize {
 }
 
 pub fn is_ascii_mode() -> bool {
-    // Check if we should use ASCII mode (for non-UTF8 terminals)
+    // Prefer ASCII where terminals commonly mis-render emoji/wide glyphs
+    #[cfg(windows)]
+    {
+        if std::env::var("BLIT_UNICODE").is_ok() {
+            return false;
+        }
+        // Default to ASCII on Windows unless explicitly overridden
+        return true;
+    }
+    // Non-Windows: allow opt-in via BLIT_ASCII or dumb terminals
     std::env::var("BLIT_ASCII").is_ok()
         || std::env::var("TERM").is_ok_and(|t| t.contains("dumb"))
 }
@@ -1008,7 +1040,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
         Some(PathSpec::Remote { host, port, path }) => {
             format!("🌐 {}:{}{}", host, port, make_breadcrumb(path, 20))
         }
-        None => "❌ No source selected".to_string(),
+        None => "❌ No source selected — press Space to set".to_string(),
     };
 
     let dest_display = match &app.dest {
@@ -1016,7 +1048,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
         Some(PathSpec::Remote { host, port, path }) => {
             format!("🌐 {}:{}{}", host, port, make_breadcrumb(path, 20))
         }
-        None => "❌ No destination selected".to_string(),
+        None => "❌ No destination selected — press Space to set".to_string(),
     };
 
     let mut header_text = vec![
@@ -1085,6 +1117,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
                     ratatui::style::Style::default().fg(Theme::COMMENT())
                 },
             ),
+            Span::raw("   • H:Help F2:Connect N:New"),
         ]),
         Line::from(vec![
             Span::styled(
@@ -1101,6 +1134,22 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
                     Theme::RED()
                 }),
             ),
+            Span::raw("  "),
+            Span::styled(
+                "NETWORK: ",
+                ratatui::style::Style::default()
+                    .fg(Theme::CYAN())
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} discovered", app.discovered.len()),
+                ratatui::style::Style::default().fg(if app.discovered.len() > 0 {
+                    Theme::GREEN()
+                } else {
+                    Theme::COMMENT()
+                }),
+            ),
+            Span::raw("  (F2 to connect)"),
         ]),
     ];
     if app.options.never_tell_me_the_odds {
@@ -1113,7 +1162,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
     }
 
     let header_widget = Paragraph::new(header_text)
-        .alignment(ratatui::layout::Alignment::Center)
+        .alignment(ratatui::layout::Alignment::Left)
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)
@@ -1665,45 +1714,18 @@ pub fn create_new_folder(app: &mut super::app::AppState) {
                 }
             }
         }
-        Pane::Remote {
-            host, port, cwd, ..
-        } => {
-            let remote_path = cwd.join(folder_name);
-            let exe = crate::resolve_blit_path();
-            let remote_url = format!("blit://{}:{}{}", host, port, remote_path.display());
-            if let Ok(temp_dir) = std::env::temp_dir().canonicalize() {
-                let temp_path = temp_dir.join(format!("blit_mkdir_{}", std::process::id()));
-                if std::fs::create_dir(&temp_path).is_ok() {
-                    let mut cmd = std::process::Command::new(&exe);
-                    let _ = cmd
-                        .arg("copy")
-                        .arg("--empty-dirs")
-                        .arg(temp_path.to_string_lossy().as_ref())
-                        .arg(&remote_url)
-                        .output();
-                    let _ = std::fs::remove_dir(&temp_path);
-                    app.status = format!("Created remote folder: {}", folder_name);
-                    let mut req: Option<(super::app::Focus, String, u16, PathBuf)> = None;
-                    if let Pane::Remote {
-                        host, port, cwd, ..
-                    } = &app.right
-                    {
-                        let pane_focus = if app.focus == super::app::Focus::Left {
-                            super::app::Focus::Left
-                        } else {
-                            super::app::Focus::Right
-                        };
-                        req = Some((pane_focus, host.clone(), *port, cwd.clone()));
-                    }
-                    if let Some((pane_focus, h, p, c)) = req {
-                        request_remote_dir(app, pane_focus, h, p, c);
-                    }
-                } else {
-                    app.status = "Failed to create temporary directory".to_string();
-                }
+        Pane::Remote { host, port, cwd, .. } => {
+            // Use protocol MKDIR directly for reliability
+            let name = folder_name.to_string();
+            super::remote::request_remote_mkdir(&app.tx_ui, host.clone(), *port, cwd.clone(), name);
+            // Trigger refresh
+            let pane_focus = if app.focus == super::app::Focus::Left {
+                super::app::Focus::Left
             } else {
-                app.status = "Failed to get temp directory".to_string();
-            }
+                super::app::Focus::Right
+            };
+            request_remote_dir(app, pane_focus, host.clone(), *port, cwd.clone());
+            app.status = "Creating remote folder...".to_string();
         }
     }
     app.input_buffer.clear();
