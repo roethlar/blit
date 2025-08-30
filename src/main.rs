@@ -270,6 +270,7 @@ fn main() -> Result<()> {
                         &remote_src.host,
                         remote_src.port,
                         &remote_src.path,
+                        remote_src.tls
                     ))?;
                 } else if src.is_file() {
                     let _ = std::fs::remove_file(src);
@@ -1301,7 +1302,12 @@ fn merge_stats(total: &mut CopyStats, other: CopyStats) {
 // Server/daemon hosting code moved to blitd binary
 // This binary (blit) is the client sync tool (local and network operations)
 
-fn convert_args_to_lib(a: &Args) -> blit::Args { blit::Args { mirror: a.mirror, delete: a.delete, empty_dirs: a.empty_dirs, ludicrous_speed: a.ludicrous_speed, progress: a.progress, verbose: a.verbose, exclude_files: a.exclude_files.clone(), exclude_dirs: a.exclude_dirs.clone(), net_workers: a.net_workers, net_chunk_mb: a.net_chunk_mb, checksum: a.checksum, force_tar: a.force_tar, no_tar: a.no_tar, never_tell_me_the_odds: a.never_tell_me_the_odds } }
+fn convert_args_to_lib_with_scheme(a: &Args, remote: &url::RemoteDest) -> blit::Args {
+    let mut out = blit::Args { mirror: a.mirror, delete: a.delete, empty_dirs: a.empty_dirs, ludicrous_speed: a.ludicrous_speed, progress: a.progress, verbose: a.verbose, exclude_files: a.exclude_files.clone(), exclude_dirs: a.exclude_dirs.clone(), net_workers: a.net_workers, net_chunk_mb: a.net_chunk_mb, checksum: a.checksum, force_tar: a.force_tar, no_tar: a.no_tar, never_tell_me_the_odds: a.never_tell_me_the_odds };
+    if !remote.tls && !a.never_tell_me_the_odds { out.never_tell_me_the_odds = true; }
+    out
+}
+
 
 fn client_push(remote: url::RemoteDest, src_root: &Path, args: &Args) -> Result<()> {
     if !src_root.exists() {
@@ -1311,12 +1317,13 @@ fn client_push(remote: url::RemoteDest, src_root: &Path, args: &Args) -> Result<
         .enable_all()
         .build()
         .context("build tokio runtime for client push")?;
-    rt.block_on(crate::net_async::client::push(
+    let lib_args = convert_args_to_lib_with_scheme(args, &remote);
+    rt.block_on(net_async::client::push(
         &remote.host,
         remote.port,
         &remote.path,
         src_root,
-        &convert_args_to_lib(args),
+        &lib_args,
     ))
 }
 
@@ -1325,26 +1332,27 @@ fn client_pull(remote: url::RemoteDest, dest_root: &Path, args: &Args) -> Result
         .enable_all()
         .build()
         .context("build tokio runtime for client pull")?;
-    rt.block_on(crate::net_async::client::pull(
+    let lib_args = convert_args_to_lib_with_scheme(args, &remote);
+    rt.block_on(net_async::client::pull(
         &remote.host,
         remote.port,
         &remote.path,
         dest_root,
-        &convert_args_to_lib(args),
+        &lib_args,
     ))
 }
 
 fn verify_trees(src: &Path, dest: &Path, checksum: bool) -> Result<VerifySummary> {
     // Direction inference: if dest is remote, do push-verify; if src is remote, do pull-verify
     if let Some(remote) = url::parse_remote_url(dest) {
-        verify_local_vs_remote(src, &remote.host, remote.port, &remote.path, checksum)
+        verify_local_vs_remote(src, &remote.host, remote.port, &remote.path, remote.tls)
     } else if let Some(remote_src) = url::parse_remote_url(src) {
         verify_remote_vs_local(
             &remote_src.host,
             remote_src.port,
             &remote_src.path,
             dest,
-            checksum,
+            remote_src.tls,
         )
     } else {
         verify_local_vs_local(src, dest, checksum)
@@ -1459,7 +1467,7 @@ fn verify_local_vs_remote(
     host: &str,
     port: u16,
     remote_path: &Path,
-    _checksum: bool,
+    secure: bool,
 ) -> Result<VerifySummary> {
     use std::collections::{HashMap, HashSet};
     // Enumerate local files
@@ -1491,12 +1499,14 @@ fn verify_local_vs_remote(
         host,
         port,
         remote_path,
+        secure,
     ))?;
     let remote_hashes = rt.block_on(net_async::client::remote_hashes(
         host,
         port,
         remote_path,
         &remote_files,
+        secure,
     ))?;
     let mut changed = 0usize;
     let mut extras = 0usize;
@@ -1566,7 +1576,7 @@ fn verify_remote_vs_local(
     port: u16,
     remote_path: &Path,
     dest: &Path,
-    _checksum: bool,
+    secure: bool,
 ) -> Result<VerifySummary> {
     use std::collections::{HashMap, HashSet};
     // Enumerate remote files and local files
@@ -1578,12 +1588,14 @@ fn verify_remote_vs_local(
         host,
         port,
         remote_path,
+        secure,
     ))?;
     let remote_hashes = rt.block_on(net_async::client::remote_hashes(
         host,
         port,
         remote_path,
         &remote_files,
+        secure,
     ))?;
     let filter = FileFilter {
         exclude_files: vec![],

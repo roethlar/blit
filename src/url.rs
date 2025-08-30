@@ -7,6 +7,7 @@ pub struct RemoteDest {
     pub host: String,
     pub port: u16,
     pub path: PathBuf,
+    pub tls: bool,
 }
 
 pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
@@ -15,8 +16,9 @@ pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
     let lower = s_trim.to_ascii_lowercase();
     let scheme_end = lower.find(':')?;
     let scheme_with_colon = &lower[..=scheme_end];
-    match scheme_with_colon {
-        "blit:" | "blits:" => {} // accept both schemes; TLS handled by caller
+    let tls = match scheme_with_colon {
+        "blit:" => false,
+        "blits:" => true,
         _ => return None,
     };
     let mut rest = &s_trim[scheme_end + 1..];
@@ -42,5 +44,6 @@ pub fn parse_remote_url(path: &Path) -> Option<RemoteDest> {
         } else {
             PathBuf::from(format!("/{}", p))
         },
+        tls,
     })
 }

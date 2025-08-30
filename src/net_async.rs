@@ -8,96 +8,40 @@
 #[cfg(feature = "server")]
 pub mod server {
     use anyhow::{Context, Result};
-    use std::time::Instant;
     use crate::protocol::frame;
+    use crate::protocol::timeouts::{read_deadline_ms, FRAME_HEADER_MS};
+    use crate::protocol_core;
     use std::path::{Path, PathBuf};
+    use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::{timeout, Duration};
-
-    // MAGIC and VERSION imported from crate::protocol
-
-    // Use centralized timeout constants and functions from protocol module
-    use crate::protocol::timeouts::{read_deadline_ms, write_deadline_ms, FRAME_HEADER_MS};
-
-    #[inline]
-    fn debug_logs_enabled() -> bool {
-        std::env::var("BLIT_DEBUG_NET").is_ok()
-    }
 
     #[inline]
     async fn read_exact_timed<S>(stream: &mut S, buf: &mut [u8], ms: u64) -> Result<()>
     where
         S: tokio::io::AsyncRead + Unpin,
     {
-        use tokio::io::AsyncReadExt;
-        match timeout(Duration::from_millis(ms), async {
-            stream.read_exact(buf).await
-        })
-        .await
-        {
+        match timeout(Duration::from_millis(ms), async { stream.read_exact(buf).await }).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => anyhow::bail!("read timeout ({} ms)", ms),
         }
     }
 
-    // note: server write_all_timed removed; frame helpers cover timed IO
-
-    pub(crate) async fn write_frame_timed<S>(
-        stream: &mut S,
-        t: u8,
-        payload: &[u8],
-        ms: u64,
-    ) -> Result<()>
-    where
-        S: tokio::io::AsyncWrite + Unpin,
-    {
-        match timeout(Duration::from_millis(ms), async {
-            let hdr = crate::protocol_core::build_frame_header(t, payload.len() as u32);
-            stream.write_all(&hdr).await?;
-            if !payload.is_empty() {
-                stream.write_all(payload).await?;
-            }
-            Ok(())
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => anyhow::bail!("frame write timeout ({} ms)", ms),
-        }
-    }
-
-    pub(crate) async fn write_frame<S>(stream: &mut S, t: u8, payload: &[u8]) -> Result<()>
-    where
-        S: tokio::io::AsyncWrite + Unpin,
-    {
-        let ms = write_deadline_ms(payload.len());
-        write_frame_timed(stream, t, payload, ms).await
-    }
-
-    pub async fn read_frame<S>(stream: &mut S) -> Result<(u8, Vec<u8>)>
+    async fn read_frame<S>(stream: &mut S) -> Result<(u8, Vec<u8>)>
     where
         S: tokio::io::AsyncRead + Unpin,
     {
-        // Read header with base timeout
         let mut hdr = [0u8; 11];
-        match timeout(Duration::from_millis(FRAME_HEADER_MS), async {
-            stream.read_exact(&mut hdr).await
-        })
-        .await
-        {
+        match timeout(Duration::from_millis(FRAME_HEADER_MS), async { stream.read_exact(&mut hdr).await }).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => anyhow::bail!("frame header timeout ({} ms)", FRAME_HEADER_MS),
         }
-
-        // Use protocol_core helper to parse header
-        let (typ, len_u32) = crate::protocol_core::parse_frame_header(&hdr)?;
+        let (typ, len_u32) = protocol_core::parse_frame_header(&hdr)?;
         let len = len_u32 as usize;
-
-        // Validate frame size
-        crate::protocol_core::validate_frame_size(len)?;
+        protocol_core::validate_frame_size(len)?;
         let mut payload = vec![0u8; len];
         if len > 0 {
             let ms = read_deadline_ms(len);
@@ -106,415 +50,187 @@ pub mod server {
         Ok((typ, payload))
     }
 
-    pub(crate) async fn read_frame_timed<S>(stream: &mut S, ms: u64) -> Result<(u8, Vec<u8>)>
+    async fn write_frame<S>(stream: &mut S, t: u8, payload: &[u8]) -> Result<()>
     where
-        S: tokio::io::AsyncRead + Unpin,
+        S: tokio::io::AsyncWrite + Unpin,
     {
-        match timeout(Duration::from_millis(ms), read_frame(stream)).await {
-            Ok(res) => res,
-            Err(_) => anyhow::bail!("frame IO timeout ({} ms)", ms),
+        let hdr = protocol_core::build_frame_header(t, payload.len() as u32);
+        stream.write_all(&hdr).await?;
+        if !payload.is_empty() {
+            stream.write_all(payload).await?;
         }
+        Ok(())
     }
 
-    fn normalize_under_root(root: &Path, p: &Path) -> Result<PathBuf> {
-        // Use the unified normalize_under_root from protocol_core
-        crate::protocol_core::normalize_under_root(root, p)
-    }
+    // Use protocol_core::normalize_under_root directly when needed
 
-    pub async fn serve(bind: &str, _root: &Path) -> Result<()> {
-        let listener = TcpListener::bind(bind).await.with_context(|| format!("bind {}", bind))?;
+    pub async fn serve(bind: &str, root: &Path) -> Result<()> {
+        let listener = TcpListener::bind(bind).await?;
         eprintln!("blit async daemon listening on {} (plaintext mode)", bind);
         loop {
             let (mut stream, peer) = listener.accept().await?;
             let _ = stream.set_nodelay(true);
             eprintln!("async conn from {}", peer);
+            let root = root.to_path_buf();
             tokio::spawn(async move {
-                // Politely inform client that plaintext mode is disabled by default
-                if let Ok((_t,_pl)) = read_frame_timed(&mut stream, 1000).await {
-                    let _ = write_frame(&mut stream, frame::ERROR, b"plaintext mode disabled; use TLS").await;
-                }
+                if let Err(e) = handle_session(&mut stream, &root).await { eprintln!("async connection error: {}", e); }
             });
         }
     }
-pub async fn serve_with_tls(
-        bind: &str,
-        root: &Path,
-        tls_config: rustls::ServerConfig,
-    ) -> Result<()> {
+
+    pub async fn serve_with_tls(bind: &str, root: &Path, tls_config: rustls::ServerConfig) -> Result<()> {
         use std::sync::Arc;
         use tokio_rustls::TlsAcceptor;
-
-        let listener = TcpListener::bind(bind)
-            .await
-            .with_context(|| format!("bind {}", bind))?;
+        let listener = TcpListener::bind(bind).await?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-
-        eprintln!(
-            "blit async daemon (TLS) listening on {} root={}",
-            bind,
-            root.display()
-        );
-
+        eprintln!("blit async daemon (TLS) listening on {} root={}", bind, root.display());
         loop {
             let (tcp_stream, peer) = listener.accept().await?;
             let _ = tcp_stream.set_nodelay(true);
             eprintln!("async TLS conn from {}", peer);
-
-            let acceptor = acceptor.clone();
             let root = root.to_path_buf();
-
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                // Perform TLS handshake
-                let mut stream = match acceptor.accept(tcp_stream).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        eprintln!("TLS handshake failed with {}: {}", peer, e);
-                        return;
-                    }
-                };
-                if let Err(e) = async move {
-                    let started = Instant::now();
-                    // Expect START or LIST_REQ, reply accordingly
-                    let (typ, pl) = read_frame_timed(&mut stream, 2500).await?;
-                    if typ == frame::LIST_REQ {
-                        // payload: path_len u16 | absolute path bytes (under root)
-                        if pl.len() < 2 {
-                            anyhow::bail!("bad LIST_REQ payload");
-                        }
-                        let nlen = u16::from_le_bytes([pl[0], pl[1]]) as usize;
-                        if pl.len() < 2 + nlen {
-                            anyhow::bail!("bad LIST_REQ path len");
-                        }
-                        let pbytes = &pl[2..2 + nlen];
-                        let preq_raw = std::str::from_utf8(pbytes).unwrap_or("");
-                        let mut rel = PathBuf::new();
-                        for comp in Path::new(preq_raw).components() {
-                            use std::path::Component::*;
-                            match comp {
-                                RootDir | CurDir => continue,
-                                ParentDir => continue,
-                                Normal(s) => rel.push(s),
-                                Prefix(_) => continue,
-                            }
-                        }
-                        // Resolve requested path under root; if it's a file, list its parent; if missing, list root
-                        let mut target = normalize_under_root(&root, &rel)?;
-                        if !target.exists() || target.is_file() {
-                            target = target
-                                .parent()
-                                .map(|p| p.to_path_buf())
-                                .unwrap_or_else(|| root.clone());
-                        }
-                        let mut out: Vec<u8> = Vec::new();
-                        let mut items: Vec<(u8, String)> = Vec::new();
-                        const MAX_LIST_ENTRIES: usize = 1000;
-                        let mut entry_count = 0;
-                        if let Ok(rd) = std::fs::read_dir(&target) {
-                            for e in rd.flatten() {
-                                if entry_count >= MAX_LIST_ENTRIES {
-                                    items.push((
-                                        2u8,
-                                        format!("... ({} entries max)", MAX_LIST_ENTRIES),
-                                    ));
-                                    break;
-                                }
-                                let name = e.file_name().to_string_lossy().to_string();
-                                let kind = match e.file_type() {
-                                    Ok(ft) if ft.is_dir() => 1u8,
-                                    _ => 0u8,
-                                };
-                                items.push((kind, name));
-                                entry_count += 1;
-                            }
-                        }
-                        items.sort_by(|a, b| match (a.0, b.0) {
-                            (1, 0) => std::cmp::Ordering::Less,
-                            (0, 1) => std::cmp::Ordering::Greater,
-                            _ => a.1.cmp(&b.1),
-                        });
-                        out.extend_from_slice(&(items.len() as u32).to_le_bytes());
-                        for (k, n) in items.into_iter() {
-                            out.push(k);
-                            out.extend_from_slice(&(n.len() as u16).to_le_bytes());
-                            out.extend_from_slice(n.as_bytes());
-                        }
-                        write_frame(&mut stream, frame::LIST_RESP, &out).await?;
-                        return Ok::<(), anyhow::Error>(());
-                    }
-                    if typ != frame::START {
-                        anyhow::bail!("expected START frame");
-                    }
-                    // Parse destination and flags: dest_len u16 | dest_bytes | flags u8
-                    let (base, flags) = if pl.len() >= 3 {
-                        let n = u16::from_le_bytes([pl[0], pl[1]]) as usize;
-                        if pl.len() >= 3 + n {
-                            let d = std::str::from_utf8(&pl[2..2 + n]).unwrap_or("");
-                            // Sanitize absolute/relative components similar to LIST_REQ
-                            let mut rel = PathBuf::new();
-                            for comp in Path::new(d).components() {
-                                use std::path::Component::*;
-                                match comp {
-                                    RootDir | Prefix(_) | CurDir => continue,
-                                    ParentDir => continue,
-                                    Normal(s) => rel.push(s),
-                                }
-                            }
-                            let p = normalize_under_root(&root, &rel)?;
-                            let flags = pl[2 + n];
-                            (p, flags)
-                        } else {
-                            (root.clone(), 0)
-                        }
-                    } else {
-                        (root.clone(), 0)
-                    };
-                    let _mirror = (flags & 0b0000_0001) != 0;
-                    let _pull = (flags & 0b0000_0010) != 0;
-                    let _include_empty_dirs = (flags & 0b0000_0100) != 0;
-                    let _speed = (flags & 0b0000_1000) != 0;
-                    write_frame(&mut stream, frame::OK, b"OK").await?;
-
-                    struct Connection {
-                        needed: std::collections::HashSet<String>,
-                        client_present: std::collections::HashSet<String>,
-                        verify_batch: Vec<String>,
-                    }
-                    let mut conn = Connection {
-                        needed: std::collections::HashSet::new(),
-                        client_present: std::collections::HashSet::new(),
-                        verify_batch: Vec::new(),
-                    };
-                    loop {
-                        let (t, payload) = read_frame(&mut stream).await?;
-                        use crate::protocol::frame as fids;
-                        match t {
-                            fids::MANIFEST_START => {
-                                conn.needed.clear();
-                                conn.client_present.clear();
-                                conn.verify_batch.clear();
-                            }
-                            fids::MANIFEST_ENTRY => {
-                                if payload.len() < 1 + 2 {
-                                    anyhow::bail!("bad MANIFEST_ENTRY");
-                                }
-                                let kind = payload[0];
-                                let nlen = u16::from_le_bytes([payload[1], payload[2]]) as usize;
-                                if payload.len() < 1 + 2 + nlen {
-                                    anyhow::bail!("bad MANIFEST_ENTRY name len");
-                                }
-                                let name = std::str::from_utf8(&payload[3..3 + nlen])
-                                    .unwrap_or("")
-                                    .to_string();
-                                conn.client_present.insert(name.clone());
-                                if kind == 0 || kind == 1 {
-                                    conn.needed.insert(name);
-                                }
-                            }
-                            fids::MANIFEST_END => {
-                                // Build NEED_LIST from client-present entries (naive: request all)
-                                let mut resp = Vec::new();
-                                let count = conn.needed.len() as u32;
-                                resp.extend_from_slice(&count.to_le_bytes());
-                                for name in conn.needed.iter() {
-                                    let nb = name.as_bytes();
-                                    resp.extend_from_slice(&(nb.len() as u16).to_le_bytes());
-                                    resp.extend_from_slice(nb);
-                                }
-                                write_frame(&mut stream, frame::NEED_LIST, &resp).await?;
-                                if debug_logs_enabled() {
-                                    eprintln!("[TLS] NEED_LIST sent: {}", count);
-                                }
-                            }
-                            fids::TAR_START => {
-                                if debug_logs_enabled() {
-                                    eprintln!("[TLS] TAR_START");
-                                }
-                                // Streaming tar unpack without temp files (mirror plaintext path)
-                                let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
-                                let (res_tx, res_rx) =
-                                    tokio::sync::oneshot::channel::<(u64, u64)>();
-                                struct ChanReader {
-                                    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-                                    buf: Vec<u8>,
-                                    pos: usize,
-                                    done: bool,
-                                }
-                                impl std::io::Read for ChanReader {
-                                    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-                                        if self.done {
-                                            return Ok(0);
-                                        }
-                                        if self.pos >= self.buf.len() {
-                                            match self.rx.blocking_recv() {
-                                                Some(chunk) => {
-                                                    self.buf = chunk;
-                                                    self.pos = 0;
-                                                }
-                                                None => {
-                                                    self.done = true;
-                                                    return Ok(0);
-                                                }
-                                            }
-                                        }
-                                        let n = out.len().min(self.buf.len() - self.pos);
-                                        if n > 0 {
-                                            out[..n]
-                                                .copy_from_slice(&self.buf[self.pos..self.pos + n]);
-                                            self.pos += n;
-                                        }
-                                        Ok(n)
-                                    }
-                                }
-                                let base_dir = base.clone();
-                                let unpacker =
-                                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                                        let reader = ChanReader {
-                                            rx,
-                                            buf: Vec::new(),
-                                            pos: 0,
-                                            done: false,
-                                        };
-                                        let mut ar = tar::Archive::new(reader);
-                                        ar.set_overwrite(true);
-                                        let mut files: u64 = 0;
-                                        let mut bytes: u64 = 0;
-                                        let entries = ar.entries().context("tar entries")?;
-                                        for e in entries {
-                                            let mut entry = e.context("tar entry")?;
-                                            let et = entry.header().entry_type();
-                                            if let Ok(rel) = entry.path() {
-                                                let dst = base_dir.join(&*rel);
-                                                if debug_logs_enabled() {
-                                                    eprintln!("[TLS] TAR entry: {}", dst.display());
-                                                }
-                                                // Skip device/FIFO/hardlink entries defensively
-                                                if et.is_block_special()
-                                                    || et.is_character_special()
-                                                    || et.is_fifo()
-                                                    || et.is_hard_link()
-                                                {
-                                                    continue;
-                                                }
-                                                if let Some(parent) = dst.parent() {
-                                                    let _ = std::fs::create_dir_all(parent);
-                                                }
-                                            }
-                                            if et.is_file() {
-                                                if let Ok(sz) = entry.header().size() {
-                                                    bytes = bytes.saturating_add(sz);
-                                                    files = files.saturating_add(1);
-                                                }
-                                            }
-                                            entry.unpack_in(&base_dir).context("unpack entry")?;
-                                        }
-                                        let _ = res_tx.send((files, bytes));
-                                        Ok(())
-                                    });
-                                loop {
-                                    let (ti, pli) = read_frame_timed(&mut stream, 750).await?;
-                                    if ti == frame::TAR_DATA {
-                                        if tx.send(pli).await.is_err() {
-                                            anyhow::bail!("tar unpacker closed");
-                                        }
-                                        continue;
-                                    }
-                                    if ti == frame::TAR_END {
-                                        break;
-                                    }
-                                    anyhow::bail!("unexpected frame during tar: {}", ti);
-                                }
-                                drop(tx);
-                                let _ = unpacker.await;
-                                let _ = res_rx.await;
-                                write_frame(&mut stream, frame::OK, b"TAR_OK").await?;
-                                if debug_logs_enabled() {
-                                    eprintln!("[TLS] TAR_OK");
-                                }
-                            }
-                            fids::FILE_RAW_START => {
-                                // Receive single raw file
-                                if payload.len() < 2 + 8 + 8 {
-                                    anyhow::bail!("bad FILE_RAW_START");
-                                }
-                                let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                                if payload.len() < 2 + nlen + 8 + 8 {
-                                    anyhow::bail!("bad FILE_RAW_START len");
-                                }
-                                let rel = std::str::from_utf8(&payload[2..2 + nlen]).unwrap_or("");
-                                let mut off = 2 + nlen;
-                                let size = u64::from_le_bytes(
-                                    payload[off..off + 8].try_into().context("Invalid size")?,
-                                );
-                                off += 8;
-                                let mtime = i64::from_le_bytes(
-                                    payload[off..off + 8].try_into().context("Invalid mtime")?,
-                                );
-                                let dst = normalize_under_root(&base, std::path::Path::new(rel))?;
-                                if let Some(parent) = dst.parent() {
-                                    std::fs::create_dir_all(parent).ok();
-                                }
-                                let mut f = std::fs::File::create(&dst)
-                                    .with_context(|| format!("create {}", dst.display()))?;
-                                let _ = f.set_len(size);
-                                let mut remaining = size as usize;
-                                let mut buf = vec![0u8; 4 * 1024 * 1024];
-                                use std::io::{Seek, SeekFrom, Write as _};
-                                while remaining > 0 {
-                                    let to_read = remaining.min(buf.len());
-                                    let ms = crate::protocol::timeouts::READ_BASE_MS
-                                        + (to_read as u64).div_ceil(1_048_576)
-                                            * crate::protocol::timeouts::PER_MB_MS;
-                                    let n = match tokio::time::timeout(
-                                        std::time::Duration::from_millis(ms),
-                                        async {
-                                            use tokio::io::AsyncReadExt;
-                                            stream.read(&mut buf[..to_read]).await
-                                        },
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(n)) => n,
-                                        Ok(Err(e)) => return Err(e.into()),
-                                        Err(_) => anyhow::bail!("raw body read timeout"),
-                                    };
-                                    if n == 0 {
-                                        anyhow::bail!("unexpected EOF during raw file body");
-                                    }
-                                    let is_zero = buf[..n].iter().all(|&b| b == 0);
-                                    if is_zero && n >= 128 * 1024 {
-                                        let _ = f.seek(SeekFrom::Current(n as i64));
-                                    } else {
-                                        f.write_all(&buf[..n]).context("write raw body")?;
-                                    }
-                                    remaining -= n;
-                                }
-                                let ft = filetime::FileTime::from_unix_time(mtime, 0);
-                                let _ = filetime::set_file_mtime(&dst, ft);
-                            }
-                            fids::DONE => {
-                                write_frame(&mut stream, frame::OK, b"OK").await?;
-                                break;
-                            }
-                            _ => {
-                                // Fall back to non-TAR file protocol and delta handling from the plaintext path
-                                // Delegate by returning an error to avoid silent hangs
-                                anyhow::bail!("TLS path unhandled frame: {}", t);
-                            }
-                        }
-                    }
-                    let elapsed = started.elapsed().as_millis();
-                    eprintln!("TLS session finished in {} ms", elapsed);
-                    Ok::<(), anyhow::Error>(())
-                }
-                .await
-                {
-                    eprintln!("async TLS connection error: {}", e);
-                }
+                let res = async move {
+                    let mut stream = acceptor.accept(tcp_stream).await?;
+                    handle_session(&mut stream, &root).await
+                }.await;
+                if let Err(e) = res { eprintln!("async TLS connection error: {}", e); }
             });
         }
     }
-}
 
+    async fn handle_session<S>(stream: &mut S, root: &Path) -> Result<()>
+    where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
+    {
+        let started = Instant::now();
+        // First frame: LIST_REQ or START
+        let (typ, pl) = read_frame(stream).await?;
+        if typ == frame::LIST_REQ {
+            if pl.len() < 2 { anyhow::bail!("bad LIST_REQ payload"); }
+            let nlen = u16::from_le_bytes([pl[0], pl[1]]) as usize;
+            if pl.len() < 2 + nlen { anyhow::bail!("bad LIST_REQ path len"); }
+            let pbytes = &pl[2..2+nlen];
+            let preq_raw = std::str::from_utf8(pbytes).unwrap_or("");
+            let mut rel = PathBuf::new();
+            for comp in Path::new(preq_raw).components() { use std::path::Component::*; match comp { RootDir|CurDir|ParentDir|Prefix(_)=>{}, Normal(s)=>rel.push(s) } }
+            let list_base = if rel.as_os_str().is_empty() { root.to_path_buf() } else { root.join(rel) };
+            let mut items: Vec<(u8, String)> = vec![(1u8, "..".into())];
+            if let Ok(rd) = std::fs::read_dir(&list_base) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let kind = if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {1} else {0};
+                    items.push((kind, name));
+                    if items.len() >= crate::protocol::MAX_LIST_ENTRIES { break; }
+                }
+            }
+            items.sort_by(|a,b| match (a.0,b.0){ (1,0)=>std::cmp::Ordering::Less,(0,1)=>std::cmp::Ordering::Greater,_=>a.1.cmp(&b.1)});
+            let mut out = Vec::new(); out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            for (k,n) in items { out.push(k); out.extend_from_slice(&(n.len() as u16).to_le_bytes()); out.extend_from_slice(n.as_bytes()); }
+            write_frame(stream, frame::LIST_RESP, &out).await?;
+            return Ok(());
+        }
+        if typ != frame::START { anyhow::bail!("expected START frame"); }
+        let (dest_rel, flags) = if pl.len() >= 3 {
+            let n = u16::from_le_bytes([pl[0], pl[1]]) as usize;
+            if pl.len() >= 3+n { (std::str::from_utf8(&pl[2..2+n]).unwrap_or("").to_string(), pl[2+n]) } else { ("".into(), 0) }
+        } else { ("".into(), 0) };
+        let mut rel = PathBuf::new();
+        for comp in Path::new(&dest_rel).components() { use std::path::Component::*; match comp { RootDir|CurDir|ParentDir|Prefix(_)=>{}, Normal(s)=>rel.push(s) } }
+        let base_dir = root.join(rel);
+        std::fs::create_dir_all(&base_dir).ok();
+        let pull = (flags & 0b0000_0010) != 0;
+        write_frame(stream, frame::OK, b"OK").await?;
+
+        // Session loop
+        let mut verify_batch: Vec<String> = Vec::new();
+        loop {
+            let (t, payload) = read_frame(stream).await?;
+            use crate::protocol::frame as fids;
+            match t {
+                fids::MANIFEST_START => { verify_batch.clear(); }
+                fids::MANIFEST_ENTRY => {
+                    if payload.len() < 3 { anyhow::bail!("bad MANIFEST_ENTRY"); }
+                    let kind = payload[0];
+                    let nlen = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+                    if payload.len() < 3+nlen { anyhow::bail!("bad MANIFEST_ENTRY name len"); }
+                    let name = std::str::from_utf8(&payload[3..3+nlen]).unwrap_or("").to_string();
+                    if kind == 0 || kind == 1 { verify_batch.push(name); }
+                }
+                fids::MANIFEST_END => {
+                    if pull {
+                        // Align client state then stream files
+                        write_frame(stream, frame::NEED_LIST, &0u32.to_le_bytes()).await?;
+                        use walkdir::WalkDir; use std::time::UNIX_EPOCH;
+                        for ent in WalkDir::new(&base_dir).into_iter().filter_map(|e| e.ok()) {
+                            if ent.file_type().is_file() {
+                                let rel = ent.path().strip_prefix(&base_dir).unwrap_or(ent.path());
+                                let rels = rel.to_string_lossy();
+                                let md = std::fs::metadata(ent.path()).ok();
+                                let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
+                                let mtime = md.and_then(|m| m.modified().ok()).and_then(|m| m.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
+                                let mut pls = Vec::with_capacity(2 + rels.len() + 8 + 8);
+                                pls.extend_from_slice(&(rels.len() as u16).to_le_bytes());
+                                pls.extend_from_slice(rels.as_bytes());
+                                pls.extend_from_slice(&size.to_le_bytes());
+                                pls.extend_from_slice(&mtime.to_le_bytes());
+                                write_frame(stream, frame::FILE_START, &pls).await?;
+                                let mut f = std::fs::File::open(ent.path())?;
+                                let mut buf = vec![0u8; 1024*1024];
+                                loop { use std::io::Read as _; let n = f.read(&mut buf)?; if n==0 { break; } write_frame(stream, frame::FILE_DATA, &buf[..n]).await?; }
+                                write_frame(stream, frame::FILE_END, &[]).await?;
+                            }
+                        }
+                        write_frame(stream, frame::DONE, &[]).await?;
+                    } else {
+                        let mut resp = Vec::new();
+                        resp.extend_from_slice(&(verify_batch.len() as u32).to_le_bytes());
+                        for name in verify_batch.iter() { let nb = name.as_bytes(); resp.extend_from_slice(&(nb.len() as u16).to_le_bytes()); resp.extend_from_slice(nb); }
+                        write_frame(stream, frame::NEED_LIST, &resp).await?;
+                    }
+                }
+                fids::TAR_START => {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+                    let unpack_root = base_dir.clone();
+                    let unpacker = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        struct ChanReader { rx: tokio::sync::mpsc::Receiver<Vec<u8>>, buf: Vec<u8>, pos: usize, done: bool }
+                        impl std::io::Read for ChanReader { fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> { if self.done { return Ok(0);} if self.pos>=self.buf.len(){ match self.rx.blocking_recv(){ Some(chunk)=>{ self.buf=chunk; self.pos=0;}, None=>{ self.done=true; return Ok(0);} } } let n=out.len().min(self.buf.len()-self.pos); if n>0 { out[..n].copy_from_slice(&self.buf[self.pos..self.pos+n]); self.pos+=n; } Ok(n) } }
+                        let mut ar = tar::Archive::new(ChanReader{ rx, buf: Vec::new(), pos: 0, done: false });
+                        ar.set_overwrite(true);
+                        ar.unpack(&unpack_root)?; Ok(()) });
+                    loop { let (ti, pl2) = read_frame(stream).await?; if ti == fids::TAR_DATA { tx.send(pl2).await.ok(); } else if ti == fids::TAR_END { break; } else { anyhow::bail!("unexpected frame during tar: {}", ti); } }
+                    drop(tx); unpacker.await??; write_frame(stream, frame::OK, b"TAR_OK").await?;
+                }
+                fids::FILE_RAW_START => {
+                    if payload.len() < 2 + 8 + 8 { anyhow::bail!("bad FILE_RAW_START"); }
+                    let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                    if payload.len() < 2 + nlen + 8 + 8 { anyhow::bail!("bad FILE_RAW_START len"); }
+                    let rels = std::str::from_utf8(&payload[2..2+nlen]).unwrap_or("");
+                    let mut off = 2 + nlen; let size = u64::from_le_bytes(payload[off..off+8].try_into().unwrap()); off+=8; let mtime = i64::from_le_bytes(payload[off..off+8].try_into().unwrap());
+                    let dst = base_dir.join(rels);
+                    if let Some(parent)=dst.parent(){ std::fs::create_dir_all(parent).ok(); }
+                    use std::io::Write as _;
+                    let mut f = std::fs::File::create(&dst).with_context(|| format!("create {}", dst.display()))?;
+                    let mut remaining=size; let mut buf=vec![0u8; 4*1024*1024];
+                    use tokio::io::AsyncReadExt as _;
+                    while remaining>0 { let to=remaining.min(buf.len() as u64) as usize; let n=stream.read(&mut buf[..to]).await?; if n==0{ anyhow::bail!("eof during raw"); } f.write_all(&buf[..n]).context("write raw")?; remaining-=n as u64; }
+                    let ft = filetime::FileTime::from_unix_time(mtime, 0); let _=filetime::set_file_mtime(&dst, ft);
+                    write_frame(stream, frame::OK, b"OK").await?;
+                }
+                fids::DONE => { write_frame(stream, frame::OK, b"OK").await?; break; }
+                fids::OK => { break; }
+                _ => {}
+            }
+        }
+        // Send a clean shutdown to emit TLS close_notify when applicable
+        {
+            use tokio::io::AsyncWriteExt as _;
+            let _ = stream.shutdown().await;
+        }
+        let _ = started; // suppress unused if logs disabled
+        Ok(())
+    }
+}
 pub mod client {
     use crate::protocol::frame;
     use crate::url;
@@ -584,8 +300,9 @@ pub mod client {
         host: &str,
         port: u16,
         path: &std::path::Path,
+        secure: bool,
     ) -> Result<Vec<(String, bool)>> {
-        let mut stream = connect_secure(host, port, true).await?;
+        let mut stream = connect_secure(host, port, secure).await?;
         let path_str = path.to_string_lossy();
         let mut payload = Vec::with_capacity(2 + path_str.len());
         payload.extend_from_slice(&(path_str.len() as u16).to_le_bytes());
@@ -628,11 +345,12 @@ pub mod client {
         host: &str,
         port: u16,
         base: &std::path::Path,
+        secure: bool,
     ) -> Result<Vec<std::path::PathBuf>> {
         let mut files = Vec::new();
         let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(base)];
         while let Some(dir) = stack.pop() {
-            let entries = list_dir(host, port, &dir).await.unwrap_or_default();
+            let entries = list_dir(host, port, &dir, secure).await.unwrap_or_default();
             for (name, is_dir) in entries {
                 if name == ".." {
                     continue;
@@ -656,8 +374,9 @@ pub mod client {
         port: u16,
         base: &std::path::Path,
         rels: &[std::path::PathBuf],
+        secure: bool,
     ) -> Result<std::collections::HashMap<String, [u8; 32]>> {
-        let mut s = connect_secure(host, port, true).await?;
+        let mut s = connect_secure(host, port, secure).await?;
         // Start session with base path
         let dest_s = base.to_string_lossy();
         let mut pl = Vec::with_capacity(2 + dest_s.len() + 1);
@@ -712,9 +431,12 @@ pub mod client {
             .await
             .with_context(|| format!("connect {}", addr))?;
         let _ = tcp.set_nodelay(true);
+        eprintln!("[client] connect_secure to {} secure={} (scheme)", addr, secure);
         if !secure {
+            eprintln!("[client] using PLAINTEXT to {}", addr);
             return Ok(StreamAny::Plain(tcp));
         }
+        eprintln!("[client] using TLS to {}", addr);
         let cfg = crate::tls::build_client_config_tofu(host, port);
         let cx = TlsConnector::from(std::sync::Arc::new(cfg));
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
@@ -793,7 +515,7 @@ pub mod client {
 
         let mut stream = match timeout(
             Duration::from_millis(crate::protocol::timeouts::CONNECT_MS),
-            connect_secure(&remote.host, remote.port, true),
+            connect_secure(&remote.host, remote.port, remote.tls),
         )
         .await
         {
@@ -880,8 +602,8 @@ pub mod client {
         Ok(())
     }
 
-    pub async fn remove_tree(host: &str, port: u16, path: &std::path::Path) -> Result<()> {
-        let mut stream = connect_secure(host, port, true).await?;
+    pub async fn remove_tree(host: &str, port: u16, path: &std::path::Path, secure: bool) -> Result<()> {
+        let mut stream = connect_secure(host, port, secure).await?;
         // START with root "/" and no flags
         let root = "/";
         let mut payload = Vec::with_capacity(2 + root.len() + 1);
@@ -1132,9 +854,11 @@ pub mod client {
             let host = host.to_string();
             let dest = dest.to_path_buf();
             let src_root = src_root.to_path_buf();
+            // Preserve the chosen security mode for worker connections
+            let worker_secure = secure;
 
             let handle = tokio::spawn(async move {
-                let secure = true;
+                let secure = worker_secure;
                 let mut s = connect_secure(&host, port, secure).await?;
                 // Start worker connection
                 let dest_s = dest.to_string_lossy();
@@ -1348,8 +1072,9 @@ pub mod client {
         src: &Path,
         dest_root: &Path,
         args: &crate::Args,
-    ) -> Result<()> {
-        let mut stream = connect_secure(host, port, true).await?;
+     ) -> Result<()> {
+        let secure = !args.never_tell_me_the_odds;
+        let mut stream = connect_secure(host, port, secure).await?;
 
         // START payload: path on server (src) + flags (mirror + pull + include_empty_dirs)
         let src_s = src.to_string_lossy();

@@ -68,7 +68,7 @@ pub mod frame {
 // Centralized timeout constants for consistent behavior across async/legacy paths
 pub mod timeouts {
     // Base timeout for frame header reads (ms)
-    pub const FRAME_HEADER_MS: u64 = 1500;
+    pub const FRAME_HEADER_MS: u64 = 3000;
 
     // Base timeout for writes (ms)
     pub const WRITE_BASE_MS: u64 = 500;
