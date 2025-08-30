@@ -9,7 +9,7 @@ Highlights:
 - Accurate file/byte counters including tar-bundled files.
 - TUI shell (feature-gated) with Dracula theme preview.
 
-Blit v3 uses a compact daemon protocol with a manifest handshake so only changed files transfer, server-side mirror deletions, symlink preservation, empty-directory mirroring, and both push and pull modes.
+Blit uses a compact daemon protocol with a manifest handshake so only changed files transfer, server-side mirror deletions, symlink preservation, empty-directory mirroring, and both push and pull modes.
 
 ## Key Features
 
