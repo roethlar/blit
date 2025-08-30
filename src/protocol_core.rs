@@ -363,7 +363,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_clear_readonly_recursive() {
-        use std::os::windows::fs::MetadataExt;
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("readonly.txt");
 

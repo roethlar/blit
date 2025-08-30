@@ -146,6 +146,7 @@ pub fn has_symlink_privilege() -> bool {
 ///
 /// This function will silently continue on errors to ensure best-effort clearing.
 /// Optimized to only call metadata once per file.
+#[cfg_attr(windows, allow(clippy::permissions_set_readonly_false))]
 pub fn clear_readonly_recursive(path: &Path) {
     if let Ok(metadata) = fs::metadata(path) {
         // Clear read-only on the current path if needed
