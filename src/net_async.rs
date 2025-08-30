@@ -548,7 +548,7 @@ pub mod client {
 
         let mut stream = match timeout(
             Duration::from_millis(crate::protocol::timeouts::CONNECT_MS),
-            connect_secure(&remote.host, remote.port, remote.tls),
+            connect_secure(&remote.host, remote.port, true),
         )
         .await
         {

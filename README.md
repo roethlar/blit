@@ -4,7 +4,7 @@ Fast local and remote sync with an async-first daemon, rsync-style delta, and ro
 
 Highlights:
 - 
-- Direction‑agnostic verbs: `mirror`, `copy`, `move` with URL inference (`blits://host:port/path`)
+- Direction‑agnostic verbs: `mirror`, `copy`, `move` with URL inference (`blit://host:port/path`)
 - Async small-file TAR bundling to reduce frame overhead and boost throughput.
 - Accurate file/byte counters including tar-bundled files.
 - TUI shell (feature-gated) with Dracula theme preview.
@@ -48,10 +48,10 @@ Daemon and remote paths:
 target/release/blitd --root /srv/root --bind 0.0.0.0:9031
 
 # Mirror local → remote (TLS)
-target/release/blit /data blits://server:9031/backup --mir -v
+target/release/blit /data blit://server:9031/backup --mir -v
 
 # Mirror remote → local (TLS)
-target/release/blit blits://server:9031/data /backup --mir -v
+target/release/blit blit://server:9031/data /backup --mir -v
 
 # Plaintext for trusted LAN benchmarking ONLY
 # 1) Start daemon with security disabled
@@ -77,14 +77,14 @@ Common recipes:
 
 ```bash
 # Mirror local data to a server path
-blit mirror /data blits://server:9031/backup -v
+blit mirror /data blit://server:9031/backup -v
 
 # High-throughput LAN push
-blit mirror /big blits://server:9031/big --net-workers 8 --net-chunk-mb 8 --ludicrous-speed -v
+blit mirror /big blit://server:9031/big --net-workers 8 --net-chunk-mb 8 --ludicrous-speed -v
 
 # Pull and verify quickly (size+mtime)
-blit mirror blits://server:9031/dataset /local/dataset -v && \
-  blit verify blits://server:9031/dataset /local/dataset --limit 20
+blit mirror blit://server:9031/dataset /local/dataset -v && \
+  blit verify blit://server:9031/dataset /local/dataset --limit 20
 ```
 
 Notes:
@@ -101,11 +101,11 @@ blit mirror <SRC> <DEST>
 blit copy   <SRC> <DEST>
 blit move   <SRC> <DEST>
 blit verify <SRC> <DEST> [--checksum] [--json] [--csv <file>] [--limit N]
-blitty --remote blits://host:9031/     # optional TUI client
+blitty --remote blit://host:9031/     # optional TUI client
 ```
 
 Direction inference:
-- If either side uses `blit://` or `blits://`, that side is remote.
+- If either side uses `blit://` or `blit://`, that side is remote.
 - Remote→remote is not supported in this release.
 
 Common options:
@@ -132,7 +132,7 @@ Performance tuning:
 
 ## TUI (blitty)
 
-- - Dual‑pane UI (local/local by default). Toggle right pane to remote and connect to `blits://host:9031`.
+- - Dual‑pane UI (local/local by default). Toggle right pane to remote and connect to `blit://host:9031`.
 - Navigation with arrows/Enter; select paths and run transfers (mirror/copy/move). Press `x` to cancel.
 - The unsafe `--never-tell-me-the-odds` is CLI‑only — not exposed in the UI.
 
