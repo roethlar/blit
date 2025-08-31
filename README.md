@@ -1,5 +1,9 @@
 # Blit — Fast, Secure File Sync (CLI + Daemon + TUI)
 
+# DO NOT USE THIS APP IN PRODUCTION!!! 
+There are fundamental bugs that need to be fixed before this will be stable enough for a prod release.
+-
+
 Fast local and remote sync with an async-first daemon, rsync-style delta, and robocopy-style ergonomics. Linux and macOS supported; Windows builds are experimental (see Platform Support).
 
 Highlights:
@@ -14,10 +18,7 @@ Blit uses a compact daemon protocol with a manifest handshake so only changed fi
 ## Key Features
 
 - High throughput: tar streaming for small files, parallel streams for medium, chunked I/O for large.
-- Robocopy-style flags: `--mir`, `-l`, `--xf/--xd`, `-s/--subdirs`, `-e/--empty-dirs`.
 - Daemon push and pull with rsync-style delta (size+mtime) and mirror deletions.
-- Symlink preservation (tar mode and per-file path), timestamps preserved.
-- Empty directories mirrored (and implied by `--mir`).
 
 ## Quick Start
 
